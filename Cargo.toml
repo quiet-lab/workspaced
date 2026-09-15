@@ -1,0 +1,23 @@
+[package]
+name = "workspaced"
+version = "0.1.0"
+edition = "2024"
+description = "Демон workspace для сессии Hyprland: приложения, workspace, столы, сессии"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+env_logger = "0.11"
+log = "0.4"
+notify = "8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+toml_edit = "0.23"
+nix = { version = "0.30", features = ["process", "signal"] }
+chrono = "0.4"
+serde_ignored = "0.1"
+dirs = "6"
+
+[profile.release]
+strip = true
