@@ -45,6 +45,11 @@ enum Command {
     },
     /// Развернуть активное окно на рабочую область с отступами; повторно — вернуть прежние положение и размер
     Maximize,
+    /// Поставить активное окно в позицию рабочей области (половина ширины и высоты в углах и по центру рядов, center — на всю высоту, full — вся область)
+    Place {
+        /// top-left, top-center, top-right, bottom-left, bottom-center, bottom-right, center или full
+        position: String,
+    },
     /// Напечатать состояние демона
     Status {
         #[arg(long)]
@@ -122,6 +127,7 @@ fn main() -> anyhow::Result<()> {
         }
         Command::Half { side } => client::call(json!({ "cmd": "half", "side": side })).map(|_| ()),
         Command::Maximize => client::call(json!({ "cmd": "maximize" })).map(|_| ()),
+        Command::Place { position } => client::call(json!({ "cmd": "place", "position": position })).map(|_| ()),
         Command::Status { json: as_json } => {
             let v = client::call(json!({ "cmd": "status" }))?;
             if as_json {

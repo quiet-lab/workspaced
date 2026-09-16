@@ -166,6 +166,18 @@ pub struct HalfAction {
     pub half: String,
 }
 
+/// Позиция окна на рабочей области: `{ place = "top-left" }`. Углы и центры
+/// рядов — окно в половину ширины и высоты; `center` — половина ширины на всю
+/// высоту; `full` — вся рабочая область.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PlaceAction {
+    pub place: String,
+}
+
+/// Допустимые позиции действия `place`.
+pub const PLACES: [&str; 8] = ["top-left", "top-center", "top-right", "bottom-left", "bottom-center", "bottom-right", "center", "full"];
+
 /// Стол, workspace и приложение: `{ desktop = 3, workspace = "dots" }`.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -184,6 +196,7 @@ pub struct TargetAction {
 pub enum Action {
     Named(String),
     Half(HalfAction),
+    Place(PlaceAction),
     Target(TargetAction),
 }
 
@@ -345,6 +358,9 @@ impl Config {
                 Some(Action::Half(HalfAction { half })) if !matches!(half.as_str(), "left" | "right" | "up" | "down") => {
                     bail!("привязка {:?}: half должен быть left, right, up или down, получено {half:?}", b.chain)
                 }
+                Some(Action::Place(PlaceAction { place })) if !PLACES.contains(&place.as_str()) => {
+                    bail!("привязка {:?}: place должен быть одним из {}, получено {place:?}", b.chain, PLACES.join(", "))
+                }
                 Some(Action::Target(TargetAction { desktop, workspace, app })) => {
                     if workspace.is_none() && app.is_none() {
                         bail!("привязка {:?}: в action нужен workspace или app", b.chain);
@@ -473,6 +489,16 @@ apps = { terminal = "right" }
         let bad = format!("{MINIMAL}\n[[binds]]\nchain = \"SUPER+X\"\naction = \"maximise\"\n");
         let err = Config::parse(&bad).unwrap_err().to_string();
         assert!(err.contains("SUPER+X") && err.contains("maximise"), "{err}");
+    }
+
+    #[test]
+    fn place_action_in_binds() {
+        let ok = format!("{MINIMAL}\n[[binds]]\nchain = \"ALT+SUPER+Home\"\naction = {{ place = \"top-left\" }}\n");
+        let cfg = Config::parse(&ok).unwrap();
+        assert_eq!(cfg.binds[0].action, Some(Action::Place(PlaceAction { place: "top-left".into() })));
+        let bad = format!("{MINIMAL}\n[[binds]]\nchain = \"ALT+SUPER+Home\"\naction = {{ place = \"left\" }}\n");
+        let err = Config::parse(&bad).unwrap_err().to_string();
+        assert!(err.contains("Home") && err.contains("top-left") && err.contains("full"), "{err}");
     }
 
     #[test]

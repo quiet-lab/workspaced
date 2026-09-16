@@ -13,7 +13,7 @@ use std::fmt::Write;
 
 use anyhow::{Result, bail};
 
-use crate::config::{Action, Bind, Config, Dispatch, HalfAction, TargetAction};
+use crate::config::{Action, Bind, Config, Dispatch, HalfAction, PlaceAction, TargetAction};
 
 /// Одно сочетание в каноническом виде: модификаторы по фиксированному порядку,
 /// клавиша как написана.
@@ -239,6 +239,7 @@ pub fn collect(cfg: &Config) -> Result<Vec<Binding>> {
                         other => bail!("привязка {:?}: неизвестное действие {other:?}", b.chain),
                     },
                     Action::Half(HalfAction { half }) => format!("workspaced half {half}"),
+                    Action::Place(PlaceAction { place }) => format!("workspaced place {place}"),
                     Action::Target(TargetAction { desktop, workspace, app }) => {
                         let mut cmd = match (workspace, app) {
                             (_, Some(a)) => format!("workspaced app {a}"),
@@ -607,6 +608,9 @@ action = { half = "left" }
 chain = "SUPER+X"
 action = "maximize"
 [[binds]]
+chain = "ALT+SUPER+Home"
+action = { place = "top-left" }
+[[binds]]
 chain = "SUPER+SHIFT+C"
 lua = """
 local soft = hl.get_config("cursor.no_hardware_cursors")
@@ -631,6 +635,7 @@ dispatch = "exit()"
         assert!(a.contains("hl.bind(\"XF86AudioRaiseVolume\", hl.dsp.exec_cmd(\"~/.scripts/change-volume.sh +\"), { locked = true, repeating = true })"), "{a}");
         assert!(a.contains("hl.bind(\"SUPER + SHIFT + left\", hl.dsp.exec_cmd(\"workspaced half left\"))"), "{a}");
         assert!(a.contains("hl.bind(\"SUPER + X\", hl.dsp.exec_cmd(\"workspaced maximize\"))"), "{a}");
+        assert!(a.contains("Home\", hl.dsp.exec_cmd(\"workspaced place top-left\"))"), "{a}");
         assert!(a.contains("hl.bind(\"SUPER + SHIFT + C\", function()\n  local ok, err = pcall(function()\n    local soft"), "{a}");
         assert!(a.contains("hl.define_submap(\"ws:SUPER + W 3\", function()"), "{a}");
         assert!(a.contains("ws_run(\"workspaced raise dev-front --desktop 3\")"), "{a}");
@@ -644,5 +649,6 @@ dispatch = "exit()"
         assert!(list.contains("SUPER+W f") && list.contains("raise dev-front") && list.contains("workspaces.dev-front"), "{list}");
         assert!(list.contains("locked,repeating"), "{list}");
         assert!(list.contains("SUPER+X") && list.contains("maximize"), "{list}");
+        assert!(list.contains("Home") && list.contains("place top-left"), "{list}");
     }
 }

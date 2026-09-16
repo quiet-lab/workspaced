@@ -832,20 +832,30 @@ impl Daemon {
             log::info!("half {side}: активного окна нет");
             return Ok(());
         };
-        let mon = self.hypr.active_monitor()?;
-        let gap = self.cfg.gap;
-        let area = mon.work_area().inset(gap);
-        let (hw, hh) = (area.w / 2, area.h / 2);
-        let cell = match side {
-            "left" => PxRect { x: area.x, y: area.y, w: hw, h: area.h },
-            "right" => PxRect { x: area.x + hw, y: area.y, w: area.w - hw, h: area.h },
-            "up" => PxRect { x: area.x, y: area.y, w: area.w, h: hh },
-            "down" => PxRect { x: area.x, y: area.y + hh, w: area.w, h: area.h - hh },
+        let (cols, rows, col, row) = match side {
+            "left" => (2, 1, 0, 0),
+            "right" => (2, 1, 1, 0),
+            "up" => (1, 2, 0, 0),
+            "down" => (1, 2, 0, 1),
             other => bail!("half: неизвестная сторона {other:?} (left, right, up, down)"),
         };
-        let r = cell.inset(gap);
+        let r = grid_cell(self.hypr.active_monitor()?.work_area(), self.cfg.gap, cols, rows, col, row);
         self.place_floating(&win.address, r)?;
         log::info!("half {side}: {} → {},{} {}×{}", win.address, r.x, r.y, r.w, r.h);
+        Ok(())
+    }
+
+    /// Активное окно в позицию на рабочей области (углы и центры рядов —
+    /// половина ширины и высоты, `center` — половина ширины на всю высоту,
+    /// `full` — вся область) по тому же правилу отступов, что у половин.
+    fn place(&mut self, position: &str) -> Result<()> {
+        let Some(win) = self.hypr.active_window()? else {
+            log::info!("place {position}: активного окна нет");
+            return Ok(());
+        };
+        let r = place_rect(self.hypr.active_monitor()?.work_area(), self.cfg.gap, position)?;
+        self.place_floating(&win.address, r)?;
+        log::info!("place {position}: {} → {},{} {}×{}", win.address, r.x, r.y, r.w, r.h);
         Ok(())
     }
 
@@ -942,6 +952,10 @@ impl Daemon {
                 None => Err(anyhow::anyhow!("нет side")),
             },
             "maximize" => self.maximize().map(|_| json!({"ok": true})),
+            "place" => match s("position") {
+                Some(position) => self.place(&position).map(|_| json!({"ok": true})),
+                None => Err(anyhow::anyhow!("нет position")),
+            },
             "remove" => match s("workspace") {
                 Some(ws) => self.remove(&ws, desktop).map(|_| json!({"ok": true})),
                 None => Err(anyhow::anyhow!("нет workspace")),
@@ -1076,6 +1090,40 @@ fn maximize_rect(work_area: PxRect, gap: i32) -> PxRect {
     work_area.inset(2 * gap)
 }
 
+/// Позиция окна по правилу одинаковых расстояний: рабочая область сужается на
+/// gap, окно получает половину её ширины (кроме `full`) и половину высоты
+/// (кроме `center` и `full`), ставится к левому краю, по центру или к правому
+/// краю и в верхний или нижний ряд, затем сужается на gap. Центральные позиции
+/// перекрывают боковые: это набор мест для одного окна, а не разбиение.
+fn place_rect(work_area: PxRect, gap: i32, position: &str) -> Result<PxRect> {
+    let area = work_area.inset(gap);
+    let (hw, hh) = (area.w / 2, area.h / 2);
+    let (x, y, w, h) = match position {
+        "top-left" => (area.x, area.y, hw, hh),
+        "top-center" => (area.x + (area.w - hw) / 2, area.y, hw, hh),
+        "top-right" => (area.x + area.w - hw, area.y, hw, hh),
+        "bottom-left" => (area.x, area.y + area.h - hh, hw, hh),
+        "bottom-center" => (area.x + (area.w - hw) / 2, area.y + area.h - hh, hw, hh),
+        "bottom-right" => (area.x + area.w - hw, area.y + area.h - hh, hw, hh),
+        "center" => (area.x + (area.w - hw) / 2, area.y, hw, area.h),
+        "full" => (area.x, area.y, area.w, area.h),
+        other => bail!("place: неизвестная позиция {other:?} ({})", crate::config::PLACES.join(", ")),
+    };
+    Ok(PxRect { x, y, w, h }.inset(gap))
+}
+
+/// Ячейка сетки cols×rows по правилу одинаковых расстояний: рабочая область
+/// сужается на gap, делится на равные ячейки (остаток деления достаётся
+/// последним столбцу и строке), выбранная ячейка сужается на gap. От края и
+/// между соседними ячейками получается 2·gap.
+fn grid_cell(work_area: PxRect, gap: i32, cols: i32, rows: i32, col: i32, row: i32) -> PxRect {
+    let area = work_area.inset(gap);
+    let (cw, ch) = (area.w / cols, area.h / rows);
+    let w = if col == cols - 1 { area.w - cw * col } else { cw };
+    let h = if row == rows - 1 { area.h - ch * row } else { ch };
+    PxRect { x: area.x + cw * col, y: area.y + ch * row, w, h }.inset(gap)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1091,5 +1139,37 @@ mod tests {
     fn maximize_rect_without_reserved() {
         let area = PxRect { x: 0, y: 0, w: 3840, h: 2160 };
         assert_eq!(maximize_rect(area, 5), PxRect { x: 10, y: 10, w: 3820, h: 2140 });
+    }
+
+    #[test]
+    fn grid_halves_keep_previous_numbers() {
+        let panel = PxRect { x: 330, y: 0, w: 3510, h: 2160 };
+        assert_eq!(grid_cell(panel, 5, 2, 1, 0, 0), PxRect { x: 340, y: 10, w: 1740, h: 2140 });
+        assert_eq!(grid_cell(panel, 5, 2, 1, 1, 0), PxRect { x: 2090, y: 10, w: 1740, h: 2140 });
+        let full = PxRect { x: 0, y: 0, w: 3840, h: 2160 };
+        assert_eq!(grid_cell(full, 5, 2, 1, 0, 0), PxRect { x: 10, y: 10, w: 1905, h: 2140 });
+        assert_eq!(grid_cell(full, 5, 1, 2, 0, 1), PxRect { x: 10, y: 1085, w: 3820, h: 1065 });
+    }
+
+    #[test]
+    fn place_positions_with_panel() {
+        let panel = PxRect { x: 330, y: 0, w: 3510, h: 2160 };
+        let r = |p| place_rect(panel, 5, p).unwrap();
+        assert_eq!(r("top-left"), PxRect { x: 340, y: 10, w: 1740, h: 1065 });
+        assert_eq!(r("top-center"), PxRect { x: 1215, y: 10, w: 1740, h: 1065 });
+        assert_eq!(r("top-right"), PxRect { x: 2090, y: 10, w: 1740, h: 1065 });
+        assert_eq!(r("bottom-left"), PxRect { x: 340, y: 1085, w: 1740, h: 1065 });
+        assert_eq!(r("bottom-center"), PxRect { x: 1215, y: 1085, w: 1740, h: 1065 });
+        assert_eq!(r("bottom-right"), PxRect { x: 2090, y: 1085, w: 1740, h: 1065 });
+        assert_eq!(r("center"), PxRect { x: 1215, y: 10, w: 1740, h: 2140 });
+        assert_eq!(r("full"), maximize_rect(panel, 5));
+        assert!(place_rect(panel, 5, "left").is_err());
+    }
+
+    #[test]
+    fn place_positions_without_reserved() {
+        let full = PxRect { x: 0, y: 0, w: 3840, h: 2160 };
+        assert_eq!(place_rect(full, 5, "bottom-left").unwrap(), PxRect { x: 10, y: 1085, w: 1905, h: 1065 });
+        assert_eq!(place_rect(full, 5, "top-center").unwrap(), PxRect { x: 967, y: 10, w: 1905, h: 1065 });
     }
 }
