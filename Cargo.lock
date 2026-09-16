@@ -1088,6 +1088,7 @@ dependencies = [
  "log",
  "nix",
  "notify",
+ "regex",
  "serde",
  "serde_ignored",
  "serde_json",

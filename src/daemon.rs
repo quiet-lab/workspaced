@@ -268,6 +268,14 @@ impl Daemon {
 
     /// При старте: теги окон дают приложения, сессия `default` — списки и ленивое восстановление.
     fn startup(&mut self) -> Result<()> {
+        // Стартовый workspace из конфига поднимается после сессии: если сессия
+        // уже подняла его, повторное поднятие только расставляет окна.
+        if let Some(st) = self.cfg.startup.clone() {
+            log::info!("стартовый workspace {} на столе {}", st.workspace, st.desktop);
+            if let Err(e) = self.raise(&st.workspace, Some(st.desktop)) {
+                log::warn!("стартовый workspace {}: {e:#}", st.workspace);
+            }
+        }
         session::restore_default(self)?;
         self.mark_dirty();
         Ok(())
@@ -550,6 +558,40 @@ impl Daemon {
 
     fn find_app_window<'a>(clients: &'a [Client], app: &str) -> Option<&'a Client> {
         clients.iter().filter(|c| c.app().as_deref() == Some(app)).min_by_key(|c| c.on_hidden())
+    /// Захват открытых окон для приложений без окна с тегом (design D2–D3
+    /// изменения work-workspace): кандидат — окно подходящего класса и
+    /// заголовка без тега или с тегом приложения, которого нет в конфиге.
+    /// Теги переставляются в композиторе и в локальном списке клиентов.
+    fn adopt_untagged(&mut self, clients: &mut [Client], apps: &[String]) -> Result<()> {
+        for app in apps {
+            if Self::find_app_window(clients, app).is_some() {
+                continue;
+            }
+            let Some(cfg) = self.cfg.apps.get(app) else {
+                continue;
+            };
+            let Some((class_re, title_re)) = cfg.matchers()? else {
+                continue;
+            };
+            let Some(i) = pick_candidate(clients, &self.cfg, &class_re, title_re.as_ref()) else {
+                continue;
+            };
+            let addr = clients[i].address.clone();
+            let mut ex = Vec::new();
+            if let Some(old) = clients[i].app() {
+                ex.push(hypr::d_tag(&addr, &format!("-app:{old}")));
+            }
+            ex.push(hypr::d_tag(&addr, &format!("app:{app}")));
+            self.hypr.dispatch_all(&ex)?;
+            clients[i].tags.retain(|t| !t.starts_with("app:"));
+            clients[i].tags.push(format!("app:{app}"));
+            // Захваченное окно больше не постороннее.
+            self.st.foreign.remove(&addr);
+            log::info!("захват: окно {addr} ({}, «{}») → приложение {app}", clients[i].class, clients[i].title);
+        }
+        Ok(())
+    }
+
     }
 
     /// Поднять workspace на столе (design D5).
@@ -558,14 +600,15 @@ impl Daemon {
             bail!("workspace {ws} не найден");
         }
         let n = desktop.unwrap_or(self.current);
-        let clients = self.hypr.clients()?;
+        let w = self.cfg.workspaces[ws].clone();
+        let apps: Vec<String> = w.apps.keys().cloned().collect();
+        let mut clients = self.hypr.clients()?;
+        self.adopt_untagged(&mut clients, &apps)?;
         let mut ex = Vec::new();
         if n != self.current {
             ex.push(hypr::d_focus_desktop(n));
             self.current = n;
         }
-        let w = self.cfg.workspaces[ws].clone();
-        let apps: Vec<String> = w.apps.keys().cloned().collect();
         let mut main_addr: Option<String> = None;
         let main_app = w.main.clone().or_else(|| self.st.main_app(&self.cfg, ws, self.mon));
         for app in &apps {
@@ -633,7 +676,8 @@ impl Daemon {
 
     /// Сделать приложение главным в workspace: обмен ячеек с текущим главным.
     fn make_main(&mut self, ws: &str, app: &str) -> Result<()> {
-        let clients = self.hypr.clients()?;
+        let mut clients = self.hypr.clients()?;
+        self.adopt_untagged(&mut clients, std::slice::from_ref(&app.to_string()))?;
         let n = self.current;
         let main_app = self.st.main_app(&self.cfg, ws, self.mon);
         let main_cell = self.cfg.templates[&self.cfg.workspaces[ws].template].main.clone();
@@ -734,7 +778,8 @@ impl Daemon {
         }
         // 4. Приложение без workspace: плавающее в центре экрана.
         let app = apps[0].clone();
-        let clients = self.hypr.clients()?;
+        let mut clients = self.hypr.clients()?;
+        self.adopt_untagged(&mut clients, apps)?;
         if let Some(c) = Self::find_app_window(&clients, &app) {
             let mut ex = Vec::new();
             if c.on_hidden() {
@@ -1072,6 +1117,24 @@ fn proc_exe(pid: i32) -> Option<PathBuf> {
 }
 
 fn which(cmd: &str) -> Option<PathBuf> {
+/// Кандидат на захват: не на `special:hidden`, класс и заголовок подходят,
+/// тега нет или он принадлежит приложению, которого нет в конфиге. Окно на
+/// обычном столе предпочтительнее окна на `special:pool`.
+fn pick_candidate(clients: &[Client], cfg: &Config, class_re: &regex::Regex, title_re: Option<&regex::Regex>) -> Option<usize> {
+    let fits = |c: &Client| !c.on_hidden() && class_re.is_match(&c.class) && title_re.is_none_or(|t| t.is_match(&c.title)) && c.app().is_none_or(|a| !cfg.apps.contains_key(&a));
+    let mut pool = None;
+    for (i, c) in clients.iter().enumerate() {
+        if !fits(c) {
+            continue;
+        }
+        if !c.on_pool() {
+            return Some(i);
+        }
+        pool.get_or_insert(i);
+    }
+    pool
+}
+
     if cmd.contains('/') {
         return Some(PathBuf::from(cmd));
     }
@@ -1148,6 +1211,38 @@ mod tests {
         assert_eq!(grid_cell(panel, 5, 2, 1, 1, 0), PxRect { x: 2090, y: 10, w: 1740, h: 2140 });
         let full = PxRect { x: 0, y: 0, w: 3840, h: 2160 };
         assert_eq!(grid_cell(full, 5, 2, 1, 0, 0), PxRect { x: 10, y: 10, w: 1905, h: 2140 });
+    fn client(addr: &str, class: &str, title: &str, ws: &str, tags: &[&str]) -> Client {
+        serde_json::from_value(json!({
+            "address": addr, "class": class, "title": title, "workspace": { "id": 1, "name": ws },
+            "tags": tags, "at": [0, 0], "size": [10, 10], "floating": true, "mapped": true
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn pick_candidate_by_class_title_and_tag() {
+        let cfg = Config::parse(
+            "[templates.t]\nmain = \"c\"\ncells = { c = { x = 0, y = 0, w = 10, h = 10 } }\n[apps.herdr]\ncmd = \"wezterm-gui\"\nclass = \"^org\\\\.wezfurlong\\\\.wezterm$\"\ntitle = \"^herdr · \"\n[apps.neovide]\ncmd = \"neovide\"\nclass = \"^neovide$\"\n[workspaces.work]\ntemplate = \"t\"\napps = { herdr = \"c\" }\n",
+        )
+        .unwrap();
+        let clients = vec![
+            client("0x1", "org.wezfurlong.wezterm", "bash · mne@dev-lab", "1", &[]),
+            client("0x2", "org.wezfurlong.wezterm", "herdr · dev-lab", "special:pool", &[]),
+            client("0x3", "org.wezfurlong.wezterm", "herdr · dev-lab", "2", &["app:terminal-dots"]),
+            client("0x4", "org.wezfurlong.wezterm", "herdr · dev-lab", "special:hidden", &[]),
+            client("0x5", "org.wezfurlong.wezterm", "herdr · x", "1", &["app:neovide"]),
+            client("0x6", "neovide", "[Scratch]", "1", &["app:editor-dots"]),
+        ];
+        let (cre, tre) = cfg.apps["herdr"].matchers().unwrap().unwrap();
+        // Заголовок отсекает 0x1, hidden — 0x4, тег живого приложения — 0x5; обычный стол предпочтительнее пула.
+        assert_eq!(pick_candidate(&clients, &cfg, &cre, tre.as_ref()), Some(2));
+        let only_pool = &clients[..2];
+        assert_eq!(pick_candidate(only_pool, &cfg, &cre, tre.as_ref()), Some(1));
+        let (cre, tre) = cfg.apps["neovide"].matchers().unwrap().unwrap();
+        assert_eq!(pick_candidate(&clients, &cfg, &cre, tre.as_ref()), Some(5));
+        assert_eq!(pick_candidate(&clients[..1], &cfg, &cre, tre.as_ref()), None);
+    }
+
         assert_eq!(grid_cell(full, 5, 1, 2, 0, 1), PxRect { x: 10, y: 1085, w: 3820, h: 1065 });
     }
 

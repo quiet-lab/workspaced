@@ -106,7 +106,9 @@ pub struct Template {
     pub cells: BTreeMap<String, Rect>,
 }
 
-/// Приложение: команда, аргументы, каталог, окружение, цепочка.
+/// Приложение: команда, аргументы, каталог, окружение, цепочка и, при
+/// необходимости, регулярные выражения класса и заголовка для захвата уже
+/// открытого окна (спецификация ws-daemon, «Захват открытых окон приложения»).
 #[derive(Debug, Clone, Deserialize)]
 pub struct App {
     pub cmd: String,
@@ -118,6 +120,37 @@ pub struct App {
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub chain: Option<String>,
+    /// Класс окна целиком (`^(?:…)$` добавляется демоном).
+    #[serde(default)]
+    pub class: Option<String>,
+    /// Заголовок окна, как написано (например, префикс `^herdr · `).
+    #[serde(default)]
+    pub title: Option<String>,
+}
+
+impl App {
+    /// Скомпилированные выражения захвата: класс целиком и заголовок как есть.
+    pub fn matchers(&self) -> Result<Option<(regex::Regex, Option<regex::Regex>)>> {
+        let Some(class) = &self.class else {
+            return Ok(None);
+        };
+        let class_re = regex::Regex::new(&format!("^(?:{class})$")).with_context(|| format!("поле class {class:?}"))?;
+        let title_re = self.title.as_deref().map(|t| regex::Regex::new(t).with_context(|| format!("поле title {t:?}"))).transpose()?;
+        Ok(Some((class_re, title_re)))
+    }
+}
+
+/// Стартовый workspace: поднимается при старте демона после восстановления сессии.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Startup {
+    pub workspace: String,
+    #[serde(default = "default_desktop")]
+    pub desktop: u8,
+}
+
+fn default_desktop() -> u8 {
+    1
 }
 
 /// Место приложения в workspace: ячейка шаблона или свой прямоугольник.
@@ -270,6 +303,8 @@ pub struct Config {
     pub workspaces: BTreeMap<String, Workspace>,
     #[serde(default)]
     pub binds: Vec<Bind>,
+    #[serde(default)]
+    pub startup: Option<Startup>,
 }
 
 /// Имя сущности, безопасное для командной строки и имени тега.
@@ -305,6 +340,20 @@ impl Config {
         for (tname, t) in &self.templates {
             if !t.cells.contains_key(&t.main) {
                 bail!("шаблон {tname}: главная ячейка {:?} не объявлена в cells", t.main);
+            }
+        }
+        for (aname, a) in &self.apps {
+            if a.title.is_some() && a.class.is_none() {
+                bail!("приложение {aname}: поле title без class не имеет смысла");
+            }
+            a.matchers().with_context(|| format!("приложение {aname}"))?;
+        }
+        if let Some(st) = &self.startup {
+            if !self.workspaces.contains_key(&st.workspace) {
+                bail!("startup: workspace {:?} не описан в [workspaces]", st.workspace);
+            }
+            if !(1..=8).contains(&st.desktop) {
+                bail!("startup: стол должен быть 1…8, получено {}", st.desktop);
             }
         }
         for (wname, w) in &self.workspaces {
@@ -499,6 +548,30 @@ apps = { terminal = "right" }
         let bad = format!("{MINIMAL}\n[[binds]]\nchain = \"ALT+SUPER+Home\"\naction = {{ place = \"left\" }}\n");
         let err = Config::parse(&bad).unwrap_err().to_string();
         assert!(err.contains("Home") && err.contains("top-left") && err.contains("full"), "{err}");
+    }
+
+    #[test]
+    fn class_title_and_startup() {
+        let ok = format!("{MINIMAL}\n[apps.terminal]\nclass = \"^org\\\\.wezfurlong\\\\.wezterm$\"\ntitle = \"^herdr · \"\n[startup]\nworkspace = \"work\"\n");
+        let ok = ok
+            .replace(
+                "[apps.terminal]\ncmd = \"wezterm-gui\"\n",
+                "[apps.terminal]\ncmd = \"wezterm-gui\"\nclass = \"^org\\\\.wezfurlong\\\\.wezterm$\"\ntitle = \"^herdr · \"\n",
+            )
+            .replace("\n[apps.terminal]\nclass", "\n[apps.unused]\ncmd = \"x\"\nclass");
+        let cfg = Config::parse(&ok).unwrap();
+        assert_eq!(cfg.startup.as_ref().map(|s| (s.workspace.as_str(), s.desktop)), Some(("work", 1)));
+        let (class_re, title_re) = cfg.apps["terminal"].matchers().unwrap().unwrap();
+        assert!(class_re.is_match("org.wezfurlong.wezterm") && !class_re.is_match("org.wezfurlong.wezterm2"));
+        assert!(title_re.unwrap().is_match("herdr · dev-lab"));
+        let title_only = format!("{MINIMAL}\n[apps.a]\ncmd = \"a\"\ntitle = \"x\"\n");
+        assert!(Config::parse(&title_only).unwrap_err().to_string().contains("приложение a"));
+        let bad_re = format!("{MINIMAL}\n[apps.a]\ncmd = \"a\"\nclass = \"(\"\n");
+        assert!(format!("{:#}", Config::parse(&bad_re).unwrap_err()).contains("class"));
+        let bad_ws = format!("{MINIMAL}\n[startup]\nworkspace = \"nope\"\n");
+        assert!(Config::parse(&bad_ws).unwrap_err().to_string().contains("nope"));
+        let bad_desk = format!("{MINIMAL}\n[startup]\nworkspace = \"work\"\ndesktop = 9\n");
+        assert!(Config::parse(&bad_desk).unwrap_err().to_string().contains("1…8"));
     }
 
     #[test]
