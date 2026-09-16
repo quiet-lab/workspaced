@@ -22,10 +22,11 @@ pub struct Desktop {
     pub active: Option<String>,
 }
 
-/// Постороннее окно: привязка к workspace и данные для восстановления.
+/// Постороннее окно: положение и данные для восстановления. К workspace
+/// демон его не привязывает: окно становится приложением workspace только
+/// по команде сохранения.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Foreign {
-    pub workspace: Option<String>,
     pub rect: PxRect,
     #[serde(default)]
     pub cmd: Vec<String>,
@@ -105,6 +106,8 @@ pub struct SessionWorkspace {
 pub struct SessionWindow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app: Option<String>,
+    /// Привязка постороннего окна из снимков прежних версий: читается ради
+    /// совместимости, не учитывается и не записывается.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
     /// «1»…«8», «pool» или «hidden».

@@ -188,7 +188,7 @@ fn print_status(v: &serde_json::Value) {
                 w.get("address").and_then(|x| x.as_str()).unwrap_or(""),
                 w.get("class").and_then(|x| x.as_str()).unwrap_or(""),
                 w.get("workspace").and_then(|x| x.as_str()).unwrap_or(""),
-                w.get("app").and_then(|x| x.as_str()).or_else(|| w.get("attached").and_then(|x| x.as_str()).map(|_| "(постороннее)")).unwrap_or("-")
+                w.get("app").and_then(|x| x.as_str()).or_else(|| w.get("foreign").and_then(|x| x.as_bool()).filter(|f| *f).map(|_| "(постороннее)")).unwrap_or("-")
             );
         }
     }

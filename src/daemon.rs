@@ -74,7 +74,6 @@ fn class_matches(class: &str, cmd_base: &str) -> bool {
 pub struct ExpectedForeign {
     pub cmd: Vec<String>,
     pub cwd: Option<String>,
-    pub workspace: Option<String>,
     pub desktop: Option<u8>,
     pub rect: PxRect,
 }
@@ -268,6 +267,7 @@ impl Daemon {
 
     /// При старте: теги окон дают приложения, сессия `default` — списки и ленивое восстановление.
     fn startup(&mut self) -> Result<()> {
+        session::restore_default(self)?;
         // Стартовый workspace из конфига поднимается после сессии: если сессия
         // уже подняла его, повторное поднятие только расставляет окна.
         if let Some(st) = self.cfg.startup.clone() {
@@ -276,7 +276,6 @@ impl Daemon {
                 log::warn!("стартовый workspace {}: {e:#}", st.workspace);
             }
         }
-        session::restore_default(self)?;
         self.mark_dirty();
         Ok(())
     }
@@ -418,13 +417,13 @@ impl Daemon {
                     }
                     None => ex.push(hypr::d_move_to(&c.address, "special:pool")),
                 }
-                self.st.foreign.insert(c.address.clone(), Foreign { workspace: e.workspace, rect: e.rect, cmd, cwd });
+                self.st.foreign.insert(c.address.clone(), Foreign { rect: e.rect, cmd, cwd });
                 self.hypr.dispatch_all(&ex)?;
             } else {
-                // Постороннее окно: привязка к активному workspace стола.
-                let ws = c.desktop().and_then(|n| self.st.desktops.get(&n)).and_then(|d| d.active.clone());
-                self.st.foreign.insert(c.address.clone(), Foreign { workspace: ws.clone(), rect: c.rect(), cmd, cwd });
-                log::info!("постороннее окно {} ({}), привязка: {}", c.address, c.class, ws.as_deref().unwrap_or("свободное"));
+                // Постороннее окно остаётся свободным: частью workspace его делает
+                // только команда сохранения.
+                self.st.foreign.insert(c.address.clone(), Foreign { rect: c.rect(), cmd, cwd });
+                log::info!("постороннее окно {} ({}) свободно", c.address, c.class);
             }
         }
         self.mark_dirty();
@@ -449,9 +448,8 @@ impl Daemon {
                 }
                 let r = PxRect { x: (self.mon.0 - c.size.0) / 2, y: (self.mon.1 - c.size.1) / 2, w: c.size.0, h: c.size.1 };
                 ex.extend(hypr::d_place(&c.address, r));
-                let ws = if let Some(w) = &p.workspace { Some(w.clone()) } else { self.st.desktops.get(&p.desktop).and_then(|d| d.active.clone()) };
                 let (cmd, cwd) = proc_info(c.pid);
-                self.st.foreign.insert(c.address.clone(), Foreign { workspace: ws, rect: r, cmd, cwd });
+                self.st.foreign.insert(c.address.clone(), Foreign { rect: r, cmd, cwd });
             }
         }
         if p.focus {
@@ -558,6 +556,8 @@ impl Daemon {
 
     fn find_app_window<'a>(clients: &'a [Client], app: &str) -> Option<&'a Client> {
         clients.iter().filter(|c| c.app().as_deref() == Some(app)).min_by_key(|c| c.on_hidden())
+    }
+
     /// Захват открытых окон для приложений без окна с тегом (design D2–D3
     /// изменения work-workspace): кандидат — окно подходящего класса и
     /// заголовка без тега или с тегом приложения, которого нет в конфиге.
@@ -590,8 +590,6 @@ impl Daemon {
             log::info!("захват: окно {addr} ({}, «{}») → приложение {app}", clients[i].class, clients[i].title);
         }
         Ok(())
-    }
-
     }
 
     /// Поднять workspace на столе (design D5).
@@ -632,25 +630,14 @@ impl Daemon {
                 }
             }
         }
-        // Посторонние окна этого workspace возвращаются, чужие паркуются.
+        // Паркуются только окна живых приложений других workspace. Посторонние
+        // окна и окна с тегом приложения, которого нет в конфиге, остаются на столе.
         for c in &clients {
-            let mine_tag = c.app().is_some_and(|a| apps.contains(&a));
-            if mine_tag {
+            if c.desktop() != Some(n) {
                 continue;
             }
-            if let Some(f) = self.st.foreign.get_mut(&c.address) {
-                if f.workspace.as_deref() == Some(ws) {
-                    if !c.on_hidden() {
-                        if c.desktop() != Some(n) {
-                            ex.push(hypr::d_move_to(&c.address, &n.to_string()));
-                        }
-                        ex.extend(hypr::d_place(&c.address, f.rect));
-                    }
-                } else if c.desktop() == Some(n) && f.workspace.is_some() {
-                    f.rect = c.rect();
-                    ex.push(hypr::d_move_to(&c.address, "special:pool"));
-                }
-            } else if c.desktop() == Some(n) && c.app().is_some() {
+            let Some(a) = c.app() else { continue };
+            if !apps.contains(&a) && self.cfg.apps.contains_key(&a) {
                 ex.push(hypr::d_move_to(&c.address, "special:pool"));
             }
         }
@@ -818,11 +805,7 @@ impl Daemon {
                 if c.desktop() != Some(n) {
                     continue;
                 }
-                let mine = c.app().is_some_and(|a| apps.contains(&a)) || self.st.foreign.get(&c.address).is_some_and(|f| f.workspace.as_deref() == Some(ws));
-                if mine {
-                    if let Some(f) = self.st.foreign.get_mut(&c.address) {
-                        f.rect = c.rect();
-                    }
+                if c.app().is_some_and(|a| apps.contains(&a)) {
                     ex.push(hypr::d_move_to(&c.address, "special:pool"));
                 }
             }
@@ -1044,7 +1027,7 @@ impl Daemon {
                 .map(|ws| {
                     let w = self.cfg.workspaces.get(ws);
                     let apps: Vec<String> = w.map(|w| w.apps.keys().cloned().collect()).unwrap_or_default();
-                    let windows: Vec<String> = clients.iter().filter(|c| c.app().is_some_and(|a| apps.contains(&a)) || self.st.foreign.get(&c.address).is_some_and(|f| f.workspace.as_deref() == Some(ws))).map(|c| c.address.clone()).collect();
+                    let windows: Vec<String> = clients.iter().filter(|c| c.app().is_some_and(|a| apps.contains(&a))).map(|c| c.address.clone()).collect();
                     json!({ "name": ws, "icon": w.and_then(|w| w.icon.clone()), "active": d.active.as_deref() == Some(ws), "apps": apps, "windows": windows })
                 })
                 .collect();
@@ -1059,8 +1042,7 @@ impl Daemon {
         let windows: Vec<Value> = clients
             .iter()
             .map(|c| {
-                let f = self.st.foreign.get(&c.address);
-                json!({ "address": c.address, "class": c.class, "title": c.title, "app": c.app(), "workspace": c.workspace.name, "attached": f.and_then(|f| f.workspace.clone()), "rect": c.rect(), "pid": c.pid })
+                json!({ "address": c.address, "class": c.class, "title": c.title, "app": c.app(), "workspace": c.workspace.name, "foreign": self.st.foreign.contains_key(&c.address), "rect": c.rect(), "pid": c.pid })
             })
             .collect();
         let pending: Vec<Value> = self.pending.iter().map(|p| json!({ "app": p.app, "pid": p.child.id(), "desktop": p.desktop })).collect();
@@ -1117,24 +1099,6 @@ fn proc_exe(pid: i32) -> Option<PathBuf> {
 }
 
 fn which(cmd: &str) -> Option<PathBuf> {
-/// Кандидат на захват: не на `special:hidden`, класс и заголовок подходят,
-/// тега нет или он принадлежит приложению, которого нет в конфиге. Окно на
-/// обычном столе предпочтительнее окна на `special:pool`.
-fn pick_candidate(clients: &[Client], cfg: &Config, class_re: &regex::Regex, title_re: Option<&regex::Regex>) -> Option<usize> {
-    let fits = |c: &Client| !c.on_hidden() && class_re.is_match(&c.class) && title_re.is_none_or(|t| t.is_match(&c.title)) && c.app().is_none_or(|a| !cfg.apps.contains_key(&a));
-    let mut pool = None;
-    for (i, c) in clients.iter().enumerate() {
-        if !fits(c) {
-            continue;
-        }
-        if !c.on_pool() {
-            return Some(i);
-        }
-        pool.get_or_insert(i);
-    }
-    pool
-}
-
     if cmd.contains('/') {
         return Some(PathBuf::from(cmd));
     }
@@ -1151,6 +1115,24 @@ pub fn set_lazy(d: &mut Daemon, map: BTreeMap<u8, String>) {
 /// складываются, и расстояние до краёв то же.
 fn maximize_rect(work_area: PxRect, gap: i32) -> PxRect {
     work_area.inset(2 * gap)
+}
+
+/// Кандидат на захват: не на `special:hidden`, класс и заголовок подходят,
+/// тега нет или он принадлежит приложению, которого нет в конфиге. Окно на
+/// обычном столе предпочтительнее окна на `special:pool`.
+fn pick_candidate(clients: &[Client], cfg: &Config, class_re: &regex::Regex, title_re: Option<&regex::Regex>) -> Option<usize> {
+    let fits = |c: &Client| !c.on_hidden() && class_re.is_match(&c.class) && title_re.is_none_or(|t| t.is_match(&c.title)) && c.app().is_none_or(|a| !cfg.apps.contains_key(&a));
+    let mut pool = None;
+    for (i, c) in clients.iter().enumerate() {
+        if !fits(c) {
+            continue;
+        }
+        if !c.on_pool() {
+            return Some(i);
+        }
+        pool.get_or_insert(i);
+    }
+    pool
 }
 
 /// Позиция окна по правилу одинаковых расстояний: рабочая область сужается на
@@ -1211,6 +1193,24 @@ mod tests {
         assert_eq!(grid_cell(panel, 5, 2, 1, 1, 0), PxRect { x: 2090, y: 10, w: 1740, h: 2140 });
         let full = PxRect { x: 0, y: 0, w: 3840, h: 2160 };
         assert_eq!(grid_cell(full, 5, 2, 1, 0, 0), PxRect { x: 10, y: 10, w: 1905, h: 2140 });
+        assert_eq!(grid_cell(full, 5, 1, 2, 0, 1), PxRect { x: 10, y: 1085, w: 3820, h: 1065 });
+    }
+
+    #[test]
+    fn place_positions_with_panel() {
+        let panel = PxRect { x: 330, y: 0, w: 3510, h: 2160 };
+        let r = |p| place_rect(panel, 5, p).unwrap();
+        assert_eq!(r("top-left"), PxRect { x: 340, y: 10, w: 1740, h: 1065 });
+        assert_eq!(r("top-center"), PxRect { x: 1215, y: 10, w: 1740, h: 1065 });
+        assert_eq!(r("top-right"), PxRect { x: 2090, y: 10, w: 1740, h: 1065 });
+        assert_eq!(r("bottom-left"), PxRect { x: 340, y: 1085, w: 1740, h: 1065 });
+        assert_eq!(r("bottom-center"), PxRect { x: 1215, y: 1085, w: 1740, h: 1065 });
+        assert_eq!(r("bottom-right"), PxRect { x: 2090, y: 1085, w: 1740, h: 1065 });
+        assert_eq!(r("center"), PxRect { x: 1215, y: 10, w: 1740, h: 2140 });
+        assert_eq!(r("full"), maximize_rect(panel, 5));
+        assert!(place_rect(panel, 5, "left").is_err());
+    }
+
     fn client(addr: &str, class: &str, title: &str, ws: &str, tags: &[&str]) -> Client {
         serde_json::from_value(json!({
             "address": addr, "class": class, "title": title, "workspace": { "id": 1, "name": ws },
@@ -1241,24 +1241,6 @@ mod tests {
         let (cre, tre) = cfg.apps["neovide"].matchers().unwrap().unwrap();
         assert_eq!(pick_candidate(&clients, &cfg, &cre, tre.as_ref()), Some(5));
         assert_eq!(pick_candidate(&clients[..1], &cfg, &cre, tre.as_ref()), None);
-    }
-
-        assert_eq!(grid_cell(full, 5, 1, 2, 0, 1), PxRect { x: 10, y: 1085, w: 3820, h: 1065 });
-    }
-
-    #[test]
-    fn place_positions_with_panel() {
-        let panel = PxRect { x: 330, y: 0, w: 3510, h: 2160 };
-        let r = |p| place_rect(panel, 5, p).unwrap();
-        assert_eq!(r("top-left"), PxRect { x: 340, y: 10, w: 1740, h: 1065 });
-        assert_eq!(r("top-center"), PxRect { x: 1215, y: 10, w: 1740, h: 1065 });
-        assert_eq!(r("top-right"), PxRect { x: 2090, y: 10, w: 1740, h: 1065 });
-        assert_eq!(r("bottom-left"), PxRect { x: 340, y: 1085, w: 1740, h: 1065 });
-        assert_eq!(r("bottom-center"), PxRect { x: 1215, y: 1085, w: 1740, h: 1065 });
-        assert_eq!(r("bottom-right"), PxRect { x: 2090, y: 1085, w: 1740, h: 1065 });
-        assert_eq!(r("center"), PxRect { x: 1215, y: 10, w: 1740, h: 2140 });
-        assert_eq!(r("full"), maximize_rect(panel, 5));
-        assert!(place_rect(panel, 5, "left").is_err());
     }
 
     #[test]

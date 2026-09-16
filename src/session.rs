@@ -41,17 +41,14 @@ pub fn snapshot(d: &Daemon) -> Result<Session> {
         if let Some(app) = c.app() {
             windows.push(SessionWindow { app: Some(app), workspace: None, desktop, rect: c.rect(), cmd: vec![], cwd: None });
         } else if c.pid > 0 {
-            let (workspace, cmd, cwd) = match st.foreign.get(&c.address) {
-                Some(f) => (f.workspace.clone(), f.cmd.clone(), f.cwd.clone()),
-                None => {
-                    let (cmd, cwd) = proc_info(c.pid);
-                    (None, cmd, cwd)
-                }
+            let (cmd, cwd) = match st.foreign.get(&c.address) {
+                Some(f) => (f.cmd.clone(), f.cwd.clone()),
+                None => proc_info(c.pid),
             };
             if cmd.is_empty() {
                 continue;
             }
-            windows.push(SessionWindow { app: None, workspace, desktop, rect: c.rect(), cmd, cwd });
+            windows.push(SessionWindow { app: None, workspace: None, desktop, rect: c.rect(), cmd, cwd });
         }
     }
     Ok(Session {
@@ -180,11 +177,10 @@ fn adopt_live_foreign(d: &mut Daemon, snapshot: &[SessionWindow]) {
         match hit {
             Some((i, w)) => {
                 used[i] = true;
-                st.foreign.insert(c.address.clone(), Foreign { workspace: w.workspace.clone(), rect: w.rect, cmd, cwd });
+                st.foreign.insert(c.address.clone(), Foreign { rect: w.rect, cmd, cwd });
             }
             None => {
-                let ws = c.desktop().and_then(|n| st.desktops.get(&n)).and_then(|x| x.active.clone());
-                st.foreign.insert(c.address.clone(), Foreign { workspace: ws, rect: c.rect(), cmd, cwd });
+                st.foreign.insert(c.address.clone(), Foreign { rect: c.rect(), cmd, cwd });
             }
         }
     }
@@ -203,7 +199,7 @@ fn spawn_missing_foreign(d: &mut Daemon, snapshot: &[SessionWindow]) -> Result<(
             continue;
         }
         let desktop = w.desktop.parse::<u8>().ok();
-        d.expect_foreign(ExpectedForeign { cmd: w.cmd.clone(), cwd: w.cwd.clone(), workspace: w.workspace.clone(), desktop, rect: w.rect });
+        d.expect_foreign(ExpectedForeign { cmd: w.cmd.clone(), cwd: w.cwd.clone(), desktop, rect: w.rect });
         if let Err(e) = d.spawn_foreign(&w.cmd, w.cwd.as_deref()) {
             log::warn!("восстановление окна {:?}: {e:#}", w.cmd);
         }

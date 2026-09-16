@@ -6,6 +6,7 @@ use toml_edit::{DocumentMut, InlineTable, Item, Table, Value, value};
 
 use crate::config::PxRect;
 use crate::daemon::Daemon;
+use crate::hypr;
 use crate::state::Place;
 
 fn rect_table(r: PxRect) -> InlineTable {
@@ -68,31 +69,49 @@ pub fn save_workspace(d: &mut Daemon) -> Result<String> {
         };
         apps_tab.insert(app, item);
     }
-    // Посторонние окна, привязанные к workspace, становятся приложениями.
+    // Посторонние окна на столе workspace становятся его приложениями: описанное
+    // в конфиге приложение вне workspace — под своим именем, остальные — новой
+    // записью в [apps] по команде процесса. Окно получает тег приложения и
+    // перестаёт быть посторонним; свободные окна на других столах не трогаются.
     let mut taken: Vec<String> = cfg.apps.keys().cloned().collect();
-    let foreign: Vec<(String, crate::state::Foreign)> = d.state().foreign.iter().filter(|(_, f)| f.workspace.as_deref() == Some(&ws)).map(|(a, f)| (a.clone(), f.clone())).collect();
-    for (addr, f) in foreign {
-        let Some(c) = clients.iter().find(|c| c.address == addr) else { continue };
-        if f.cmd.is_empty() {
+    let mut ex = Vec::new();
+    let mut adopted = Vec::new();
+    for c in clients.iter().filter(|c| c.desktop() == Some(n)) {
+        if c.app().is_some_and(|a| cells.contains_key(&a)) {
             continue;
         }
-        let name = app_name(&c.class, &taken);
-        taken.push(name.clone());
-        let apps_root = root.entry("apps").or_insert(Item::Table(Table::new())).as_table_mut().context("[apps] не таблица")?;
-        let mut t = Table::new();
-        t["cmd"] = value(f.cmd[0].as_str());
-        if f.cmd.len() > 1 {
-            let mut arr = toml_edit::Array::new();
-            for a in &f.cmd[1..] {
-                arr.push(a.as_str());
+        let Some(f) = d.state().foreign.get(&c.address).cloned() else {
+            continue;
+        };
+        let name = match c.app() {
+            Some(a) if cfg.apps.contains_key(&a) => a,
+            _ => {
+                if f.cmd.is_empty() {
+                    continue;
+                }
+                let name = app_name(&c.class, &taken);
+                taken.push(name.clone());
+                let apps_root = root.entry("apps").or_insert(Item::Table(Table::new())).as_table_mut().context("[apps] не таблица")?;
+                let mut t = Table::new();
+                t["cmd"] = value(f.cmd[0].as_str());
+                if f.cmd.len() > 1 {
+                    let mut arr = toml_edit::Array::new();
+                    for a in &f.cmd[1..] {
+                        arr.push(a.as_str());
+                    }
+                    t["args"] = value(arr);
+                }
+                if let Some(cwd) = &f.cwd {
+                    t["cwd"] = value(cwd.as_str());
+                }
+                apps_root.insert(&name, Item::Table(t));
+                ex.push(hypr::d_tag(&c.address, &format!("app:{name}")));
+                name
             }
-            t["args"] = value(arr);
-        }
-        if let Some(cwd) = &f.cwd {
-            t["cwd"] = value(cwd.as_str());
-        }
-        apps_root.insert(&name, Item::Table(t));
+        };
         apps_tab.insert(&name, Item::Value(rect_item(c.rect())));
+        adopted.push(c.address.clone());
+        log::info!("сохранение: окно {} ({}) → приложение {name} workspace {ws}", c.address, c.class);
     }
     let wtab = doc["workspaces"][&ws].as_table_mut().unwrap();
     wtab.insert("apps", Item::Table(apps_tab));
@@ -103,6 +122,15 @@ pub fn save_workspace(d: &mut Daemon) -> Result<String> {
     std::fs::write(&tmp, &out)?;
     std::fs::rename(&tmp, &path)?;
     d.set_cfg_text(out);
+    if !ex.is_empty() {
+        d.hypr().dispatch_all(&ex)?;
+    }
+    for a in &adopted {
+        d.state_mut().foreign.remove(a);
+    }
+    // Назначения ячеек workspace пересобираются из только что записанного конфига,
+    // иначе новые приложения в них не попадут до перезапуска демона.
+    d.state_mut().cells.remove(&ws);
     d.reload_config();
     log::info!("workspace {ws} записан в конфиг");
     Ok(ws)
