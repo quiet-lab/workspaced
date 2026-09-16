@@ -339,7 +339,7 @@ impl Config {
                 bail!("привязка {:?}: пустой список dispatch", b.chain);
             }
             match &b.action {
-                Some(Action::Named(n)) if !matches!(n.as_str(), "sessions" | "save-workspace" | "next-workspace") => {
+                Some(Action::Named(n)) if !matches!(n.as_str(), "sessions" | "save-workspace" | "next-workspace" | "maximize") => {
                     bail!("привязка {:?}: неизвестное действие {n:?}", b.chain)
                 }
                 Some(Action::Half(HalfAction { half })) if !matches!(half.as_str(), "left" | "right" | "up" | "down") => {
@@ -463,6 +463,16 @@ apps = { terminal = "right" }
         assert_eq!(cfg.templates.len(), 1);
         assert_eq!(cfg.apps.len(), 1);
         assert_eq!(cfg.workspaces.len(), 1);
+    }
+
+    #[test]
+    fn named_actions_in_binds() {
+        // Служебные действия строкой: известное принимается, опечатка отклоняется с указанием привязки.
+        let ok = format!("{MINIMAL}\n[[binds]]\nchain = \"SUPER+X\"\naction = \"maximize\"\n");
+        Config::parse(&ok).unwrap();
+        let bad = format!("{MINIMAL}\n[[binds]]\nchain = \"SUPER+X\"\naction = \"maximise\"\n");
+        let err = Config::parse(&bad).unwrap_err().to_string();
+        assert!(err.contains("SUPER+X") && err.contains("maximise"), "{err}");
     }
 
     #[test]

@@ -48,6 +48,9 @@ pub struct Client {
     pub floating: bool,
     #[serde(default)]
     pub mapped: bool,
+    /// Полноэкранный режим композитора: 0 — нет, 1 — maximized, 2 — fullscreen.
+    #[serde(default)]
+    pub fullscreen: i32,
 }
 
 impl Client {
@@ -229,6 +232,12 @@ pub fn d_place(addr: &str, r: PxRect) -> [String; 2] {
         format!("hl.dsp.window.resize({{ x = {}, y = {}, relative = false, {} }})", r.w, r.h, win(addr)),
         format!("hl.dsp.window.move({{ x = {}, y = {}, relative = false, {} }})", r.x, r.y, win(addr)),
     ]
+}
+
+/// Снять полноэкранный режим композитора с активного окна: `mode` — "fullscreen" (2)
+/// или "maximized" (1); `unset` с другим режимом состояние не снимает.
+pub fn d_fullscreen_unset(mode: &str) -> String {
+    format!("hl.dsp.window.fullscreen({{ mode = \"{mode}\", action = \"unset\" }})")
 }
 
 pub fn d_float_on(addr: &str) -> String {

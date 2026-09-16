@@ -235,6 +235,7 @@ pub fn collect(cfg: &Config) -> Result<Vec<Binding>> {
                         "sessions" => "workspaced sessions".to_string(),
                         "save-workspace" => "workspaced save-workspace".to_string(),
                         "next-workspace" => "workspaced next".to_string(),
+                        "maximize" => "workspaced maximize".to_string(),
                         other => bail!("привязка {:?}: неизвестное действие {other:?}", b.chain),
                     },
                     Action::Half(HalfAction { half }) => format!("workspaced half {half}"),
@@ -603,6 +604,9 @@ repeating = true
 chain = "SUPER+SHIFT+left"
 action = { half = "left" }
 [[binds]]
+chain = "SUPER+X"
+action = "maximize"
+[[binds]]
 chain = "SUPER+SHIFT+C"
 lua = """
 local soft = hl.get_config("cursor.no_hardware_cursors")
@@ -626,6 +630,7 @@ dispatch = "exit()"
         assert!(a.contains("hl.bind(\"ALT + Tab\", function() hl.dispatch(hl.dsp.window.cycle_next({ next = true })); hl.dispatch(hl.dsp.window.bring_to_top()) end)"), "{a}");
         assert!(a.contains("hl.bind(\"XF86AudioRaiseVolume\", hl.dsp.exec_cmd(\"~/.scripts/change-volume.sh +\"), { locked = true, repeating = true })"), "{a}");
         assert!(a.contains("hl.bind(\"SUPER + SHIFT + left\", hl.dsp.exec_cmd(\"workspaced half left\"))"), "{a}");
+        assert!(a.contains("hl.bind(\"SUPER + X\", hl.dsp.exec_cmd(\"workspaced maximize\"))"), "{a}");
         assert!(a.contains("hl.bind(\"SUPER + SHIFT + C\", function()\n  local ok, err = pcall(function()\n    local soft"), "{a}");
         assert!(a.contains("hl.define_submap(\"ws:SUPER + W 3\", function()"), "{a}");
         assert!(a.contains("ws_run(\"workspaced raise dev-front --desktop 3\")"), "{a}");
@@ -638,5 +643,6 @@ dispatch = "exit()"
         assert!(list.contains("SUPER+Return") && list.contains("exec wezterm-gui") && list.contains("binds[1]"), "{list}");
         assert!(list.contains("SUPER+W f") && list.contains("raise dev-front") && list.contains("workspaces.dev-front"), "{list}");
         assert!(list.contains("locked,repeating"), "{list}");
+        assert!(list.contains("SUPER+X") && list.contains("maximize"), "{list}");
     }
 }

@@ -1,7 +1,7 @@
 //! Демон: владелец модели. Слушает события Hyprland, выполняет команды клиентов
 //! и панели, запускает приложения, расставляет окна, пишет сессию `default`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
@@ -99,6 +99,8 @@ pub struct Daemon {
     pending: Vec<Pending>,
     subs: Vec<UnixStream>,
     dirty: Option<Instant>,
+    /// Геометрия окон до развёртывания (ключ — адрес окна), только в памяти.
+    maximized: HashMap<String, PxRect>,
 }
 
 pub fn socket_path() -> Result<PathBuf> {
@@ -169,7 +171,7 @@ pub fn run() -> Result<()> {
         });
     }
 
-    let mut d = Daemon { cfg, cfg_text, cfg_path, expected: Vec::new(), hypr, st: State::default(), mon, current, pending: Vec::new(), subs: Vec::new(), dirty: None };
+    let mut d = Daemon { cfg, cfg_text, cfg_path, expected: Vec::new(), hypr, st: State::default(), mon, current, pending: Vec::new(), subs: Vec::new(), dirty: None, maximized: HashMap::new() };
     d.startup()?;
     log::info!("демон запущен, стол {}, монитор {}×{}", d.current, d.mon.0, d.mon.1);
     for msg in rx {
@@ -842,11 +844,71 @@ impl Daemon {
             other => bail!("half: неизвестная сторона {other:?} (left, right, up, down)"),
         };
         let r = cell.inset(gap);
-        let mut ex = vec![hypr::d_float_on(&win.address)];
-        ex.extend(hypr::d_place(&win.address, r));
-        self.hypr.dispatch_all(&ex)?;
+        self.place_floating(&win.address, r)?;
         log::info!("half {side}: {} → {},{} {}×{}", win.address, r.x, r.y, r.w, r.h);
+        Ok(())
+    }
+
+    /// Окно плавающим в заданный прямоугольник; сессия `default` запомнит новое положение.
+    fn place_floating(&mut self, addr: &str, r: PxRect) -> Result<()> {
+        let mut ex = vec![hypr::d_float_on(addr)];
+        ex.extend(hypr::d_place(addr, r));
+        self.hypr.dispatch_all(&ex)?;
         self.mark_dirty();
+        Ok(())
+    }
+
+    // ---- Развёртывание окна -------------------------------------------------------
+
+    /// Активное окно на всю рабочую область с отступом 2·gap от каждого края, как у
+    /// половин и ячеек. Повторный вызов на развёрнутом окне возвращает геометрию,
+    /// запомненную перед развёртыванием; сдвинутое окно разворачивается заново.
+    /// Полноэкранное окно сначала выводится из полноэкранного режима и всегда
+    /// оказывается развёрнутым: возврат прежней геометрии — следующим вызовом.
+    fn maximize(&mut self) -> Result<()> {
+        let Some(mut win) = self.hypr.active_window()? else {
+            log::info!("maximize: активного окна нет");
+            return Ok(());
+        };
+        let mut from_fullscreen = false;
+        if win.fullscreen != 0 {
+            // В полноэкранном режиме j/activewindow отдаёт размер экрана, а не окна:
+            // геометрию читаем заново после выхода. Снимается только тот режим,
+            // в котором окно находится (2 — fullscreen, 1 — maximized).
+            let mode = if win.fullscreen == 2 { "fullscreen" } else { "maximized" };
+            self.hypr.dispatch(&hypr::d_fullscreen_unset(mode))?;
+            win = match self.hypr.active_window()? {
+                Some(w) if w.address == win.address => w,
+                _ => {
+                    log::info!("maximize: окно {} пропало после выхода из полноэкранного режима", win.address);
+                    return Ok(());
+                }
+            };
+            from_fullscreen = true;
+        }
+        // Забыть окна, которых уже нет.
+        let alive: Vec<String> = self.hypr.clients()?.into_iter().map(|c| c.address).collect();
+        self.maximized.retain(|a, _| alive.contains(a));
+
+        let target = maximize_rect(self.hypr.active_monitor()?.work_area(), self.cfg.gap);
+        let cur = win.rect();
+        if cur == target {
+            if from_fullscreen {
+                log::info!("maximize: {} вышло из полноэкранного режима, уже развёрнуто", win.address);
+                return Ok(());
+            }
+            match self.maximized.remove(&win.address) {
+                Some(prev) => {
+                    self.place_floating(&win.address, prev)?;
+                    log::info!("maximize: {} возвращено → {},{} {}×{}", win.address, prev.x, prev.y, prev.w, prev.h);
+                }
+                None => log::info!("maximize: окно {} уже развёрнуто, прежняя геометрия неизвестна", win.address),
+            }
+            return Ok(());
+        }
+        self.maximized.insert(win.address.clone(), cur);
+        self.place_floating(&win.address, target)?;
+        log::info!("maximize: {} → {},{} {}×{}", win.address, target.x, target.y, target.w, target.h);
         Ok(())
     }
 
@@ -879,6 +941,7 @@ impl Daemon {
                 Some(side) => self.half(&side).map(|_| json!({"ok": true})),
                 None => Err(anyhow::anyhow!("нет side")),
             },
+            "maximize" => self.maximize().map(|_| json!({"ok": true})),
             "remove" => match s("workspace") {
                 Some(ws) => self.remove(&ws, desktop).map(|_| json!({"ok": true})),
                 None => Err(anyhow::anyhow!("нет workspace")),
@@ -1004,4 +1067,29 @@ fn which(cmd: &str) -> Option<PathBuf> {
 /// Ленивое поднятие для стола: используется при восстановлении сессии.
 pub fn set_lazy(d: &mut Daemon, map: BTreeMap<u8, String>) {
     d.st.lazy = map;
+}
+
+/// Развёрнутая область: рабочая область без 2·gap с каждой стороны. У `half`
+/// рабочая область сужается на gap, затем половина ещё на gap; здесь оба шага
+/// складываются, и расстояние до краёв то же.
+fn maximize_rect(work_area: PxRect, gap: i32) -> PxRect {
+    work_area.inset(2 * gap)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maximize_rect_with_panel_on_the_left() {
+        // Монитор 3840×2160, панель резервирует 330 px слева, gap = 5.
+        let area = PxRect { x: 330, y: 0, w: 3510, h: 2160 };
+        assert_eq!(maximize_rect(area, 5), PxRect { x: 340, y: 10, w: 3490, h: 2140 });
+    }
+
+    #[test]
+    fn maximize_rect_without_reserved() {
+        let area = PxRect { x: 0, y: 0, w: 3840, h: 2160 };
+        assert_eq!(maximize_rect(area, 5), PxRect { x: 10, y: 10, w: 3820, h: 2140 });
+    }
 }
