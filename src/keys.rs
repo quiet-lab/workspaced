@@ -138,11 +138,12 @@ impl Flags {
     fn any(&self) -> bool {
         !self.names().is_empty()
     }
-    /// Флаги для `hl.bind`. Удержание кнопки мыши в заглушках API 0.56 называется
-    /// `drag`, в примерах и старых конфигах — `mouse`; печатаются оба, лишний
-    /// ключ композитор не считает ошибкой.
+    /// Флаги для `hl.bind`. Удержание кнопки мыши — `mouse`, как в примере из
+    /// поставки Hyprland; флаг `drag` из заглушек API означает другое: привязка
+    /// срабатывает по отпусканию кнопки, и перетаскивание начиналось бы со
+    /// второго клика.
     fn lua(&self) -> String {
-        let name = |n: &str| if n == "mouse" { "drag = true, mouse = true".to_string() } else { format!("{n} = true") };
+        let name = |n: &str| format!("{n} = true");
         format!("{{ {} }}", self.names().iter().map(|n| name(n)).collect::<Vec<_>>().join(", "))
     }
     fn describe(&self) -> String {
@@ -564,7 +565,7 @@ apps = { firefox-chat = "c" }
         assert!(err.contains("одного выражения dispatch"), "{err}");
         let text = base() + "\n[[binds]]\nchain = \"SUPER+mouse:272\"\nmouse = true\ndispatch = \"window.drag()\"\n";
         let lua = to_lua(&Config::parse(&text).unwrap()).unwrap();
-        assert!(lua.contains("hl.bind(\"SUPER + mouse:272\", hl.dsp.window.drag(), { drag = true, mouse = true })"), "{lua}");
+        assert!(lua.contains("hl.bind(\"SUPER + mouse:272\", hl.dsp.window.drag(), { mouse = true })"), "{lua}");
     }
 
     #[test]
