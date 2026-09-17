@@ -593,11 +593,18 @@ impl Daemon {
     }
 
     /// Поднять workspace на столе (design D5).
+    /// Стол, на котором workspace сейчас активен.
+    fn active_desktop_of(&self, ws: &str) -> Option<u8> {
+        self.st.desktops.iter().find(|(_, d)| d.active.as_deref() == Some(ws)).map(|(n, _)| *n)
+    }
+
     pub fn raise(&mut self, ws: &str, desktop: Option<u8>) -> Result<()> {
         if !self.cfg.workspaces.contains_key(ws) {
             bail!("workspace {ws} не найден");
         }
-        let n = desktop.unwrap_or(self.current);
+        // Без явного стола workspace, уже активный на другом столе, не переезжает:
+        // демон переходит на тот стол и отдаёт фокус главному окну.
+        let n = desktop.unwrap_or_else(|| self.active_desktop_of(ws).unwrap_or(self.current));
         let w = self.cfg.workspaces[ws].clone();
         let apps: Vec<String> = w.apps.keys().cloned().collect();
         let mut clients = self.hypr.clients()?;
@@ -738,11 +745,12 @@ impl Daemon {
         {
             return self.make_main(&ws, &a);
         }
-        // 2. Список текущего стола по порядку.
+        // 2. Список текущего стола по порядку (workspace, активный на другом
+        // столе, поднимается там же, см. raise).
         let list = self.st.desktop(n).workspaces.clone();
         for ws in &list {
             if let Some(a) = in_ws(&self.cfg, ws) {
-                self.raise(ws, Some(n))?;
+                self.raise(ws, None)?;
                 return self.make_main(ws, &a);
             }
         }
