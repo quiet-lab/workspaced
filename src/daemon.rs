@@ -40,6 +40,10 @@ struct Pending {
     exe: Option<PathBuf>,
     /// Имя команды для мягкого сопоставления с классом окна.
     cmd_base: String,
+    /// Выражения `class` и `title` приложения: окно из контейнера (distrobox,
+    /// podman) не потомок запущенного процесса, его узнают только по ним.
+    class_re: Option<regex::Regex>,
+    title_re: Option<regex::Regex>,
     started: Instant,
     /// Процесс завершился без окна: ещё немного ждём новое окно у чужого процесса.
     exited_at: Option<Instant>,
@@ -53,6 +57,9 @@ impl Pending {
         if ancestors.contains(&(self.child.id() as i32)) {
             return true;
         }
+        if matcher_fits(self.class_re.as_ref(), self.title_re.as_ref(), c) {
+            return true;
+        }
         if let Some(e) = &self.exe
             && proc_exe(c.pid).as_ref() == Some(e)
         {
@@ -60,6 +67,12 @@ impl Pending {
         }
         class_matches(&c.class, &self.cmd_base)
     }
+}
+
+/// Окно целиком подходит под `class` и, если задано, `title` приложения;
+/// без `class` сопоставления нет.
+fn matcher_fits(class_re: Option<&regex::Regex>, title_re: Option<&regex::Regex>, c: &Client) -> bool {
+    class_re.is_some_and(|cr| cr.is_match(&c.class)) && title_re.is_none_or(|t| t.is_match(&c.title))
 }
 
 /// Класс окна содержит имя команды или наоборот (без учёта регистра).
@@ -547,8 +560,9 @@ impl Daemon {
         let child = command.spawn().with_context(|| format!("{app}: не удалось запустить {cmd}"))?;
         let exe = which(&cmd).and_then(|p| p.canonicalize().ok());
         let cmd_base = Path::new(&cmd).file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+        let (class_re, title_re) = a.matchers()?.map_or((None, None), |(c, t)| (Some(c), t));
         log::info!("{app}: запущен pid {} ({cmd} {})", child.id(), args.join(" "));
-        self.pending.push(Pending { app: app.to_string(), workspace: workspace.map(String::from), desktop, child, exe, cmd_base, started: Instant::now(), exited_at: None, target, focus });
+        self.pending.push(Pending { app: app.to_string(), workspace: workspace.map(String::from), desktop, child, exe, cmd_base, class_re, title_re, started: Instant::now(), exited_at: None, target, focus });
         Ok(())
     }
 
@@ -1225,6 +1239,22 @@ mod tests {
             "tags": tags, "at": [0, 0], "size": [10, 10], "floating": true, "mapped": true
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn matcher_fits_by_class_and_title() {
+        let class_re = regex::Regex::new("^(?:(?i)^google-chrome$)$").unwrap();
+        let title_re = regex::Regex::new("^herdr · ").unwrap();
+        let chrome = client("0x1", "google-chrome", "Новая вкладка", "2", &[]);
+        let term = client("0x2", "org.wezfurlong.wezterm", "herdr · dev-lab", "1", &[]);
+        let other = client("0x3", "org.wezfurlong.wezterm", "bash · mne", "1", &[]);
+        assert!(matcher_fits(Some(&class_re), None, &chrome));
+        assert!(!matcher_fits(Some(&class_re), None, &term));
+        let wez = regex::Regex::new("^org\\.wezfurlong\\.wezterm$").unwrap();
+        assert!(matcher_fits(Some(&wez), Some(&title_re), &term));
+        assert!(!matcher_fits(Some(&wez), Some(&title_re), &other));
+        // Без class сопоставления нет, даже если title подходит.
+        assert!(!matcher_fits(None, Some(&title_re), &term));
     }
 
     #[test]
