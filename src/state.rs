@@ -71,13 +71,14 @@ impl State {
         })
     }
 
-    /// Прямоугольник окна приложения в workspace с учётом зазора для ячеек.
+    /// Прямоугольник окна приложения в workspace: ячейка шаблона или `rect`, как
+    /// записано в конфиге, без отступов от демона.
     pub fn rect_for(&mut self, cfg: &Config, ws: &str, app: &str, mon: (i32, i32)) -> Option<PxRect> {
         let place = self.cells_of(cfg, ws, mon).get(app)?.clone();
         match place {
             Place::Cell(c) => {
                 let t = cfg.templates.get(&cfg.workspaces.get(ws)?.template)?;
-                Some(t.cells.get(&c)?.resolve(mon.0, mon.1).inset(cfg.gap))
+                Some(t.cells.get(&c)?.resolve(mon.0, mon.1))
             }
             Place::Rect { rect } => Some(rect),
         }

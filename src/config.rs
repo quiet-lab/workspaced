@@ -92,7 +92,8 @@ impl Rect {
 }
 
 impl PxRect {
-    /// Прямоугольник, уменьшенный на зазор с каждой стороны.
+    /// Прямоугольник, уменьшенный на зазор с каждой стороны. Нужен командам
+    /// `half`, `place` и `maximize`; ячейки и `rect` из конфига не трогает.
     pub fn inset(self, gap: i32) -> PxRect {
         PxRect { x: self.x + gap, y: self.y + gap, w: (self.w - 2 * gap).max(1), h: (self.h - 2 * gap).max(1) }
     }
@@ -293,6 +294,8 @@ pub struct Config {
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub keys: Keys,
+    /// Зазор для команд `half`, `place` и `maximize`; ячейки шаблонов и `rect`
+    /// приложений передаются композитору как записаны.
     #[serde(default)]
     pub gap: i32,
     #[serde(default)]
