@@ -12,10 +12,10 @@ use std::sync::mpsc::{self, Sender};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
-use crate::config::{Config, Placement, PxRect, config_path};
+use crate::config::{Config, Mode, Placement, PxRect, config_path};
 use crate::hypr::{self, Client, Event, Hypr};
 use crate::session;
-use crate::state::{ExtraApp, Foreign, Place, State};
+use crate::state::{Cycle, ExtraApp, Foreign, Place, State};
 
 /// Куда поставить окно после появления.
 #[derive(Debug, Clone)]
@@ -471,6 +471,7 @@ impl Daemon {
             }
             Event::CloseWindow { addr } => {
                 self.st.foreign.remove(&addr);
+                self.forget_window(&addr);
                 self.broadcast();
                 true
             }
@@ -492,7 +493,16 @@ impl Daemon {
                 }
                 _ => false,
             },
-            Event::ActiveWindow { .. } | Event::Other(_) => false,
+            Event::ActiveWindow { .. } => {
+                // Последнее окно workspace, получавшее фокус: из него берётся
+                // prev, когда цикл начинается с чужого окна. Состояние окон
+                // при этом не меняется, поэтому снимок сессии не пишется.
+                if let Err(e) = self.on_focus() {
+                    log::warn!("смена фокуса: {e:#}");
+                }
+                false
+            }
+            Event::Other(_) => false,
         };
         // Снимок сессии пишет обработчик события, а не отложенная запись
         // по таймеру: одна запись на событие, изменившее состояние.
@@ -729,10 +739,20 @@ impl Daemon {
         // Без явного стола workspace, уже активный на другом столе, не переезжает:
         // демон переходит на тот стол и отдаёт фокус главному окну.
         let n = desktop.unwrap_or_else(|| self.active_desktop_of(ws).unwrap_or(self.current));
+        // Ленивое поднятие для этого стола больше не нужно: workspace там
+        // поднимает эта команда. Иначе событие смены стола пришло бы следом
+        // и отдало фокус главному окну поверх того, что сделала команда.
+        self.st.lazy.remove(&n);
         let w = self.cfg.workspaces[ws].clone();
         let apps: Vec<String> = w.apps.keys().cloned().collect();
+        let stack = w.mode() == Mode::Stack;
         let mut clients = self.hypr.clients()?;
         self.adopt_untagged(&mut clients, &apps)?;
+        // Вытесняемый workspace запоминает, где оставлены его окна: в режиме
+        // `stack` следующее поднятие вернёт их именно туда.
+        if let Some(old) = self.st.desktops.get(&n).and_then(|d| d.active.clone()).filter(|a| a != ws) {
+            self.remember_geometry(&old, &clients);
+        }
         let mut ex = Vec::new();
         if n != self.current {
             ex.push(hypr::d_focus_desktop(n));
@@ -751,10 +771,21 @@ impl Daemon {
                 continue;
             }
             for c in wins.iter().filter(|c| !c.on_hidden()) {
-                if c.desktop() != Some(n) {
+                let moving = c.desktop() != Some(n);
+                if moving {
                     ex.push(hypr::d_move_to(&c.address, &n.to_string()));
                 }
-                if let Some(r) = rect {
+                if stack {
+                    // Окно, уже стоящее на столе, поднятие не двигает: оно там,
+                    // где его оставил пользователь. Вернувшееся окно встаёт
+                    // в запомненный прямоугольник, а без него — на место из конфига.
+                    let kept = self.st.geom.get(ws).and_then(|g| g.get(&c.address)).copied();
+                    let target = if moving { kept.or(rect) } else { None };
+                    if let Some(r) = target {
+                        ex.extend(hypr::d_place(&c.address, r));
+                    }
+                    self.st.geom.entry(ws.to_string()).or_default().insert(c.address.clone(), target.unwrap_or_else(|| c.rect()));
+                } else if let Some(r) = rect {
                     ex.extend(hypr::d_place(&c.address, r));
                 }
             }
@@ -794,56 +825,168 @@ impl Daemon {
         Ok(())
     }
 
-    /// Сделать приложение главным в workspace: обмен ячеек с текущим главным.
-    /// Стопки приложений меняются ячейками целиком, фокус и верхнее место
-    /// получает первый экземпляр вызванного приложения.
-    fn make_main(&mut self, ws: &str, app: &str) -> Result<()> {
-        let mut clients = self.hypr.clients()?;
-        self.adopt_untagged(&mut clients, std::slice::from_ref(&app.to_string()))?;
-        let ws_apps: Vec<String> = self.cfg.workspaces[ws].apps.keys().cloned().collect();
-        let n = self.current;
-        let main_app = self.st.main_app(&self.cfg, ws, self.mon);
-        let main_cell = self.cfg.templates[&self.cfg.workspaces[ws].template].main.clone();
-        if main_app.as_deref() != Some(app) {
-            // Обмен виден потом в снимке сессии и в записи workspace, поэтому
-            // след в журнале нужен: иначе причину перестановки не восстановить.
-            log::info!("{ws}: {app} становится главным, прежнее главное — {}", main_app.as_deref().unwrap_or("нет"));
-            swap_cells(self.st.cells_of(&self.cfg, ws, self.mon), main_app.as_deref(), app, &main_cell);
+    /// Последнее окно workspace, получавшее фокус. Берётся из события
+    /// `activewindow`: опроса нет, сведение приходит от композитора. Из него
+    /// выводится prev, когда цикл начинается с чужого окна.
+    fn on_focus(&mut self) -> Result<()> {
+        let Some(c) = self.hypr.active_window()? else { return Ok(()) };
+        let Some(n) = c.desktop() else { return Ok(()) };
+        let Some(ws) = self.st.desktops.get(&n).and_then(|d| d.active.clone()) else { return Ok(()) };
+        let ws_apps = self.ws_apps(&ws);
+        if ws_app_of(&self.cfg, &ws_apps, &c).is_some() {
+            self.st.focus.insert(ws, c.address);
         }
-        let mut ex = Vec::new();
-        if let Some(m) = &main_app
-            && m != app
-            && let Some(r) = self.st.rect_for(&self.cfg, ws, m, self.mon)
-        {
-            for c in placed_windows(&self.cfg, &clients, &ws_apps, m).iter().filter(|c| !c.on_hidden()) {
-                ex.extend(hypr::d_place(&c.address, r));
+        Ok(())
+    }
+
+    /// Забыть закрытое окно: запомненный прямоугольник, последний фокус
+    /// workspace и окно возврата незаконченного цикла.
+    fn forget_window(&mut self, addr: &str) {
+        for g in self.st.geom.values_mut() {
+            g.remove(addr);
+        }
+        self.st.focus.retain(|_, a| a != addr);
+        for c in self.st.cycle.values_mut() {
+            if c.back.as_deref() == Some(addr) {
+                c.back = None;
             }
         }
-        let rect = self.st.rect_for(&self.cfg, ws, app, self.mon);
-        let wins = placed_windows(&self.cfg, &clients, &ws_apps, app);
-        if wins.is_empty() {
-            // Приложение без окон запускается; без cmd остаётся без окна, место пустым.
-            self.spawn(app, Some(ws), n, rect.map(Target::Place).unwrap_or(Target::Free(None)), true)?;
-        } else {
-            for c in wins.iter().filter(|c| !c.on_hidden()) {
+    }
+
+    /// Приложения workspace по порядку записи в его разделе.
+    fn ws_apps(&self, ws: &str) -> Vec<String> {
+        self.cfg.workspaces.get(ws).map(|w| w.apps.keys().cloned().collect()).unwrap_or_default()
+    }
+
+    /// Запомнить, где стоят окна workspace, прежде чем увести их со стола:
+    /// в режиме `stack` поднятие вернёт их именно туда. В режиме обмена ячеек
+    /// место задаёт конфиг, и запоминать нечего.
+    fn remember_geometry(&mut self, ws: &str, clients: &[Client]) {
+        if self.cfg.workspaces.get(ws).map(|w| w.mode()) != Some(Mode::Stack) {
+            return;
+        }
+        let cfg = self.cfg.clone();
+        let apps = self.ws_apps(ws);
+        for c in clients.iter().filter(|c| c.desktop().is_some()) {
+            if c.app().is_some_and(|a| apps.iter().any(|x| cfg.app_is(&a, x))) {
+                self.st.geom.entry(ws.to_string()).or_default().insert(c.address.clone(), c.rect());
+            }
+        }
+    }
+
+    /// Обмен ячеек: приложение занимает главную ячейку, прежнее главное — его.
+    /// Стопки меняются целиком, остальные окна не двигаются. Диспетчеры
+    /// дописываются в `ex`, чтобы обмен и фокус ушли одной последовательностью.
+    fn swap_to_main(&mut self, ws: &str, app: &str, clients: &[Client], ex: &mut Vec<String>) {
+        let cfg = self.cfg.clone();
+        let ws_apps = self.ws_apps(ws);
+        let main_app = self.st.main_app(&cfg, ws, self.mon);
+        if main_app.as_deref() == Some(app) {
+            return;
+        }
+        let Some(main_cell) = cfg.templates.get(&cfg.workspaces[ws].template).map(|t| t.main.clone()) else { return };
+        // Обмен виден потом в снимке сессии и в записи workspace, поэтому
+        // след в журнале нужен: иначе причину перестановки не восстановить.
+        log::info!("{ws}: {app} становится главным, прежнее главное — {}", main_app.as_deref().unwrap_or("нет"));
+        swap_cells(self.st.cells_of(&cfg, ws, self.mon), main_app.as_deref(), app, &main_cell);
+        let n = self.current;
+        for name in [main_app.as_deref(), Some(app)].into_iter().flatten() {
+            let Some(r) = self.st.rect_for(&cfg, ws, name, self.mon) else { continue };
+            for c in placed_windows(&cfg, clients, &ws_apps, name).iter().filter(|c| !c.on_hidden()) {
                 if c.desktop() != Some(n) {
                     ex.push(hypr::d_move_to(&c.address, &n.to_string()));
                 }
-                if let Some(r) = rect {
-                    ex.extend(hypr::d_place(&c.address, r));
-                }
-            }
-            if let Some(c) = wins.iter().find(|c| !c.on_hidden()) {
-                ex.push(hypr::d_focus_window(&c.address));
-                ex.push(hypr::d_bring_to_top());
+                ex.extend(hypr::d_place(&c.address, r));
             }
         }
+    }
+
+    /// Выбрать окно (спецификация ws-daemon, «Цепочка приложения»): в режиме
+    /// обмена ячеек приложение окна сначала занимает главную ячейку, в режиме
+    /// `stack` окно только поднимается наверх и получает фокус.
+    fn select_window(&mut self, ws: &str, addr: &str, clients: &[Client]) -> Result<()> {
+        let cfg = self.cfg.clone();
+        let ws_apps = self.ws_apps(ws);
+        let mut ex = Vec::new();
+        if cfg.workspaces.get(ws).map(|w| w.mode()) == Some(Mode::Swap)
+            && let Some(c) = clients.iter().find(|c| c.address == addr)
+            && let Some(app) = ws_app_of(&cfg, &ws_apps, c)
+        {
+            self.swap_to_main(ws, &app, clients, &mut ex);
+        }
+        ex.push(hypr::d_focus_window(addr));
+        ex.push(hypr::d_bring_to_top());
         self.hypr.dispatch_all(&ex)?;
         self.broadcast();
         Ok(())
     }
 
-    /// Цепочка приложения (design D6). `apps` — кандидаты с одной цепочкой.
+    /// Цикл по экземплярам приложения в workspace (спецификация ws-daemon,
+    /// «Цепочка приложения»). `fresh` означает, что workspace подняла эта же
+    /// цепочка: фокус уже отдан главному окну, и цикл начинается заново.
+    fn cycle(&mut self, ws: &str, app: &str, fresh: bool) -> Result<()> {
+        let mut clients = self.hypr.clients()?;
+        self.adopt_untagged(&mut clients, std::slice::from_ref(&app.to_string()))?;
+        let cfg = self.cfg.clone();
+        let ws_apps = self.ws_apps(ws);
+        let wins = placed_windows(&cfg, &clients, &ws_apps, app);
+        let order: Vec<String> = wins.iter().filter(|c| !c.on_hidden()).map(|c| c.address.clone()).collect();
+        if order.is_empty() && !wins.is_empty() {
+            // Все окна приложения спрятаны пользователем на `special:hidden`:
+            // второй экземпляр не запускается, показывать нечего.
+            log::info!("{app}: все окна скрыты, цикл пропущен");
+            return Ok(());
+        }
+        let active = self.hypr.active_window()?.map(|c| c.address);
+        let on_instance = active.as_deref().is_some_and(|a| order.iter().any(|x| x == a));
+        if fresh || !on_instance {
+            // Начало цикла: запомнить окно, к которому вернёт его конец.
+            let main_window = (cfg.workspaces.get(ws).map(|w| w.mode()) == Some(Mode::Swap))
+                .then(|| self.st.main_app(&cfg, ws, self.mon))
+                .flatten()
+                .filter(|m| m != app)
+                .and_then(|m| placed_windows(&cfg, &clients, &ws_apps, &m).into_iter().find(|c| !c.on_hidden()).map(|c| c.address.clone()));
+            let focus = self.st.focus.get(ws).cloned();
+            let back = anchor_window(&cfg, &clients, &ws_apps, main_window.as_deref(), &order, active.as_deref(), focus.as_deref());
+            self.st.cycle.insert(ws.to_string(), Cycle { app: app.to_string(), back });
+        }
+        let prev = self
+            .st
+            .cycle
+            .get(ws)
+            .filter(|c| c.app == app)
+            .and_then(|c| c.back.clone())
+            .filter(|a| clients.iter().any(|c| c.address == *a && !c.on_hidden()));
+        let next = next_app_window(&cfg, &clients, ws, app);
+        match cycle_step(&order, active.as_deref(), fresh, prev.as_deref(), next.as_deref()) {
+            CycleStep::Launch => {
+                // Запуск — это тоже выбор экземпляра: в режиме обмена ячеек
+                // приложение сначала занимает главную ячейку, и окно появляется
+                // уже в ней, а прежнее главное уходит в ячейку приложения.
+                let mut ex = Vec::new();
+                if cfg.workspaces.get(ws).map(|w| w.mode()) == Some(Mode::Swap) {
+                    self.swap_to_main(ws, app, &clients, &mut ex);
+                }
+                self.hypr.dispatch_all(&ex)?;
+                let rect = self.st.rect_for(&cfg, ws, app, self.mon);
+                let n = self.current;
+                self.spawn(app, Some(ws), n, rect.map(Target::Place).unwrap_or(Target::Free(None)), true)
+            }
+            CycleStep::Select(addr) => self.select_window(ws, &addr, &clients),
+            CycleStep::Back(addr) => {
+                log::info!("{ws}: цикл {app} закончен, возврат к окну {addr}");
+                self.select_window(ws, &addr, &clients)
+            }
+            CycleStep::NextApp(addr) => {
+                log::info!("{ws}: цикл {app} закончен, prev нет — следующее приложение workspace, окно {addr}");
+                self.select_window(ws, &addr, &clients)
+            }
+        }
+    }
+
+    /// Цепочка приложения: цикл по экземплярам в workspace приложения
+    /// (спецификация ws-daemon, «Цепочка приложения»). `apps` — кандидаты
+    /// с одной цепочкой: действует тот из них, чей workspace найдётся раньше.
     pub fn app(&mut self, apps: &[String], desktop: Option<u8>, workspace: Option<&str>) -> Result<()> {
         for a in apps {
             if !self.cfg.apps.contains_key(a) {
@@ -856,8 +999,12 @@ impl Daemon {
             self.hypr.dispatch(&hypr::d_focus_desktop(n))?;
             self.current = n;
         }
+        // Поднятый этой же цепочкой workspace начинает цикл заново: поднятие
+        // уже отдало фокус первому экземпляру главного приложения.
+        let mut raised = false;
         if let Some(ws) = workspace {
             self.raise(ws, None)?;
+            raised = true;
         }
         let in_ws = |cfg: &Config, ws: &str| -> Option<String> { apps.iter().find(|a| cfg.workspaces.get(ws).is_some_and(|w| w.apps.contains_key(*a))).cloned() };
         let n = self.current;
@@ -865,7 +1012,7 @@ impl Daemon {
         if let Some(ws) = self.st.desktop(n).active.clone()
             && let Some(a) = in_ws(&self.cfg, &ws)
         {
-            return self.make_main(&ws, &a);
+            return self.cycle(&ws, &a, raised);
         }
         // 2. Список текущего стола по порядку (workspace, активный на другом
         // столе, поднимается там же, см. raise).
@@ -873,7 +1020,7 @@ impl Daemon {
         for ws in &list {
             if let Some(a) = in_ws(&self.cfg, ws) {
                 self.raise(ws, None)?;
-                return self.make_main(ws, &a);
+                return self.cycle(ws, &a, true);
             }
         }
         // 3. Другие столы по возрастанию номера.
@@ -882,7 +1029,7 @@ impl Daemon {
             for ws in &list {
                 if let Some(a) = in_ws(&self.cfg, ws) {
                     self.raise(ws, Some(k))?;
-                    return self.make_main(ws, &a);
+                    return self.cycle(ws, &a, true);
                 }
             }
         }
@@ -890,28 +1037,35 @@ impl Daemon {
         for (ws, _) in self.cfg.workspaces.clone() {
             if let Some(a) = in_ws(&self.cfg, &ws) {
                 self.raise(&ws, Some(n))?;
-                return self.make_main(&ws, &a);
+                return self.cycle(&ws, &a, true);
             }
         }
-        // 4. Приложение без workspace: плавающее на своём месте по умолчанию
+        // 4. Приложение без workspace: цикл по его окнам без prev и без
+        // следующего приложения, поэтому за последним экземпляром идёт первый.
+        // Окно, которого ещё нет, открывается на своём месте по умолчанию
         // (`rect` приложения, а без него — центр экрана).
         let app = apps[0].clone();
         let mut clients = self.hypr.clients()?;
         self.adopt_untagged(&mut clients, apps)?;
         let wins = app_windows(&self.cfg, &clients, &app);
-        if let Some(c) = wins.iter().find(|c| !c.on_hidden()).or_else(|| wins.first()) {
-            // Повторная цепочка только даёт фокус первому экземпляру и поднимает
-            // его окно наверх, места не меняя.
-            let mut ex = Vec::new();
-            if c.on_hidden() {
-                ex.push(hypr::d_move_to(&c.address, &n.to_string()));
-            }
-            ex.push(hypr::d_focus_window(&c.address));
-            ex.push(hypr::d_bring_to_top());
+        let order: Vec<String> = wins.iter().filter(|c| !c.on_hidden()).map(|c| c.address.clone()).collect();
+        if order.is_empty()
+            && let Some(c) = wins.first()
+        {
+            // Все окна скрыты пользователем: показываем первое на этом столе.
+            let ex = vec![hypr::d_move_to(&c.address, &n.to_string()), hypr::d_focus_window(&c.address), hypr::d_bring_to_top()];
             return self.hypr.dispatch_all(&ex);
         }
-        let rect = State::app_rect(&self.cfg, &app, self.mon);
-        self.spawn(&app, None, n, Target::Free(rect), true)
+        let active = self.hypr.active_window()?.map(|c| c.address);
+        match cycle_step(&order, active.as_deref(), false, None, None) {
+            CycleStep::Launch => {
+                let rect = State::app_rect(&self.cfg, &app, self.mon);
+                self.spawn(&app, None, n, Target::Free(rect), true)
+            }
+            CycleStep::Select(addr) | CycleStep::Back(addr) | CycleStep::NextApp(addr) => {
+                self.hypr.dispatch_all(&[hypr::d_focus_window(&addr), hypr::d_bring_to_top()])
+            }
+        }
     }
 
     /// Следующий workspace в списке текущего стола.
@@ -934,6 +1088,7 @@ impl Daemon {
         if was_active {
             d.active = None;
             let clients = self.hypr.clients()?;
+            self.remember_geometry(ws, &clients);
             let apps: Vec<String> = self.cfg.workspaces.get(ws).map(|w| w.apps.keys().cloned().collect()).unwrap_or_default();
             let mut ex = Vec::new();
             for c in &clients {
@@ -1525,6 +1680,81 @@ fn adopt_plan(cfg: &Config, clients: &[Client], apps: &[String]) -> Result<Vec<(
     Ok(plan)
 }
 
+/// Приложение workspace, которому принадлежит окно: само приложение, если оно
+/// описано в workspace, иначе его семейство. Окно чужого приложения даёт `None`.
+fn ws_app_of(cfg: &Config, ws_apps: &[String], c: &Client) -> Option<String> {
+    let own = c.app()?;
+    if ws_apps.contains(&own) {
+        return Some(own);
+    }
+    ws_apps.iter().find(|x| cfg.app_is(&own, x)).cloned()
+}
+
+/// Что делает клавиша приложения на этом нажатии.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CycleStep {
+    /// Окон нет: запустить приложение.
+    Launch,
+    /// Выбрать окно (что значит «выбрать», решает режим workspace).
+    Select(String),
+    /// Цикл закончен: вернуться к окну prev.
+    Back(String),
+    /// Цикл закончен, prev нет: первое окно следующего приложения workspace.
+    NextApp(String),
+}
+
+/// Шаг цикла по экземплярам приложения (спецификация ws-daemon, «Цепочка
+/// приложения»). `order` — адреса экземпляров по порядку, `active` — активное
+/// окно, `fresh` — workspace только что поднят этой же цепочкой, `prev` — окно
+/// возврата, `next` — первое окно следующего приложения workspace.
+///
+/// Счётчика нажатий нет: шаг выводится из активного окна, поэтому выбор
+/// экземпляра мышью учёта не меняет.
+pub fn cycle_step(order: &[String], active: Option<&str>, fresh: bool, prev: Option<&str>, next: Option<&str>) -> CycleStep {
+    let Some(first) = order.first() else { return CycleStep::Launch };
+    if fresh {
+        return CycleStep::Select(first.clone());
+    }
+    match active.and_then(|a| order.iter().position(|x| x == a)) {
+        // Активно окно приложения, и за ним есть следующий экземпляр.
+        Some(i) if i + 1 < order.len() => CycleStep::Select(order[i + 1].clone()),
+        // Активен последний экземпляр: цикл закончен.
+        Some(_) => match (prev, next) {
+            (Some(p), _) => CycleStep::Back(p.to_string()),
+            (None, Some(n)) => CycleStep::NextApp(n.to_string()),
+            (None, None) => CycleStep::Select(first.clone()),
+        },
+        // Активно чужое окно: цикл начинается с первого экземпляра.
+        None => CycleStep::Select(first.clone()),
+    }
+}
+
+/// Окно, к которому вернёт конец цикла (prev). В режиме обмена ячеек это
+/// первое окно приложения, стоявшего в главной ячейке (`main_window`): конец
+/// цикла обязан вернуть расстановку. В режиме `stack` — активное окно
+/// workspace, а если активно чужое окно, то последнее окно workspace,
+/// получавшее фокус. Экземпляры самого вызванного приложения prev не бывают.
+pub fn anchor_window(cfg: &Config, clients: &[Client], ws_apps: &[String], main_window: Option<&str>, order: &[String], active: Option<&str>, focus: Option<&str>) -> Option<String> {
+    if let Some(m) = main_window {
+        return Some(m.to_string());
+    }
+    let fits = |a: &str| {
+        !order.iter().any(|x| x == a) && clients.iter().any(|c| c.address == a && !c.on_hidden() && ws_app_of(cfg, ws_apps, c).is_some())
+    };
+    active.filter(|a| fits(a)).or_else(|| focus.filter(|a| fits(a))).map(String::from)
+}
+
+/// Первое нескрытое окно следующего приложения workspace: по порядку записи
+/// в разделе workspace, циклически после вызванного. Приложения без окон
+/// пропускаются — конец цикла не запускает программу, которую не вызывали.
+pub fn next_app_window(cfg: &Config, clients: &[Client], ws: &str, app: &str) -> Option<String> {
+    let names: Vec<String> = cfg.workspaces.get(ws)?.apps.keys().cloned().collect();
+    let i = names.iter().position(|n| n == app)?;
+    (1..names.len())
+        .map(|k| &names[(i + k) % names.len()])
+        .find_map(|name| placed_windows(cfg, clients, &names, name).into_iter().find(|c| !c.on_hidden()).map(|c| c.address.clone()))
+}
+
 /// Обмен ячеек: приложение идёт в главную ячейку, прежнее главное — на его
 /// место. Стопка меняется ячейкой целиком, остальные окна не двигаются.
 fn swap_cells(cells: &mut BTreeMap<String, Place>, main_app: Option<&str>, app: &str, main_cell: &str) {
@@ -1959,6 +2189,87 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
         for (cmd, op) in [("status", None), ("sessions", None), ("session", Some("list")), ("session", Some("save"))] {
             assert!(!changes_state(cmd, op), "{cmd}");
         }
+    }
+
+    /// Окна `work`: herdr, chromium, neovide и одно свободное.
+    fn work_clients() -> Vec<Client> {
+        vec![
+            client("0x1", "wezterm-herdr", "herdr · dev-lab", "1", &["app:herdr#1"]),
+            client("0x2", "chromium", "Новости", "1", &["app:chromium#1"]),
+            client("0x3", "neovide", "[Scratch]", "1", &["app:neovide#1"]),
+            client("0x9", "Galculator", "Калькулятор", "1", &[]),
+        ]
+    }
+
+    #[test]
+    fn cycle_walks_instances_and_returns_to_prev() {
+        let a = |s: &str| s.to_string();
+        let order = vec![a("0x1"), a("0x2"), a("0x3")];
+        // Активно чужое окно: цикл начинается с первого экземпляра.
+        assert_eq!(cycle_step(&order, Some("0xf"), false, Some("0xf"), None), CycleStep::Select(a("0x1")));
+        // Дальше экземпляры идут по порядку.
+        assert_eq!(cycle_step(&order, Some("0x1"), false, Some("0xf"), None), CycleStep::Select(a("0x2")));
+        assert_eq!(cycle_step(&order, Some("0x2"), false, Some("0xf"), None), CycleStep::Select(a("0x3")));
+        // За последним экземпляром цикл заканчивается возвратом к prev.
+        assert_eq!(cycle_step(&order, Some("0x3"), false, Some("0xf"), None), CycleStep::Back(a("0xf")));
+        // prev нет: первое окно следующего приложения workspace.
+        assert_eq!(cycle_step(&order, Some("0x3"), false, None, Some("0x7")), CycleStep::NextApp(a("0x7")));
+        // Ни prev, ни следующего приложения: цикл начинается сначала.
+        assert_eq!(cycle_step(&order, Some("0x3"), false, None, None), CycleStep::Select(a("0x1")));
+        // Выбор экземпляра мышью учёта не меняет: после клика по второму окну
+        // следующее нажатие выбирает третье, а первое повторно не показывается.
+        assert_eq!(cycle_step(&order, Some("0x2"), false, None, None), CycleStep::Select(a("0x3")));
+        // Единственный экземпляр — переключатель «туда и обратно».
+        let one = vec![a("0x1")];
+        assert_eq!(cycle_step(&one, Some("0xf"), false, Some("0xf"), None), CycleStep::Select(a("0x1")));
+        assert_eq!(cycle_step(&one, Some("0x1"), false, Some("0xf"), None), CycleStep::Back(a("0xf")));
+        // Только что поднятый workspace начинает цикл заново.
+        assert_eq!(cycle_step(&order, Some("0x3"), true, Some("0xf"), None), CycleStep::Select(a("0x1")));
+        // Окон нет: приложение запускается.
+        assert_eq!(cycle_step(&[], Some("0xf"), false, None, None), CycleStep::Launch);
+        // Активного окна нет вовсе (пустой стол): первый экземпляр.
+        assert_eq!(cycle_step(&order, None, false, None, None), CycleStep::Select(a("0x1")));
+    }
+
+    #[test]
+    fn anchor_is_main_window_in_swap_and_previous_in_stack() {
+        let cfg = Config::parse(CFG).unwrap();
+        let ws_apps: Vec<String> = vec!["herdr".into(), "chromium".into(), "neovide".into()];
+        let clients = work_clients();
+        // Цикл идёт по единственному окну chromium.
+        let order = vec!["0x2".to_string()];
+        let anchor = |main: Option<&str>, active: Option<&str>, focus: Option<&str>| anchor_window(&cfg, &clients, &ws_apps, main, &order, active, focus).unwrap_or_default();
+        // Режим обмена ячеек: возврат к окну прежнего главного приложения,
+        // каким бы ни было активное окно.
+        assert_eq!(anchor(Some("0x1"), Some("0x3"), None), "0x1");
+        // Режим stack: активное окно workspace.
+        assert_eq!(anchor(None, Some("0x3"), None), "0x3");
+        // Активно свободное окно: берётся последнее окно workspace с фокусом.
+        assert_eq!(anchor(None, Some("0x9"), Some("0x1")), "0x1");
+        // Экземпляр вызванного приложения prev не бывает.
+        assert_eq!(anchor(None, Some("0x2"), Some("0x2")), "");
+        // Закрытое окно prev не даёт.
+        assert_eq!(anchor(None, Some("0xdead"), None), "");
+    }
+
+    #[test]
+    fn next_app_follows_config_order() {
+        // В разделе `work` приложения записаны как herdr, chromium, neovide —
+        // порядок не алфавитный, и цикл идёт именно по нему.
+        let cfg = Config::parse(CFG).unwrap();
+        let clients = work_clients();
+        let next = |app: &str, cs: &[Client]| next_app_window(&cfg, cs, "work", app).unwrap_or_default();
+        assert_eq!(next("herdr", &clients), "0x2");
+        assert_eq!(next("chromium", &clients), "0x3");
+        // За последним приложением списка снова идёт первое.
+        assert_eq!(next("neovide", &clients), "0x1");
+        // Приложение без окон пропускается.
+        let without: Vec<Client> = clients.iter().filter(|c| c.address != "0x2").cloned().collect();
+        assert_eq!(next("herdr", &without), "0x3");
+        // Окон нет ни у кого, кроме вызванного: следующего приложения нет.
+        assert_eq!(next("herdr", &clients[..1]), "");
+        // Приложение вне workspace следующего не имеет.
+        assert_eq!(next("wezterm", &clients), "");
     }
 
     #[test]

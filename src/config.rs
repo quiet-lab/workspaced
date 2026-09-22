@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use indexmap::IndexMap;
 use serde::Deserialize;
 
 /// Путь к конфигу: `$XDG_CONFIG_HOME/workspaced/config.toml`.
@@ -177,6 +178,23 @@ pub enum Placement {
     Rect { rect: Rect },
 }
 
+/// Поведение клавиши приложения в workspace (спецификация ws-daemon,
+/// «Цепочка приложения»): обмен ячеек с главной или подъём окна на месте.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// Окна приложения занимают главную ячейку, прежнее главное уходит в их.
+    Swap,
+    /// Окна стоят на своих местах, меняется только порядок по глубине и фокус.
+    Stack,
+}
+
+/// Допустимые значения поля `mode` у workspace.
+pub const MODES: [&str; 2] = ["swap", "stack"];
+
+fn default_mode() -> String {
+    MODES[0].to_string()
+}
+
 /// Workspace: шаблон, приложения по ячейкам, главное, иконка, цепочка.
 /// Сравнение на равенство нужно перечитыванию конфига: у workspace, чей раздел
 /// изменился, назначения ячеек собираются заново (спецификация ws-config,
@@ -192,8 +210,20 @@ pub struct Workspace {
     pub chain: Option<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// Поведение клавиши приложения: `swap` (по умолчанию) или `stack`.
+    /// Значение проверяется при чтении конфига, поэтому дальше читается как есть.
+    #[serde(default = "default_mode")]
+    pub mode: String,
+    /// Порядок записей сохраняется таким, как в файле: по нему конец цикла
+    /// клавиши выбирает следующее приложение workspace.
     #[serde(default)]
-    pub apps: BTreeMap<String, Placement>,
+    pub apps: IndexMap<String, Placement>,
+}
+
+impl Workspace {
+    pub fn mode(&self) -> Mode {
+        if self.mode == "stack" { Mode::Stack } else { Mode::Swap }
+    }
 }
 
 /// Служебные цепочки и зарезервированные сочетания.
@@ -405,6 +435,9 @@ impl Config {
             let Some(t) = self.templates.get(&w.template) else {
                 bail!("workspace {wname}: шаблон {:?} не найден", w.template);
             };
+            if !MODES.contains(&w.mode.as_str()) {
+                bail!("workspace {wname}: mode должен быть одним из {}, получено {:?}", MODES.join(", "), w.mode);
+            }
             for (aname, place) in &w.apps {
                 if !self.apps.contains_key(aname) {
                     bail!("workspace {wname}: приложение {aname:?} не описано в [apps]");
@@ -634,6 +667,31 @@ apps = { terminal = "right" }
         assert!(Config::parse(&bad_ws).unwrap_err().to_string().contains("nope"));
         let bad_desk = format!("{MINIMAL}\n[startup]\nworkspace = \"work\"\ndesktop = 9\n");
         assert!(Config::parse(&bad_desk).unwrap_err().to_string().contains("1…8"));
+    }
+
+    #[test]
+    fn workspace_mode_and_app_order() {
+        // Без поля mode workspace работает обменом ячеек.
+        let cfg = Config::parse(MINIMAL).unwrap();
+        assert_eq!(cfg.workspaces["work"].mode(), Mode::Swap);
+
+        // Порядок приложений в разделе workspace — как в файле, а не по алфавиту.
+        let text = MINIMAL.replace(
+            "[apps.terminal]\ncmd = \"wezterm-gui\"\n",
+            "[apps.terminal]\ncmd = \"wezterm-gui\"\n[apps.browser]\ncmd = \"chromium\"\n[apps.editor]\ncmd = \"neovide\"\n",
+        )
+        .replace(
+            "apps = { terminal = \"right\" }",
+            "mode = \"stack\"\napps = { terminal = \"right\", editor = \"left\", browser = \"left\" }",
+        );
+        let cfg = Config::parse(&text).unwrap();
+        assert_eq!(cfg.workspaces["work"].mode(), Mode::Stack);
+        assert_eq!(cfg.workspaces["work"].apps.keys().map(String::as_str).collect::<Vec<_>>(), vec!["terminal", "editor", "browser"]);
+
+        // Опечатка в режиме отклоняется с указанием workspace и допустимых значений.
+        let bad = text.replace("mode = \"stack\"", "mode = \"stak\"");
+        let err = Config::parse(&bad).unwrap_err().to_string();
+        assert!(err.contains("work") && err.contains("stak") && err.contains("swap") && err.contains("stack"), "{err}");
     }
 
     #[test]

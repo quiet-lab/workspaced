@@ -63,11 +63,29 @@ impl ExtraApp {
     }
 }
 
+/// Незаконченный цикл клавиши приложения в workspace (спецификация ws-daemon,
+/// «Цепочка приложения»): чьи экземпляры перебираются и к какому окну вернёт
+/// конец цикла (prev). Запись живёт в памяти демона: это след незаконченного
+/// цикла, а не состояние окон, поэтому в снимок сессии она не попадает.
+#[derive(Debug, Clone)]
+pub struct Cycle {
+    pub app: String,
+    pub back: Option<String>,
+}
+
 #[derive(Debug, Default)]
 pub struct State {
     pub desktops: BTreeMap<u8, Desktop>,
     /// workspace → приложение → место (текущее назначение, по умолчанию из конфига).
     pub cells: BTreeMap<String, BTreeMap<String, Place>>,
+    /// workspace → незаконченный цикл клавиши приложения.
+    pub cycle: BTreeMap<String, Cycle>,
+    /// workspace → последнее его окно, получавшее фокус (событие `activewindow`).
+    pub focus: BTreeMap<String, String>,
+    /// workspace → адрес окна → прямоугольник, в котором окно оставили.
+    /// Нужен режиму `stack`: вернувшееся на стол окно встаёт именно туда.
+    /// Живёт до остановки демона, как геометрия окна до развёртывания.
+    pub geom: BTreeMap<String, HashMap<String, PxRect>>,
     /// workspace → имя → дополнительное приложение сессии.
     pub extra: BTreeMap<String, BTreeMap<String, ExtraApp>>,
     /// адрес окна → посторонняя привязка.

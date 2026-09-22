@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use anyhow::{Context, Result, bail};
 use toml_edit::{DocumentMut, InlineTable, Item, Table, Value, value};
 
-use crate::config::{Config, PxRect};
+use crate::config::{Config, Mode, PxRect};
 use crate::daemon::{self, Daemon};
 use crate::hypr::{self, Client};
 use crate::state::{ExtraApp, Foreign, Place};
@@ -191,6 +191,11 @@ pub fn save_workspace(d: &mut Daemon) -> Result<String> {
     let wtab = workspaces.entry(&ws).or_insert(Item::Table(Table::new())).as_table_mut().context("workspace не таблица")?;
     if let Some(m) = &main_app {
         wtab["main"] = value(m.as_str());
+    }
+    // Режим задаёт только пользователь, командой он не меняется; запись нужна,
+    // чтобы раздел workspace в файле описывал его целиком.
+    if cfg.workspaces.get(&ws).map(|w| w.mode()) == Some(Mode::Stack) {
+        wtab["mode"] = value("stack");
     }
     // Приложения по ячейкам; окно не в своей ячейке — rect.
     let mut apps_tab = Table::new();
