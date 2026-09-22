@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{Config, Placement, PxRect};
+use crate::config::{App, Config, Placement, PxRect};
 
 /// Место окна в workspace: ячейка шаблона или прямоугольник в пикселях.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -34,11 +34,42 @@ pub struct Foreign {
     pub cwd: Option<String>,
 }
 
+/// Дополнительное приложение workspace, принятое командой сохранения сессии
+/// (спецификация ws-sessions, «Дополнительные приложения сессии»). Запись
+/// живёт только в сессии: конфиг она не меняет. Пустой `cmd` означает, что
+/// запись называет приложение конфига и задаёт ему лишь место в этом
+/// workspace; иначе запись описывает и само приложение.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct ExtraApp {
+    /// Класс окна как есть; в выражение захвата демон превращает его сам.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cmd: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    pub rect: PxRect,
+}
+
+impl ExtraApp {
+    /// Запись приложения для эффективного конфига: команда и каталог из
+    /// процесса окна, класс — точное совпадение с классом окна.
+    pub fn to_app(&self) -> App {
+        let (cmd, args) = match self.cmd.split_first() {
+            Some((c, rest)) => (Some(c.clone()), rest.to_vec()),
+            None => (None, Vec::new()),
+        };
+        App { cmd, args, cwd: self.cwd.clone(), class: self.class.as_deref().map(regex::escape), ..App::default() }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct State {
     pub desktops: BTreeMap<u8, Desktop>,
     /// workspace → приложение → место (текущее назначение, по умолчанию из конфига).
     pub cells: BTreeMap<String, BTreeMap<String, Place>>,
+    /// workspace → имя → дополнительное приложение сессии.
+    pub extra: BTreeMap<String, BTreeMap<String, ExtraApp>>,
     /// адрес окна → посторонняя привязка.
     pub foreign: HashMap<String, Foreign>,
     /// Столы, чей активный workspace поднимается при первом переходе (ленивое восстановление).
@@ -106,10 +137,14 @@ impl State {
 
 // ---- Сессия ------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionWorkspace {
     #[serde(default)]
     pub cells: BTreeMap<String, Place>,
+    /// Дополнительные приложения сессии этого workspace. Поле необязательное:
+    /// снимок прежнего формата читается без ошибки.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra_apps: BTreeMap<String, ExtraApp>,
 }
 
 /// Окно в снимке: окно приложения либо постороннее (с командой и каталогом).
@@ -171,6 +206,53 @@ template = "thirds"
 main = "wezterm"
 apps = { wezterm = "center" }
 "#;
+
+    #[test]
+    fn snapshot_keeps_extra_apps_and_reads_old_format() {
+        // Снимок прежнего формата: таблицы дополнительных приложений нет.
+        let old = r#"
+saved = "2026-09-22T11:34:44+03:00"
+active_desktop = 1
+[desktops.1]
+workspaces = ["work"]
+active = "work"
+[workspaces.work.cells]
+chromium = "left"
+"#;
+        let s: Session = toml::from_str(old).unwrap();
+        assert!(s.workspaces["work"].extra_apps.is_empty());
+        assert_eq!(s.workspaces["work"].cells["chromium"], Place::Cell("left".into()));
+
+        // Запись и чтение дополнительного приложения: полная запись и запись
+        // только о месте.
+        let mut s = s;
+        let rect = PxRect { x: 100, y: 200, w: 800, h: 600 };
+        let extra = &mut s.workspaces.get_mut("work").unwrap().extra_apps;
+        extra.insert("galculator".into(), ExtraApp { class: Some("Galculator".into()), cmd: vec!["galculator".into()], cwd: Some("/home/mne".into()), rect });
+        extra.insert("chrome-ai".into(), ExtraApp { rect, ..ExtraApp::default() });
+        let text = toml::to_string_pretty(&s).unwrap();
+        let back: Session = toml::from_str(&text).unwrap();
+        let extra = &back.workspaces["work"].extra_apps;
+        assert_eq!(extra["galculator"].cmd, vec!["galculator".to_string()]);
+        assert_eq!(extra["galculator"].class.as_deref(), Some("Galculator"));
+        assert_eq!(extra["galculator"].rect, rect);
+        // Запись только о месте пишется без класса и команды.
+        assert_eq!(extra["chrome-ai"], ExtraApp { rect, ..ExtraApp::default() });
+        assert!(!text.contains("class = \"\""), "{text}");
+    }
+
+    #[test]
+    fn extra_app_becomes_app_of_effective_config() {
+        let e = ExtraApp { class: Some("Galculator".into()), cmd: vec!["galculator".into(), "--mode=paper".into()], cwd: Some("/tmp".into()), rect: PxRect { x: 0, y: 0, w: 10, h: 10 } };
+        let app = e.to_app();
+        assert_eq!(app.cmd.as_deref(), Some("galculator"));
+        assert_eq!(app.args, vec!["--mode=paper".to_string()]);
+        assert_eq!(app.cwd.as_deref(), Some("/tmp"));
+        // Класс окна превращается в выражение точного совпадения.
+        let (class_re, title_re) = app.matchers().unwrap().unwrap();
+        assert!(class_re.is_match("Galculator") && !class_re.is_match("Galculator2"));
+        assert!(title_re.is_none());
+    }
 
     #[test]
     fn place_rule_four_steps() {

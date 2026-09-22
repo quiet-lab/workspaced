@@ -1,4 +1,4 @@
-//! Сессии: снимок состояния, `default` по таймеру, именованные по команде,
+//! Сессии: снимок состояния, `default` по событию, именованные по команде,
 //! восстановление при старте (лениво) и загрузка со сверкой (спецификация ws-sessions).
 
 use std::collections::BTreeMap;
@@ -51,11 +51,20 @@ pub fn snapshot(d: &Daemon) -> Result<Session> {
             windows.push(SessionWindow { app: None, workspace: None, desktop, rect: c.rect(), cmd, cwd });
         }
     }
+    // Назначения ячеек и дополнительные приложения сессии — сведения об одном
+    // и том же workspace, поэтому в снимке они лежат рядом.
+    let mut workspaces: BTreeMap<String, SessionWorkspace> = BTreeMap::new();
+    for (w, cells) in &st.cells {
+        workspaces.entry(w.clone()).or_default().cells = cells.clone();
+    }
+    for (w, apps) in &st.extra {
+        workspaces.entry(w.clone()).or_default().extra_apps = apps.clone();
+    }
     Ok(Session {
         saved: chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         active_desktop: d.current_desktop(),
         desktops: st.desktops.iter().map(|(n, d)| (n.to_string(), d.clone())).collect(),
-        workspaces: st.cells.iter().map(|(w, cells)| (w.clone(), SessionWorkspace { cells: cells.clone() })).collect(),
+        workspaces,
         windows,
     })
 }
@@ -144,9 +153,11 @@ pub fn restore_default(d: &mut Daemon) -> Result<()> {
     Ok(())
 }
 
-/// Списки столов и назначения ячеек из снимка.
+/// Списки столов, назначения ячеек и дополнительные приложения из снимка.
+/// Workspace сверяются с файлом конфига, а не с эффективным: дополнительные
+/// приложения прежнего состояния здесь как раз заменяются.
 fn apply_lists(d: &mut Daemon, s: &Session) {
-    let cfg_ws: Vec<String> = d.cfg().workspaces.keys().cloned().collect();
+    let cfg_ws: Vec<String> = d.cfg_file().workspaces.keys().cloned().collect();
     let st = d.state_mut();
     st.desktops.clear();
     for (n, dsk) in &s.desktops {
@@ -157,12 +168,22 @@ fn apply_lists(d: &mut Daemon, s: &Session) {
         }
     }
     st.cells.clear();
+    st.extra.clear();
     for (w, sw) in &s.workspaces {
-        if cfg_ws.contains(w) {
+        if !cfg_ws.contains(w) {
+            continue;
+        }
+        // Пустая таблица ячеек в снимке ничего не значит: назначения тогда
+        // собираются из конфига при первом обращении.
+        if !sw.cells.is_empty() {
             st.cells.insert(w.clone(), sw.cells.clone());
+        }
+        if !sw.extra_apps.is_empty() {
+            st.extra.insert(w.clone(), sw.extra_apps.clone());
         }
     }
     st.lazy.clear();
+    d.rebuild_cfg();
 }
 
 /// Живые окна без тега сопоставляются с посторонними окнами снимка по команде и каталогу.
@@ -199,9 +220,11 @@ fn spawn_missing_foreign(d: &mut Daemon, snapshot: &[SessionWindow]) -> Result<(
             continue;
         }
         let desktop = w.desktop.parse::<u8>().ok();
-        d.expect_foreign(ExpectedForeign { cmd: w.cmd.clone(), cwd: w.cwd.clone(), desktop, rect: w.rect });
-        if let Err(e) = d.spawn_foreign(&w.cmd, w.cwd.as_deref()) {
-            log::warn!("восстановление окна {:?}: {e:#}", w.cmd);
+        // Ожидание заводится по pid запущенного процесса: оно живёт до окна
+        // или до выхода процесса, сроком не ограничено.
+        match d.spawn_foreign(&w.cmd, w.cwd.as_deref()) {
+            Ok(pid) => d.expect_foreign(ExpectedForeign { cmd: w.cmd.clone(), cwd: w.cwd.clone(), desktop, rect: w.rect, pid }),
+            Err(e) => log::warn!("восстановление окна {:?}: {e:#}", w.cmd),
         }
     }
     Ok(())

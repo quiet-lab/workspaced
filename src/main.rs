@@ -72,6 +72,8 @@ enum Command {
     },
     /// Поднять следующий workspace из списка текущего стола
     Next,
+    /// Принять посторонние окна текущего стола в активный workspace на время сессии
+    SaveSession,
     /// Записать текущее состояние активного workspace в конфиг
     SaveWorkspace,
     /// Убрать workspace из списка стола (окна паркуются)
@@ -140,6 +142,15 @@ fn main() -> anyhow::Result<()> {
         Command::Raise { workspace, desktop } => client::call(json!({ "cmd": "raise", "workspace": workspace, "desktop": desktop })).map(|_| ()),
         Command::App { app, desktop, workspace } => client::call(json!({ "cmd": "app", "apps": app, "desktop": desktop, "workspace": workspace })).map(|_| ()),
         Command::Next => client::call(json!({ "cmd": "next" })).map(|_| ()),
+        Command::SaveSession => {
+            let v = client::call(json!({ "cmd": "save-session" }))?;
+            let ws = v.get("workspace").and_then(|w| w.as_str()).unwrap_or("?");
+            match v.get("adopted").and_then(|n| n.as_u64()).unwrap_or(0) {
+                0 => println!("workspace {ws}: посторонних окон на столе нет"),
+                n => println!("workspace {ws}: принято окон — {n}"),
+            }
+            Ok(())
+        }
         Command::SaveWorkspace => {
             let v = client::call(json!({ "cmd": "save-workspace" }))?;
             println!("workspace {} записан в конфиг", v.get("workspace").and_then(|w| w.as_str()).unwrap_or("?"));

@@ -192,6 +192,7 @@ fn expand_range(b: &Bind) -> Vec<Bind> {
 pub fn collect(cfg: &Config) -> Result<Vec<Binding>> {
     let mut out: Vec<Binding> = Vec::new();
     let named = [
+        (&cfg.keys.save_session, "keys.save_session", "workspaced save-session"),
         (&cfg.keys.save_workspace, "keys.save_workspace", "workspaced save-workspace"),
         (&cfg.keys.sessions, "keys.sessions", "workspaced sessions"),
         (&cfg.keys.next_workspace, "keys.next_workspace", "workspaced next"),
@@ -234,6 +235,7 @@ pub fn collect(cfg: &Config) -> Result<Vec<Binding>> {
                 Act::Daemon(match a {
                     Action::Named(n) => match n.as_str() {
                         "sessions" => "workspaced sessions".to_string(),
+                        "save-session" => "workspaced save-session".to_string(),
                         "save-workspace" => "workspaced save-workspace".to_string(),
                         "next-workspace" => "workspaced next".to_string(),
                         "maximize" => "workspaced maximize".to_string(),
@@ -519,6 +521,30 @@ apps = { firefox-chat = "c" }
             .replace("apps = { firefox-front = \"c\" }", "apps = { firefox-front = \"c\", firefox-back = \"l\" }");
         let err = Config::parse(&text).unwrap_err().to_string();
         assert!(err.contains("dev-front") && err.contains("firefox-front") && err.contains("firefox-back"), "{err}");
+    }
+
+    #[test]
+    fn two_save_chains_share_a_prefix() {
+        // Общий первый сегмент у двух цепочек допустим: обе живут в одной
+        // подкарте и ни одна не является началом другой.
+        let text = base() + "\n[keys]\nsave_session = \"CTRL+SUPER+s CTRL+SUPER+s\"\nsave_workspace = \"CTRL+SUPER+s CTRL+SUPER+w\"\n";
+        let cfg = Config::parse(&text).unwrap();
+        let lua = to_lua(&cfg).unwrap();
+        luac(&lua);
+        // Модификаторы приводятся к каноническому порядку: SUPER, CTRL, ALT, SHIFT.
+        assert!(lua.contains("hl.bind(\"SUPER + CTRL + s\", hl.dsp.submap(\"ws:SUPER + CTRL + s\"))"), "{lua}");
+        assert!(lua.contains("ws_run(\"workspaced save-session\")"), "{lua}");
+        assert!(lua.contains("ws_run(\"workspaced save-workspace\")"), "{lua}");
+        let list = to_list(&cfg).unwrap();
+        assert!(list.contains("SUPER+CTRL+s SUPER+CTRL+s") && list.contains("save-session") && list.contains("keys.save_session"), "{list}");
+        assert!(list.contains("SUPER+CTRL+s SUPER+CTRL+w") && list.contains("save-workspace"), "{list}");
+        assert!(!list.contains("SUPER+TAB"), "{list}");
+
+        // Действие сохранения сессии доступно и записью [[binds]].
+        let text = base() + "\n[[binds]]\nchain = \"SUPER+K\"\naction = \"save-session\"\n";
+        assert!(to_list(&Config::parse(&text).unwrap()).unwrap().contains("save-session"));
+        let bad = base() + "\n[[binds]]\nchain = \"SUPER+K\"\naction = \"save-sesion\"\n";
+        assert!(Config::parse(&bad).unwrap_err().to_string().contains("save-sesion"));
     }
 
     #[test]

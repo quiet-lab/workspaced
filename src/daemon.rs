@@ -8,15 +8,14 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Sender};
-use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
-use crate::config::{Config, PxRect, config_path};
+use crate::config::{Config, Placement, PxRect, config_path};
 use crate::hypr::{self, Client, Event, Hypr};
 use crate::session;
-use crate::state::{Foreign, Place, State};
+use crate::state::{ExtraApp, Foreign, Place, State};
 
 /// Куда поставить окно после появления.
 #[derive(Debug, Clone)]
@@ -30,14 +29,16 @@ enum Target {
     Pool,
 }
 
-/// Запущенное приложение, чьё окно ещё не появилось.
+/// Запущенное приложение, чьё окно ещё не появилось. Запись живёт до окна:
+/// сроков у ожидания нет, всё решают события — появление окна и выход процесса.
 struct Pending {
     app: String,
     workspace: Option<String>,
     desktop: u8,
-    child: Child,
-    /// Исполняемый файл: `which` команды, затем `/proc/<pid>/exe`, пока процесс жив
-    /// (обёртка-скрипт вроде `/usr/bin/firefox` выполняет настоящий бинарник).
+    pid: u32,
+    /// Исполняемый файл: `which` команды, затем `/proc/<pid>/exe`, пока процесс
+    /// жив (обёртка-скрипт вроде `/usr/bin/firefox` выполняет настоящий
+    /// бинарник); уточняется при появлении окна.
     exe: Option<PathBuf>,
     /// Имя команды для мягкого сопоставления с классом окна.
     cmd_base: String,
@@ -45,9 +46,9 @@ struct Pending {
     /// podman) не потомок запущенного процесса, его узнают только по ним.
     class_re: Option<regex::Regex>,
     title_re: Option<regex::Regex>,
-    started: Instant,
-    /// Процесс завершился без окна: ещё немного ждём новое окно у чужого процесса.
-    exited_at: Option<Instant>,
+    /// Процесс вышел, а окна не было: запись ждёт первое подходящее окно,
+    /// а повторное нажатие клавиши приложения запускает его заново.
+    exited: bool,
     target: Target,
     focus: bool,
 }
@@ -55,7 +56,7 @@ struct Pending {
 impl Pending {
     /// Похоже ли окно на результат этого запуска.
     fn matches(&self, c: &Client, ancestors: &[i32]) -> bool {
-        if ancestors.contains(&(self.child.id() as i32)) {
+        if ancestors.contains(&(self.pid as i32)) {
             return true;
         }
         if matcher_fits(self.class_re.as_ref(), self.title_re.as_ref(), c) {
@@ -84,12 +85,15 @@ fn class_matches(class: &str, cmd_base: &str) -> bool {
 }
 
 /// Постороннее окно из снимка сессии, которое запущено и ждёт появления.
+/// Ожидание живёт до окна или до выхода запущенного процесса.
 #[derive(Debug, Clone)]
 pub struct ExpectedForeign {
     pub cmd: Vec<String>,
     pub cwd: Option<String>,
     pub desktop: Option<u8>,
     pub rect: PxRect,
+    /// Процесс, запущенный ради этого окна.
+    pub pid: u32,
 }
 
 enum Msg {
@@ -97,21 +101,26 @@ enum Msg {
     Request { line: String, reply: Sender<String> },
     Subscribe(UnixStream),
     ConfigChanged,
-    Tick,
+    /// Запущенный демоном процесс завершился.
+    ChildExited { pid: u32 },
 }
 
 pub struct Daemon {
+    /// Конфиг файла вместе с дополнительными приложениями сессии.
     cfg: Config,
+    /// Конфиг как прочитан из файла, без дополнительных приложений сессии.
+    cfg_file: Config,
     cfg_text: String,
     cfg_path: PathBuf,
-    expected: Vec<(ExpectedForeign, Instant)>,
+    expected: Vec<ExpectedForeign>,
     hypr: Hypr,
     st: State,
     mon: (i32, i32),
     current: u8,
     pending: Vec<Pending>,
     subs: Vec<UnixStream>,
-    dirty: Option<Instant>,
+    /// Отправитель сообщений демону: нужен потокам, ждущим выхода процессов.
+    tx: Sender<Msg>,
     /// Геометрия окон до развёртывания (ключ — адрес окна), только в памяти.
     maximized: HashMap<String, PxRect>,
 }
@@ -171,20 +180,7 @@ pub fn run() -> Result<()> {
         let path = cfg_path.clone();
         std::thread::spawn(move || watch_config(path, tx));
     }
-    // Таймер.
-    {
-        let tx = tx.clone();
-        std::thread::spawn(move || {
-            loop {
-                std::thread::sleep(Duration::from_millis(100));
-                if tx.send(Msg::Tick).is_err() {
-                    break;
-                }
-            }
-        });
-    }
-
-    let mut d = Daemon { cfg, cfg_text, cfg_path, expected: Vec::new(), hypr, st: State::default(), mon, current, pending: Vec::new(), subs: Vec::new(), dirty: None, maximized: HashMap::new() };
+    let mut d = Daemon { cfg: cfg.clone(), cfg_file: cfg, cfg_text, cfg_path, expected: Vec::new(), hypr, st: State::default(), mon, current, pending: Vec::new(), subs: Vec::new(), tx: tx.clone(), maximized: HashMap::new() };
     d.startup()?;
     log::info!("демон запущен, стол {}, монитор {}×{}", d.current, d.mon.0, d.mon.1);
     for msg in rx {
@@ -205,7 +201,11 @@ pub fn run() -> Result<()> {
                 }
             }
             Msg::ConfigChanged => d.reload_config(),
-            Msg::Tick => d.tick(),
+            Msg::ChildExited { pid } => {
+                if let Err(e) = d.on_child_exit(pid) {
+                    log::warn!("выход процесса {pid}: {e:#}");
+                }
+            }
         }
     }
     Ok(())
@@ -240,6 +240,20 @@ fn serve_conn(conn: UnixStream, tx: Sender<Msg>) {
     }
 }
 
+/// Завершена ли этим событием запись конфига. Учитываются только события,
+/// означающие готовый файл: закрытие файла, открытого на запись (правка
+/// на месте — `nvim`, `tee`), и появление файла под своим именем после записи
+/// во временный файл с переименованием (`chezmoi apply`). Промежуточные
+/// `Modify(Data)` приходят посреди записи и дали бы перечитывание неполного
+/// файла. `Create` не учитывается: за созданием файла всегда следует закрытие.
+/// `Modify(Name(Both))` тоже не учитывается: на одно переименование в
+/// наблюдаемом каталоге `notify` присылает и `To`, и парный `Both`, и учёт
+/// обоих дал бы два перечитывания на одно сохранение.
+fn write_finished(kind: &notify::EventKind) -> bool {
+    use notify::event::{AccessKind, AccessMode, EventKind, ModifyKind, RenameMode};
+    matches!(kind, EventKind::Access(AccessKind::Close(AccessMode::Write)) | EventKind::Modify(ModifyKind::Name(RenameMode::To)))
+}
+
 fn watch_config(path: PathBuf, tx: Sender<Msg>) {
     use notify::{RecursiveMode, Watcher};
     let (wtx, wrx) = mpsc::channel();
@@ -254,22 +268,32 @@ fn watch_config(path: PathBuf, tx: Sender<Msg>) {
             return;
         }
     };
-    // Следим за каталогом: редакторы пишут через временный файл и переименование.
+    // Следим за каталогом: редакторы пишут через временный файл и переименование,
+    // при котором у файла меняется inode и наблюдение за ним самим теряется.
     if let Some(dir) = path.parent()
         && let Err(e) = watcher.watch(dir, RecursiveMode::NonRecursive)
     {
         log::error!("наблюдатель конфига: {e}");
         return;
     }
-    let mut last = Instant::now() - Duration::from_secs(10);
     for ev in wrx {
         let touches = ev.paths.iter().any(|p| p.file_name() == path.file_name());
-        if touches && last.elapsed() > Duration::from_millis(300) {
-            last = Instant::now();
-            std::thread::sleep(Duration::from_millis(200));
+        if touches && write_finished(&ev.kind) {
             let _ = tx.send(Msg::ConfigChanged);
         }
     }
+}
+
+/// Ждать выхода запущенного процесса в отдельном потоке и сообщить о нём
+/// демону. Так выход процесса становится событием, и опрос `try_wait`
+/// по таймеру не нужен; заодно поток забирает код возврата, и процесса-зомби
+/// не остаётся.
+fn watch_child(mut child: Child, tx: Sender<Msg>) {
+    std::thread::spawn(move || {
+        let pid = child.id();
+        let _ = child.wait();
+        let _ = tx.send(Msg::ChildExited { pid });
+    });
 }
 
 fn err_json(e: impl std::fmt::Display) -> Value {
@@ -290,17 +314,20 @@ impl Daemon {
                 log::warn!("стартовый workspace {}: {e:#}", st.workspace);
             }
         }
-        self.mark_dirty();
+        self.save_session_file();
         Ok(())
     }
 
     pub fn reload_config(&mut self) {
         match Config::load(&self.cfg_path) {
             Ok(cfg) => {
-                self.cfg = cfg;
+                let old = std::mem::replace(&mut self.cfg_file, cfg);
                 self.cfg_text = std::fs::read_to_string(&self.cfg_path).unwrap_or_default();
-                // Назначения ячеек пересобираются из конфига для workspace, которых ещё не касались.
-                self.st.cells.retain(|ws, _| self.cfg.workspaces.contains_key(ws));
+                // Назначения ячеек снимаются у workspace, чей раздел изменился
+                // или исчез: правка файла возвращает расстановку, а обмен ячеек
+                // в нетронутых workspace сохраняется.
+                keep_cells(&old, &self.cfg_file, &mut self.st.cells);
+                self.rebuild_cfg();
                 log::info!("конфиг перечитан: {} workspace, {} приложений", self.cfg.workspaces.len(), self.cfg.apps.len());
                 match Command::new("hyprctl").arg("reload").arg("config-only").output() {
                     Ok(o) if o.status.success() => {}
@@ -313,8 +340,43 @@ impl Daemon {
         }
     }
 
+    /// Пересобрать эффективный конфиг: файл плюс дополнительные приложения
+    /// сессии (спецификация ws-sessions, «Дополнительные приложения сессии»).
+    /// Каждое такое приложение попадает в `apps` и в таблицу `apps` своего
+    /// workspace, поэтому поднятие, цепочка, парковка, расстановка и состояние
+    /// для панели обращаются с ним как с приложением конфига.
+    pub fn rebuild_cfg(&mut self) {
+        let (cfg, dropped) = merge_extra(&self.cfg_file, &self.st.extra);
+        for (ws, name, reason) in dropped {
+            log::warn!("дополнительное приложение сессии {name} (workspace {ws}) снято: {reason}");
+            if let Some(apps) = self.st.extra.get_mut(&ws) {
+                apps.remove(&name);
+            }
+            if let Some(cells) = self.st.cells.get_mut(&ws) {
+                cells.remove(&name);
+            }
+        }
+        self.st.extra.retain(|_, apps| !apps.is_empty());
+        // У workspace, назначения которого уже собраны, дополнительное
+        // приложение иначе осталось бы без места. Места приложений, уже
+        // описанных в workspace, не трогаются.
+        let extra = self.st.extra.clone();
+        for (ws, apps) in &extra {
+            let Some(cells) = self.st.cells.get_mut(ws) else { continue };
+            for (name, e) in apps {
+                cells.entry(name.clone()).or_insert(Place::Rect { rect: e.rect });
+            }
+        }
+        self.cfg = cfg;
+    }
+
     pub fn cfg(&self) -> &Config {
         &self.cfg
+    }
+    /// Конфиг как прочитан из файла: нужен там, где дополнительные приложения
+    /// сессии учитывать нельзя (сверка списка workspace со снимком).
+    pub fn cfg_file(&self) -> &Config {
+        &self.cfg_file
     }
     pub fn cfg_path(&self) -> &Path {
         &self.cfg_path
@@ -329,7 +391,7 @@ impl Daemon {
         &self.st
     }
     pub fn expect_foreign(&mut self, e: ExpectedForeign) {
-        self.expected.push((e, Instant::now()));
+        self.expected.push(e);
     }
     pub fn state_mut(&mut self) -> &mut State {
         &mut self.st
@@ -347,41 +409,34 @@ impl Daemon {
         self.mon
     }
 
-    fn mark_dirty(&mut self) {
-        self.dirty = Some(Instant::now());
-    }
-
-    fn tick(&mut self) {
-        if let Some(t) = self.dirty
-            && t.elapsed() >= Duration::from_millis(500)
-        {
-            self.dirty = None;
-            if let Err(e) = session::save_default(self) {
-                log::warn!("запись сессии default: {e:#}");
-            }
+    /// Записать снимок сессии `default`. Вызывается в конце обработки события
+    /// или команды, изменивших состояние, — до ответа клиенту, поэтому
+    /// к возврату команды файл уже обновлён.
+    pub fn save_session_file(&mut self) {
+        if let Err(e) = session::save_default(self) {
+            log::warn!("запись сессии default: {e:#}");
         }
-        self.check_pending();
-        self.expected.retain(|(_, t)| t.elapsed() < Duration::from_secs(30));
     }
 
     // ---- События ----------------------------------------------------------------
 
     fn on_event(&mut self, ev: Event) -> Result<()> {
-        match ev {
-            Event::OpenWindow { addr, .. } => self.on_open(&addr)?,
+        let changed = match ev {
+            Event::OpenWindow { addr, .. } => {
+                self.on_open(&addr)?;
+                true
+            }
             Event::CloseWindow { addr } => {
                 self.st.foreign.remove(&addr);
-                self.mark_dirty();
                 self.broadcast();
+                true
             }
             Event::MoveWindow { .. } => {
-                self.mark_dirty();
                 self.broadcast();
+                true
             }
-            Event::Workspace { name } => {
-                if let Ok(n) = name.parse::<u8>()
-                    && (1..=8).contains(&n)
-                {
+            Event::Workspace { name } => match name.parse::<u8>() {
+                Ok(n) if (1..=8).contains(&n) => {
                     self.current = n;
                     if let Some(ws) = self.st.lazy.remove(&n) {
                         log::info!("стол {n}: ленивое поднятие {ws}");
@@ -389,11 +444,17 @@ impl Daemon {
                             log::warn!("ленивое поднятие {ws}: {e:#}");
                         }
                     }
-                    self.mark_dirty();
                     self.broadcast();
+                    true
                 }
-            }
-            Event::ActiveWindow { .. } | Event::Other(_) => {}
+                _ => false,
+            },
+            Event::ActiveWindow { .. } | Event::Other(_) => false,
+        };
+        // Снимок сессии пишет обработчик события, а не отложенная запись
+        // по таймеру: одна запись на событие, изменившее состояние.
+        if changed {
+            self.save_session_file();
         }
         Ok(())
     }
@@ -403,24 +464,30 @@ impl Daemon {
         let clients = self.hypr.clients()?;
         let Some(c) = clients.iter().find(|c| c.address == *addr).cloned() else { return Ok(()) };
         if c.app().is_some() {
-            self.mark_dirty();
             self.broadcast();
             return Ok(());
         }
         let ancestors = ancestors(c.pid);
+        // Исполняемый файл уточняется здесь, а не опросом: обёртка-скрипт
+        // (`/usr/bin/firefox`) к появлению окна уже выполнила настоящий бинарник.
+        for p in self.pending.iter_mut().filter(|p| !p.exited) {
+            if let Some(e) = proc_exe(p.pid as i32) {
+                p.exe = Some(e);
+            }
+        }
         let hit = self
             .pending
             .iter()
-            .position(|p| ancestors.contains(&(p.child.id() as i32)))
+            .position(|p| ancestors.contains(&(p.pid as i32)))
             .or_else(|| self.pending.iter().position(|p| p.matches(&c, &ancestors)));
         if let Some(i) = hit {
             let p = self.pending.remove(i);
             self.adopt(&c, p)?;
         } else {
             let (cmd, cwd) = proc_info(c.pid);
-            if let Some(i) = self.expected.iter().position(|(e, _)| e.cmd == cmd && e.cwd == cwd) {
+            if let Some(i) = self.expected.iter().position(|e| e.cmd == cmd && e.cwd == cwd) {
                 // Постороннее окно из снимка: на своё место.
-                let (e, _) = self.expected.remove(i);
+                let e = self.expected.remove(i);
                 let mut ex = Vec::new();
                 match e.desktop {
                     Some(n) => {
@@ -434,13 +501,12 @@ impl Daemon {
                 self.st.foreign.insert(c.address.clone(), Foreign { rect: e.rect, cmd, cwd });
                 self.hypr.dispatch_all(&ex)?;
             } else {
-                // Постороннее окно остаётся свободным: частью workspace его делает
-                // только команда сохранения.
+                // Постороннее окно остаётся свободным: частью workspace его
+                // делает только команда сохранения — сессии или конфига.
                 self.st.foreign.insert(c.address.clone(), Foreign { rect: c.rect(), cmd, cwd });
                 log::info!("постороннее окно {} ({}) свободно", c.address, c.class);
             }
         }
-        self.mark_dirty();
         self.broadcast();
         Ok(())
     }
@@ -489,57 +555,68 @@ impl Daemon {
         self.hypr.dispatch_all(&ex)
     }
 
-    /// Просроченные запуски и одноэкземплярные приложения (процесс вышел без окна).
-    fn check_pending(&mut self) {
-        if self.pending.is_empty() {
-            return;
+    /// Свободное окно, подходящее ожиданию запуска номер `i`.
+    fn free_window_for(&self, i: usize) -> Result<Option<Client>> {
+        Ok(self.hypr.clients()?.into_iter().find(|c| c.app().is_none() && self.pending[i].matches(c, &[])))
+    }
+
+    /// Выход запущенного демоном процесса. Сроков у ожидания нет: запись
+    /// `pending` живёт до окна. Если к моменту выхода подходящее свободное окно
+    /// уже есть (одноэкземплярное приложение открыло его в прежнем процессе),
+    /// оно принимается сразу; иначе запись переходит в состояние «процесс вышел,
+    /// окно ожидается» и ждёт первого подходящего `openwindow`. Ожидание
+    /// постороннего окна из снимка выхода процесса не переживает: восстановить
+    /// его уже нечем.
+    fn on_child_exit(&mut self, pid: u32) -> Result<()> {
+        if let Some(i) = self.expected.iter().position(|e| e.pid == pid) {
+            let e = self.expected.remove(i);
+            log::warn!("восстановление окна {:?}: процесс завершился, окна нет", e.cmd);
+            return Ok(());
         }
-        let mut i = 0;
-        while i < self.pending.len() {
-            let p = &mut self.pending[i];
-            if p.exited_at.is_none() {
-                // Пока процесс жив, уточняем исполняемый файл (после exec обёртки).
-                if let Some(e) = proc_exe(p.child.id() as i32) {
-                    p.exe = Some(e);
-                }
-                if matches!(p.child.try_wait(), Ok(Some(_))) {
-                    p.exited_at = Some(Instant::now());
-                }
-            }
-            let waited_after_exit = p.exited_at.is_some_and(|t| t.elapsed() > Duration::from_secs(2));
-            let expired = p.started.elapsed() > Duration::from_secs(30);
-            if waited_after_exit {
-                // Одноэкземплярное приложение: окно осталось у уже работающего процесса.
+        let Some(i) = self.pending.iter().position(|p| p.pid == pid) else { return Ok(()) };
+        let found = self.free_window_for(i)?;
+        match pending_step(true, found.is_some(), false) {
+            PendingStep::Adopt => {
+                let c = found.expect("окно найдено");
                 let p = self.pending.remove(i);
-                let found = self.hypr.clients().ok().and_then(|cs| cs.into_iter().find(|c| c.app().is_none() && p.matches(c, &[])));
-                match found {
-                    Some(c) => {
-                        log::info!("{}: процесс завершился без окна, принято окно {} ({})", p.app, c.address, c.class);
-                        self.st.foreign.remove(&c.address);
-                        if let Err(e) = self.adopt(&c, p) {
-                            log::warn!("принятие окна: {e:#}");
-                        }
-                        self.mark_dirty();
-                        self.broadcast();
-                    }
-                    None => log::warn!("{}: процесс завершился, окна нет", p.app),
-                }
-                continue;
+                log::info!("{}: процесс завершился без окна, принято окно {} ({})", p.app, c.address, c.class);
+                self.st.foreign.remove(&c.address);
+                self.adopt(&c, p)?;
+                self.save_session_file();
+                self.broadcast();
             }
-            if expired {
-                let p = self.pending.remove(i);
-                log::warn!("{}: окно не появилось за 30 с, ожидание снято", p.app);
-                continue;
+            _ => {
+                self.pending[i].exited = true;
+                log::info!("{}: процесс завершился, окна пока нет — ждём его появления", self.pending[i].app);
             }
-            i += 1;
         }
+        Ok(())
     }
 
     // ---- Запуск -----------------------------------------------------------------
 
     fn spawn(&mut self, app: &str, workspace: Option<&str>, desktop: u8, target: Target, focus: bool) -> Result<()> {
-        if self.pending.iter().any(|p| p.app == app) {
-            return Ok(());
+        // Пока запуск идёт, повторная клавиша второго экземпляра не заводит.
+        // Если процесс уже вышел, а окна так и нет, клавиша не должна остаться
+        // без ответа: принимается подходящее свободное окно, а когда его нет —
+        // прежнее ожидание снимается и приложение запускается заново.
+        if let Some(i) = self.pending.iter().position(|p| p.app == app) {
+            let exited = self.pending[i].exited;
+            let found = if exited { self.free_window_for(i)? } else { None };
+            match pending_step(exited, found.is_some(), true) {
+                PendingStep::Wait => return Ok(()),
+                PendingStep::Adopt => {
+                    let c = found.expect("окно найдено");
+                    let p = self.pending.remove(i);
+                    log::info!("{app}: принято уже открытое окно {} ({})", c.address, c.class);
+                    self.st.foreign.remove(&c.address);
+                    return self.adopt(&c, p);
+                }
+                _ => {
+                    self.pending.remove(i);
+                    log::info!("{app}: прежний запуск окна не дал, запускаем заново");
+                }
+            }
         }
         let Some(a) = self.cfg.apps.get(app) else { bail!("приложение {app} не описано") };
         let ws = workspace.and_then(|w| self.cfg.workspaces.get(w));
@@ -564,11 +641,13 @@ impl Daemon {
             });
         }
         let child = command.spawn().with_context(|| format!("{app}: не удалось запустить {cmd}"))?;
+        let pid = child.id();
+        watch_child(child, self.tx.clone());
         let exe = which(&cmd).and_then(|p| p.canonicalize().ok());
         let cmd_base = Path::new(&cmd).file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
         let (class_re, title_re) = a.matchers()?.map_or((None, None), |(c, t)| (Some(c), t));
-        log::info!("{app}: запущен pid {} ({cmd} {})", child.id(), args.join(" "));
-        self.pending.push(Pending { app: app.to_string(), workspace: workspace.map(String::from), desktop, child, exe, cmd_base, class_re, title_re, started: Instant::now(), exited_at: None, target, focus });
+        log::info!("{app}: запущен pid {pid} ({cmd} {})", args.join(" "));
+        self.pending.push(Pending { app: app.to_string(), workspace: workspace.map(String::from), desktop, pid, exe, cmd_base, class_re, title_re, exited: false, target, focus });
         Ok(())
     }
 
@@ -668,7 +747,6 @@ impl Daemon {
         }
         d.active = Some(ws.to_string());
         self.hypr.dispatch_all(&ex)?;
-        self.mark_dirty();
         self.broadcast();
         Ok(())
     }
@@ -715,7 +793,6 @@ impl Daemon {
             }
         }
         self.hypr.dispatch_all(&ex)?;
-        self.mark_dirty();
         self.broadcast();
         Ok(())
     }
@@ -823,7 +900,6 @@ impl Daemon {
             }
             self.hypr.dispatch_all(&ex)?;
         }
-        self.mark_dirty();
         self.broadcast();
         Ok(())
     }
@@ -845,7 +921,7 @@ impl Daemon {
     }
 
     /// Запуск постороннего окна из снимка сессии по команде и каталогу.
-    pub fn spawn_foreign(&mut self, cmd: &[String], cwd: Option<&str>) -> Result<()> {
+    pub fn spawn_foreign(&mut self, cmd: &[String], cwd: Option<&str>) -> Result<u32> {
         let Some((prog, args)) = cmd.split_first() else { bail!("пустая команда") };
         let mut command = Command::new(prog);
         command.args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
@@ -857,8 +933,10 @@ impl Daemon {
         unsafe {
             command.pre_exec(|| nix::unistd::setsid().map(|_| ()).map_err(std::io::Error::other));
         }
-        command.spawn().with_context(|| format!("не удалось запустить {prog}"))?;
-        Ok(())
+        let child = command.spawn().with_context(|| format!("не удалось запустить {prog}"))?;
+        let pid = child.id();
+        watch_child(child, self.tx.clone());
+        Ok(pid)
     }
 
     // ---- Половина рабочей области ---------------------------------------------
@@ -904,7 +982,6 @@ impl Daemon {
         let mut ex = vec![hypr::d_float_on(addr)];
         ex.extend(hypr::d_place(addr, r));
         self.hypr.dispatch_all(&ex)?;
-        self.mark_dirty();
         Ok(())
     }
 
@@ -972,6 +1049,7 @@ impl Daemon {
         let cmd = req.get("cmd").and_then(|c| c.as_str()).unwrap_or("");
         let s = |k: &str| req.get(k).and_then(|v| v.as_str()).map(String::from);
         let desktop = req.get("desktop").and_then(|v| v.as_u64()).map(|v| v as u8);
+        let changes = changes_state(cmd, s("op").as_deref());
         let r = match cmd {
             "raise" => match s("workspace") {
                 Some(ws) => self.raise(&ws, desktop).map(|_| json!({"ok": true})),
@@ -1000,6 +1078,7 @@ impl Daemon {
                 Some(ws) => self.remove(&ws, desktop).map(|_| json!({"ok": true})),
                 None => Err(anyhow::anyhow!("нет workspace")),
             },
+            "save-session" => crate::save::save_session(self).map(|(ws, n)| json!({"ok": true, "workspace": ws, "adopted": n})),
             "save-workspace" => crate::save::save_workspace(self).map(|ws| json!({"ok": true, "workspace": ws})),
             "sessions" => session::list(self).map(|list| {
                 let ev = json!({"event": "show-sessions", "sessions": list});
@@ -1020,7 +1099,14 @@ impl Daemon {
             other => Err(anyhow::anyhow!("неизвестная команда {other:?}")),
         };
         match r {
-            Ok(v) => v,
+            Ok(v) => {
+                // Снимок сессии пишется здесь, до ответа клиенту: к возврату
+                // команды файл уже обновлён.
+                if changes {
+                    self.save_session_file();
+                }
+                v
+            }
             Err(e) => {
                 log::warn!("{cmd}: {e:#}");
                 err_json(format!("{e:#}"))
@@ -1058,7 +1144,7 @@ impl Daemon {
                 json!({ "address": c.address, "class": c.class, "title": c.title, "app": c.app(), "instance": c.app_instance().map(|(_, n)| n), "workspace": c.workspace.name, "foreign": self.st.foreign.contains_key(&c.address), "rect": c.rect(), "pid": c.pid })
             })
             .collect();
-        let pending: Vec<Value> = self.pending.iter().map(|p| json!({ "app": p.app, "pid": p.child.id(), "desktop": p.desktop })).collect();
+        let pending: Vec<Value> = self.pending.iter().map(|p| json!({ "app": p.app, "pid": p.pid, "desktop": p.desktop })).collect();
         let obj = v.as_object_mut().unwrap();
         obj.insert("ok".into(), json!(true));
         obj.insert("windows".into(), json!(windows));
@@ -1155,8 +1241,107 @@ fn first_window<'a>(cfg: &Config, clients: &'a [Client], app: &str) -> Option<&'
     wins.iter().find(|c| !c.on_hidden()).or_else(|| wins.first()).copied()
 }
 
+/// Эффективный конфиг из файла и дополнительных приложений сессии. Запись
+/// с командой описывает и приложение, и его место в workspace; запись без
+/// команды называет приложение конфига и задаёт ему только место. Вторым
+/// значением возвращается перечень снятых записей: workspace, имя и причина.
+/// Снимаются записи, чей workspace из файла исчез, чьё имя занято приложением
+/// конфига (конфиг главнее), чьё приложение конфига пропало и чьё место конфиг
+/// теперь задаёт сам.
+#[allow(clippy::type_complexity)]
+pub fn merge_extra(file: &Config, extra: &BTreeMap<String, BTreeMap<String, ExtraApp>>) -> (Config, Vec<(String, String, String)>) {
+    let mut cfg = file.clone();
+    let mut dropped = Vec::new();
+    for (ws, apps) in extra {
+        for (name, e) in apps {
+            let known = file.apps.contains_key(name);
+            let reason = match file.workspaces.get(ws) {
+                None => Some(format!("workspace {ws} из конфига исчез")),
+                Some(_) if e.cmd.is_empty() && !known => Some("приложения с таким именем в конфиге больше нет".to_string()),
+                Some(_) if !e.cmd.is_empty() && known => Some("приложение с таким именем описано в конфиге, запись конфига главнее".to_string()),
+                Some(w) if w.apps.contains_key(name) => Some(format!("место приложения задано в разделе workspace {ws}")),
+                Some(_) => None,
+            };
+            match reason {
+                Some(r) => dropped.push((ws.clone(), name.clone(), r)),
+                None => {
+                    if !e.cmd.is_empty() {
+                        cfg.apps.insert(name.clone(), e.to_app());
+                    }
+                    if let Some(w) = cfg.workspaces.get_mut(ws) {
+                        w.apps.insert(name.clone(), Placement::Rect { rect: e.rect.to_rect() });
+                    }
+                }
+            }
+        }
+    }
+    (cfg, dropped)
+}
+
+/// Что делать с ожиданием запуска приложения.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PendingStep {
+    /// Запуск идёт: ждать окна, второго экземпляра не заводить.
+    Wait,
+    /// Принять уже открытое подходящее окно.
+    Adopt,
+    /// Запомнить, что процесс вышел, и ждать первого подходящего окна.
+    MarkExited,
+    /// Снять ожидание и запустить приложение заново.
+    Restart,
+}
+
+/// Решение по уже заведённому ожиданию запуска. `exited` — процесс вышел,
+/// `window` — в системе есть подходящее свободное окно, `key` — решение
+/// принимается по нажатию клавиши приложения, иначе по выходу процесса.
+/// Сроков в этой схеме нет: клавиша не остаётся без ответа, потому что после
+/// выхода процесса она либо принимает окно, либо запускает приложение заново.
+pub fn pending_step(exited: bool, window: bool, key: bool) -> PendingStep {
+    match (key, exited, window) {
+        (false, _, true) => PendingStep::Adopt,
+        (false, _, false) => PendingStep::MarkExited,
+        (true, false, _) => PendingStep::Wait,
+        (true, true, true) => PendingStep::Adopt,
+        (true, true, false) => PendingStep::Restart,
+    }
+}
+
+/// Меняет ли команда состояние демона. После такой команды снимок сессии
+/// `default` записывается до ответа клиенту; команды только для чтения
+/// (`status`, `sessions`, `session list`) файла не трогают.
+pub fn changes_state(cmd: &str, op: Option<&str>) -> bool {
+    match cmd {
+        "raise" | "app" | "next" | "half" | "maximize" | "place" | "remove" | "save-session" | "save-workspace" => true,
+        "session" => op == Some("load"),
+        _ => false,
+    }
+}
+
+/// Назначения ячеек, переживающие перечитывание конфига: остаются только
+/// workspace, чей раздел в файле не менялся (спецификация ws-config, «Слежение
+/// за конфигом»). Назначения остальных собираются заново при следующем
+/// обращении, поэтому откат правки возвращает расстановку.
+pub fn keep_cells(old: &Config, new: &Config, cells: &mut BTreeMap<String, BTreeMap<String, Place>>) {
+    cells.retain(|ws, _| match (old.workspaces.get(ws), new.workspaces.get(ws)) {
+        (Some(o), Some(n)) => o == n,
+        _ => false,
+    });
+}
+
+/// Приложение конфига, которому подходит окно по `class` и, если он задан,
+/// `title`. Сначала перебираются варианты, затем семейства, внутри группы
+/// по именам: более точное совпадение побеждает, как при захвате открытых окон.
+pub fn app_for_window(cfg: &Config, c: &Client) -> Option<String> {
+    let mut names: Vec<&String> = cfg.apps.keys().collect();
+    names.sort_by_key(|n| (cfg.family_of(n).is_none(), n.as_str()));
+    names
+        .into_iter()
+        .find(|n| matches!(cfg.apps[*n].matchers(), Ok(Some((cr, tr))) if matcher_fits(Some(&cr), tr.as_ref(), c)))
+        .cloned()
+}
+
 /// Наименьший свободный номер, начиная с 1, среди занятых.
-fn free_number(used: &[u32]) -> u32 {
+pub fn free_number(used: &[u32]) -> u32 {
     let mut used = used.to_vec();
     used.sort_unstable();
     let mut num = 1;
@@ -1478,6 +1663,129 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
         let cfg = Config::parse(&two).unwrap();
         let plan = adopt_plan(&cfg, &clients[..1], &["chromium".to_string()]).unwrap();
         assert_eq!(plan, vec![(0, "chromium-docs".to_string(), 1)]);
+    }
+
+    #[test]
+    fn app_for_window_prefers_variant() {
+        let cfg = Config::parse(CFG).unwrap();
+        let gmail = client("0x1", "chromium", "Gmail — Входящие", "1", &[]);
+        let news = client("0x2", "chromium", "Новости", "1", &[]);
+        let alien = client("0x3", "galculator", "Калькулятор", "1", &[]);
+        // Более точное совпадение побеждает: окно Gmail достаётся варианту.
+        assert_eq!(app_for_window(&cfg, &gmail).as_deref(), Some("chromium-mail"));
+        assert_eq!(app_for_window(&cfg, &news).as_deref(), Some("chromium"));
+        // Окно, которому не подходит ни одно приложение конфига.
+        assert_eq!(app_for_window(&cfg, &alien), None);
+    }
+
+    #[test]
+    fn merge_extra_adds_apps_and_drops_shadowed() {
+        let cfg = Config::parse(CFG).unwrap();
+        let rect = PxRect { x: 100, y: 200, w: 800, h: 600 };
+        let full = ExtraApp { class: Some("Galculator".into()), cmd: vec!["galculator".into()], cwd: None, rect };
+        let place_only = ExtraApp { rect, ..ExtraApp::default() };
+        let mut extra: BTreeMap<String, BTreeMap<String, ExtraApp>> = BTreeMap::new();
+        let apps = extra.entry("work".into()).or_default();
+        apps.insert("galculator".into(), full.clone());
+        apps.insert("chromium-mail".into(), place_only.clone());
+        let (eff, dropped) = merge_extra(&cfg, &extra);
+        assert!(dropped.is_empty());
+        // Новое приложение появилось и в [apps], и в таблице apps workspace.
+        assert_eq!(eff.apps["galculator"].cmd.as_deref(), Some("galculator"));
+        assert_eq!(eff.workspaces["work"].apps["galculator"], Placement::Rect { rect: rect.to_rect() });
+        // Запись только о месте описание приложения конфига не подменяет,
+        // а лишь добавляет его в этот workspace.
+        assert_eq!(eff.apps["chromium-mail"].title.as_deref(), Some("^Gmail"));
+        assert_eq!(eff.workspaces["work"].apps["chromium-mail"], Placement::Rect { rect: rect.to_rect() });
+        // Файл конфига не менялся.
+        assert!(!cfg.apps.contains_key("galculator"));
+        assert!(!cfg.workspaces["work"].apps.contains_key("galculator"));
+
+        // Имя занято конфигом — запись конфига главнее; приложения конфига
+        // не стало — запись только о месте снимается; workspace исчез — тоже.
+        let mut extra: BTreeMap<String, BTreeMap<String, ExtraApp>> = BTreeMap::new();
+        extra.entry("work".into()).or_default().insert("chromium".into(), full);
+        extra.entry("work".into()).or_default().insert("keepassxc".into(), place_only.clone());
+        extra.entry("notes".into()).or_default().insert("galculator".into(), place_only.clone());
+        let (eff, dropped) = merge_extra(&cfg, &extra);
+        let mut names: Vec<&str> = dropped.iter().map(|(_, n, _)| n.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["chromium", "galculator", "keepassxc"]);
+        assert_eq!(eff.apps["chromium"].cmd.as_deref(), Some("chromium"));
+        assert!(!eff.workspaces["work"].apps.contains_key("keepassxc"));
+
+        // Конфиг сам задал место приложению в этом workspace: запись снимается.
+        let mut extra: BTreeMap<String, BTreeMap<String, ExtraApp>> = BTreeMap::new();
+        extra.entry("work".into()).or_default().insert("herdr".into(), place_only);
+        let (eff, dropped) = merge_extra(&cfg, &extra);
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(eff.workspaces["work"].apps["herdr"], Placement::Cell("center".into()));
+    }
+
+    #[test]
+    fn keep_cells_resets_only_changed_workspace() {
+        let cfg = Config::parse(CFG).unwrap();
+        let changed = Config::parse(&CFG.replace("neovide = \"right\"", "neovide = { rect = { x = 0, y = 0, w = 10, h = 10 } }")).unwrap();
+        let added = Config::parse(&format!("{CFG}\n[workspaces.surf]\ntemplate = \"thirds\"\napps = {{ neovide = \"right\" }}\n")).unwrap();
+        let cells = || BTreeMap::from([("work".to_string(), BTreeMap::from([("chromium".to_string(), Place::Cell("center".into()))]))]);
+        // Раздел workspace изменился: назначения снимаются и соберутся из файла.
+        let mut c = cells();
+        keep_cells(&cfg, &changed, &mut c);
+        assert!(c.is_empty());
+        // Правка соседнего workspace обмен ячеек в `work` не сбрасывает.
+        let mut c = cells();
+        keep_cells(&cfg, &added, &mut c);
+        assert_eq!(c["work"]["chromium"], Place::Cell("center".into()));
+        // Workspace из конфига исчез.
+        let mut c = cells();
+        keep_cells(&cfg, &Config::default(), &mut c);
+        assert!(c.is_empty());
+    }
+
+    #[test]
+    fn pending_waits_for_the_window_without_deadlines() {
+        // Окно появилось до выхода процесса: запись снимает обработчик
+        // openwindow, до решения дело не доходит. Здесь — остальные переходы.
+        // Процесс вышел, подходящее окно уже есть: принять сразу.
+        assert_eq!(pending_step(false, true, false), PendingStep::Adopt);
+        // Процесс вышел, окна нет: ждать первого подходящего окна.
+        assert_eq!(pending_step(false, false, false), PendingStep::MarkExited);
+        // Клавиша нажата, пока запуск идёт: второй экземпляр не заводится.
+        assert_eq!(pending_step(false, false, true), PendingStep::Wait);
+        assert_eq!(pending_step(false, true, true), PendingStep::Wait);
+        // Клавиша нажата после выхода процесса: принять окно, если оно есть,
+        // иначе запустить заново — клавиша не остаётся без ответа.
+        assert_eq!(pending_step(true, true, true), PendingStep::Adopt);
+        assert_eq!(pending_step(true, false, true), PendingStep::Restart);
+    }
+
+    #[test]
+    fn config_reload_only_on_finished_writes() {
+        use notify::event::{AccessKind, AccessMode, CreateKind, DataChange, EventKind, ModifyKind, RenameMode};
+        // Правка на месте (nvim, tee): перечитывание по закрытию файла.
+        assert!(write_finished(&EventKind::Access(AccessKind::Close(AccessMode::Write))));
+        // Запись во временный файл с переименованием (chezmoi apply).
+        assert!(write_finished(&EventKind::Modify(ModifyKind::Name(RenameMode::To))));
+        // Парное событие переименования приходит вдобавок к `To`: учёт обоих
+        // дал бы два перечитывания на одно сохранение.
+        assert!(!write_finished(&EventKind::Modify(ModifyKind::Name(RenameMode::Both))));
+        assert!(!write_finished(&EventKind::Modify(ModifyKind::Name(RenameMode::From))));
+        // Посреди записи и при создании файла не перечитываем: иначе на одно
+        // сохранение пришлось бы несколько перечитываний, в том числе неполного файла.
+        assert!(!write_finished(&EventKind::Modify(ModifyKind::Data(DataChange::Any))));
+        assert!(!write_finished(&EventKind::Create(CreateKind::File)));
+        assert!(!write_finished(&EventKind::Access(AccessKind::Close(AccessMode::Read))));
+    }
+
+    #[test]
+    fn only_state_changing_commands_write_the_snapshot() {
+        for cmd in ["raise", "app", "next", "half", "maximize", "place", "remove", "save-session", "save-workspace"] {
+            assert!(changes_state(cmd, None), "{cmd}");
+        }
+        assert!(changes_state("session", Some("load")));
+        for (cmd, op) in [("status", None), ("sessions", None), ("session", Some("list")), ("session", Some("save"))] {
+            assert!(!changes_state(cmd, op), "{cmd}");
+        }
     }
 
     #[test]

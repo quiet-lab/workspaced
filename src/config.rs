@@ -72,7 +72,7 @@ pub struct Rect {
 }
 
 /// Прямоугольник в пикселях экрана.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, Deserialize)]
 pub struct PxRect {
     pub x: i32,
     pub y: i32,
@@ -97,6 +97,11 @@ impl PxRect {
     pub fn inset(self, gap: i32) -> PxRect {
         PxRect { x: self.x + gap, y: self.y + gap, w: (self.w - 2 * gap).max(1), h: (self.h - 2 * gap).max(1) }
     }
+
+    /// Тот же прямоугольник в форме конфига: все четыре числа в пикселях.
+    pub fn to_rect(self) -> Rect {
+        Rect { x: Coord::Px(self.x), y: Coord::Px(self.y), w: Coord::Px(self.w), h: Coord::Px(self.h) }
+    }
 }
 
 /// Шаблон геометрии: именованные ячейки и главная.
@@ -112,7 +117,7 @@ pub struct Template {
 /// открытого окна (спецификация ws-daemon, «Захват открытых окон приложения»).
 /// Приложение-вариант называет своё семейство полем `family`; приложение без
 /// `cmd` окон не открывает, а только собирает подходящие по `class`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct App {
     #[serde(default)]
     pub cmd: Option<String>,
@@ -173,7 +178,10 @@ pub enum Placement {
 }
 
 /// Workspace: шаблон, приложения по ячейкам, главное, иконка, цепочка.
-#[derive(Debug, Clone, Deserialize)]
+/// Сравнение на равенство нужно перечитыванию конфига: у workspace, чей раздел
+/// изменился, назначения ячеек собираются заново (спецификация ws-config,
+/// «Слежение за конфигом»).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Workspace {
     pub template: String,
     #[serde(default)]
@@ -191,6 +199,11 @@ pub struct Workspace {
 /// Служебные цепочки и зарезервированные сочетания.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Keys {
+    /// Сохранить сессию: посторонние окна стола входят в активный workspace,
+    /// файл конфига не меняется.
+    #[serde(default)]
+    pub save_session: Option<String>,
+    /// Записать активный workspace в этот файл.
     #[serde(default)]
     pub save_workspace: Option<String>,
     #[serde(default)]
@@ -433,7 +446,7 @@ impl Config {
                 bail!("привязка {:?}: пустой список dispatch", b.chain);
             }
             match &b.action {
-                Some(Action::Named(n)) if !matches!(n.as_str(), "sessions" | "save-workspace" | "next-workspace" | "maximize") => {
+                Some(Action::Named(n)) if !matches!(n.as_str(), "sessions" | "save-session" | "save-workspace" | "next-workspace" | "maximize") => {
                     bail!("привязка {:?}: неизвестное действие {n:?}", b.chain)
                 }
                 Some(Action::Half(HalfAction { half })) if !matches!(half.as_str(), "left" | "right" | "up" | "down") => {
