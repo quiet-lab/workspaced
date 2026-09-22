@@ -72,6 +72,13 @@ enum Command {
     },
     /// Поднять следующий workspace из списка текущего стола
     Next,
+    /// Перенести активный workspace текущего стола на стол 1…8 и перейти туда
+    MoveDesktop {
+        /// Номер стола 1…8
+        desktop: u8,
+    },
+    /// Расставить окна текущего стола по описанию активного workspace
+    Arrange,
     /// Принять посторонние окна текущего стола в активный workspace на время сессии
     SaveSession,
     /// Записать текущее состояние активного workspace в конфиг
@@ -142,6 +149,8 @@ fn main() -> anyhow::Result<()> {
         Command::Raise { workspace, desktop } => client::call(json!({ "cmd": "raise", "workspace": workspace, "desktop": desktop })).map(|_| ()),
         Command::App { app, desktop, workspace } => client::call(json!({ "cmd": "app", "apps": app, "desktop": desktop, "workspace": workspace })).map(|_| ()),
         Command::Next => client::call(json!({ "cmd": "next" })).map(|_| ()),
+        Command::MoveDesktop { desktop } => client::call(json!({ "cmd": "move-desktop", "desktop": desktop })).map(|_| ()),
+        Command::Arrange => client::call(json!({ "cmd": "arrange" })).map(|_| ()),
         Command::SaveSession => {
             let v = client::call(json!({ "cmd": "save-session" }))?;
             let ws = v.get("workspace").and_then(|w| w.as_str()).unwrap_or("?");

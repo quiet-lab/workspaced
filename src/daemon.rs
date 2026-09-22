@@ -585,7 +585,7 @@ impl Daemon {
                 if c.desktop() != Some(p.desktop) {
                     ex.push(hypr::d_move_to(&c.address, &p.desktop.to_string()));
                 }
-                let r = rect.unwrap_or(PxRect { x: (self.mon.0 - c.size.0) / 2, y: (self.mon.1 - c.size.1) / 2, w: c.size.0, h: c.size.1 });
+                let r = rect.unwrap_or_else(|| center_rect(c, self.mon));
                 ex.extend(hypr::d_place(&c.address, r));
                 let (cmd, cwd) = proc_info(c.pid);
                 self.st.foreign.insert(c.address.clone(), Foreign { rect: r, cmd, cwd });
@@ -1099,6 +1099,99 @@ impl Daemon {
         }
     }
 
+    /// Стол, на котором композитор находится сейчас. Поле `current` — только
+    /// кэш: его обновляют события `workspacev2` и команды самого демона,
+    /// а событие приходит отдельным соединением и обрабатывается в общей
+    /// очереди, поэтому событие, отставшее от команды, может вернуть в кэш
+    /// стол, с которого демон уже ушёл. Команда, которая действует на «стол,
+    /// где пользователь сейчас», MUST отталкиваться от композитора, как
+    /// `half`, `place` и `maximize` отталкиваются от активного окна.
+    /// Специальный стол (`special:*`) номера не имеет, и кэш тогда остаётся
+    /// прежним.
+    fn sync_current(&mut self) -> u8 {
+        let live = self.hypr.active_workspace().ok().and_then(|w| w.parse::<u8>().ok()).filter(|n| (1..=8).contains(n));
+        if let Some(n) = live
+            && n != self.current
+        {
+            log::info!("текущий стол уточнён у композитора: был {}, стал {n}", self.current);
+            self.current = n;
+        }
+        self.current
+    }
+
+    /// Перенести активный workspace текущего стола на стол `n` и перейти туда
+    /// (спецификация ws-daemon, «Перенос workspace на стол»). Перенос — это
+    /// поднятие с явным столом, поэтому остальное делает `raise`: окна всех
+    /// приложений переезжают, а workspace, активный на столе `n`, сворачивается
+    /// на `special:pool` по общему правилу.
+    pub fn move_desktop(&mut self, n: u8) -> Result<()> {
+        if !(1..=8).contains(&n) {
+            bail!("стол должен быть от 1 до 8, получено {n}");
+        }
+        let cur = self.sync_current();
+        let active = self.st.desktops.get(&cur).and_then(|d| d.active.clone());
+        match move_step(cur, n, active.as_deref()) {
+            MoveStep::Nothing => {
+                log::info!("перенос на стол {n}: на столе {cur} нет активного workspace");
+                Ok(())
+            }
+            MoveStep::Here(ws) => {
+                log::info!("перенос на стол {n}: workspace {ws} уже на этом столе");
+                Ok(())
+            }
+            MoveStep::Move(ws) => {
+                // Окна запоминают, где их оставили: в режиме `stack` перенос
+                // не отменяет сдвиг окна мышью, и на новом столе окно встаёт
+                // туда, где стояло.
+                let clients = self.hypr.clients()?;
+                self.remember_geometry(&ws, &clients);
+                log::info!("перенос workspace {ws} со стола {cur} на стол {n}");
+                self.raise(&ws, Some(n))
+            }
+        }
+    }
+
+    /// Расставить окна текущего стола по описанию активного workspace
+    /// (спецификация ws-daemon, «Расстановка по команде»). Назначения ячеек
+    /// команда не меняет: окна встают по тем местам, которые назначены сейчас.
+    fn arrange(&mut self) -> Result<()> {
+        // Расстановка тоже действует на стол, где пользователь сейчас,
+        // поэтому стол берётся у композитора, а не из кэша.
+        let n = self.sync_current();
+        let cfg = self.cfg.clone();
+        let ws = self.st.desktops.get(&n).and_then(|d| d.active.clone());
+        let clients = self.hypr.clients()?;
+        // Порядок появления даёт номер окна у композитора: по нему выбирается
+        // первое окно класса, на место которого встаёт вся стопка свободных окон.
+        let mut windows: Vec<&Client> = clients.iter().filter(|c| c.desktop() == Some(n)).collect();
+        windows.sort_by_key(|c| c.stable());
+        if windows.is_empty() {
+            log::info!("расстановка на столе {n}: окон нет");
+            return Ok(());
+        }
+        let plan = arrange_plan(&mut self.st, &cfg, ws.as_deref(), &windows, self.mon);
+        let mut ex: Vec<String> = plan.iter().flat_map(|(addr, r)| hypr::d_place(addr, *r)).collect();
+        // Фокус остаётся у активного окна, а само окно поднимается наверх своей стопки.
+        if let Some(a) = self.hypr.active_window()?.filter(|c| c.desktop() == Some(n)).map(|c| c.address) {
+            ex.push(hypr::d_focus_window(&a));
+            ex.push(hypr::d_bring_to_top());
+        }
+        self.hypr.dispatch_all(&ex)?;
+        log::info!("расстановка на столе {n}: окон {}, workspace {}", plan.len(), ws.as_deref().unwrap_or("нет"));
+        // В режиме `stack` запомненные прямоугольники сменяются местами
+        // из конфига: вернуть окна к описанию — и есть смысл команды.
+        if let Some(w) = ws.filter(|w| cfg.workspaces.get(w).map(|x| x.mode()) == Some(Mode::Stack)) {
+            let ws_apps = self.ws_apps(&w);
+            for (addr, r) in &plan {
+                if clients.iter().any(|c| c.address == *addr && ws_app_of(&cfg, &ws_apps, c).is_some()) {
+                    self.st.geom.entry(w.clone()).or_default().insert(addr.clone(), *r);
+                }
+            }
+        }
+        self.broadcast();
+        Ok(())
+    }
+
     /// Следующий workspace в списке текущего стола.
     pub fn next(&mut self) -> Result<()> {
         let d = self.st.desktop(self.current).clone();
@@ -1297,6 +1390,11 @@ impl Daemon {
                 }
             }
             "next" => self.next().map(|_| json!({"ok": true})),
+            "move-desktop" => match desktop {
+                Some(n) => self.move_desktop(n).map(|_| json!({"ok": true})),
+                None => Err(anyhow::anyhow!("нет desktop")),
+            },
+            "arrange" => self.arrange().map(|_| json!({"ok": true})),
             "half" => match s("side") {
                 Some(side) => self.half(&side).map(|_| json!({"ok": true})),
                 None => Err(anyhow::anyhow!("нет side")),
@@ -1589,7 +1687,7 @@ pub fn pending_step(exited: bool, window: bool, key: bool) -> PendingStep {
 /// (`status`, `sessions`, `session list`) файла не трогают.
 pub fn changes_state(cmd: &str, op: Option<&str>) -> bool {
     match cmd {
-        "raise" | "app" | "next" | "half" | "maximize" | "place" | "remove" | "save-session" | "save-workspace" => true,
+        "raise" | "app" | "next" | "move-desktop" | "arrange" | "half" | "maximize" | "place" | "remove" | "save-session" | "save-workspace" => true,
         "session" => op == Some("load"),
         _ => false,
     }
@@ -1629,6 +1727,56 @@ pub fn open_rect(st: &mut State, cfg: &Config, ws: Option<&str>, app: &str, mon:
         Some(w) => st.rect_for(cfg, w, app, mon),
         None => State::app_rect(cfg, app, mon),
     }
+}
+
+/// Что делает команда переноса workspace на стол.
+#[derive(Debug, PartialEq, Eq)]
+pub enum MoveStep {
+    /// Перенести названный workspace на целевой стол и перейти туда.
+    Move(String),
+    /// Ничего не делать: workspace уже на целевом столе.
+    Here(String),
+    /// Ничего не делать: на текущем столе активного workspace нет.
+    Nothing,
+}
+
+/// Решение команды `move-desktop` (спецификация ws-daemon, «Перенос workspace
+/// на стол») по фактическому текущему столу, целевому столу и активному
+/// workspace текущего стола. Текущий стол читается у композитора, а не берётся
+/// из кэша демона (`Daemon::sync_current`): иначе перенос идёт не с того стола,
+/// на котором пользователь.
+pub fn move_step(current: u8, target: u8, active: Option<&str>) -> MoveStep {
+    match active {
+        None => MoveStep::Nothing,
+        Some(ws) if target == current => MoveStep::Here(ws.to_string()),
+        Some(ws) => MoveStep::Move(ws.to_string()),
+    }
+}
+
+/// План расстановки по команде (спецификация ws-daemon, «Расстановка
+/// по команде»): адрес окна и место, которое оно займёт. Окно приложения,
+/// описанного в эффективном конфиге, встаёт на место своего приложения
+/// по правилу мест; окно без описания — в положение по умолчанию, а окна
+/// одного класса без описания образуют одну стопку на месте первого из них.
+/// Окна передаются по порядку появления: он и задаёт это первое окно.
+pub fn arrange_plan(st: &mut State, cfg: &Config, ws: Option<&str>, windows: &[&Client], mon: (i32, i32)) -> Vec<(String, PxRect)> {
+    let mut stacks: BTreeMap<String, PxRect> = BTreeMap::new();
+    let mut plan = Vec::new();
+    for c in windows {
+        let rect = c.app().filter(|a| cfg.apps.contains_key(a)).and_then(|a| open_rect(st, cfg, ws, &a, mon));
+        let r = match rect {
+            Some(r) => r,
+            None => *stacks.entry(c.class.clone()).or_insert_with(|| center_rect(c, mon)),
+        };
+        plan.push((c.address.clone(), r));
+    }
+    plan
+}
+
+/// Положение по умолчанию: центр экрана с нынешним размером окна — так ставит
+/// новое окно и композитор по правилам `float-by-default` и `center` сессии.
+fn center_rect(c: &Client, mon: (i32, i32)) -> PxRect {
+    PxRect { x: (mon.0 - c.size.0) / 2, y: (mon.1 - c.size.1) / 2, w: c.size.0, h: c.size.1 }
 }
 
 /// Окна, которые пора освободить: тег называет приложение, которого
@@ -2254,7 +2402,7 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
 
     #[test]
     fn only_state_changing_commands_write_the_snapshot() {
-        for cmd in ["raise", "app", "next", "half", "maximize", "place", "remove", "save-session", "save-workspace"] {
+        for cmd in ["raise", "app", "next", "move-desktop", "arrange", "half", "maximize", "place", "remove", "save-session", "save-workspace"] {
             assert!(changes_state(cmd, None), "{cmd}");
         }
         assert!(changes_state("session", Some("load")));
@@ -2360,6 +2508,68 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
         assert_eq!(st.cells_of(&cfg, "work", mon).get("herdr"), None);
         // У семейства без cmd запускать нечего: место остаётся пустым, демон пишет в журнал.
         assert!(cfg.app_command(None, &cfg.apps["wezterm"]).is_none());
+    }
+
+    #[test]
+    fn move_step_by_current_and_target_desktop() {
+        // Целевой стол не текущий: активный workspace текущего стола переезжает.
+        assert_eq!(move_step(2, 3, Some("surf")), MoveStep::Move("surf".to_string()));
+        assert_eq!(move_step(1, 8, Some("work")), MoveStep::Move("work".to_string()));
+        // Целевой стол — текущий: workspace уже здесь, действия нет.
+        assert_eq!(move_step(3, 3, Some("surf")), MoveStep::Here("surf".to_string()));
+        // На текущем столе активного workspace нет: переносить нечего.
+        assert_eq!(move_step(4, 5, None), MoveStep::Nothing);
+        assert_eq!(move_step(3, 3, None), MoveStep::Nothing);
+    }
+
+    #[test]
+    fn arrange_plan_places_apps_and_stacks_free_windows() {
+        let cfg = Config::parse(CFG).unwrap();
+        let mon = (3840, 2160);
+        let mut st = State::default();
+        let sized = |addr: &str, class: &str, tags: &[&str], w: i32, h: i32| {
+            let mut c = client(addr, class, "", "1", tags);
+            c.size = (w, h);
+            c
+        };
+        let clients = [
+            sized("0x1", "wezterm-herdr", &["app:herdr#1"], 100, 100),
+            sized("0x2", "chromium", &["app:chromium#1"], 100, 100),
+            sized("0x3", "chromium", &["app:chromium#2"], 100, 100),
+            sized("0x4", "qalculate-gtk", &["app:calc#1"], 600, 400),
+            sized("0x5", "Galculator", &[], 800, 600),
+            sized("0x6", "Galculator", &[], 400, 300),
+            sized("0x7", "org.telegram.desktop", &[], 1000, 900),
+            // Тег называет приложение, которого в конфиге нет: описания у окна тоже нет.
+            sized("0x8", "neovide", &["app:editor-dots#1"], 500, 500),
+        ];
+        let windows: Vec<&Client> = clients.iter().collect();
+        let plan = arrange_plan(&mut st, &cfg, Some("work"), &windows, mon);
+        let place = |addr: &str| plan.iter().find(|(a, _)| a == addr).map(|(_, r)| *r).unwrap();
+        // Окна приложений — на свои места по правилу мест: вариант в ячейке
+        // семейства, два окна Chromium стопкой в одной ячейке, приложение вне
+        // workspace — в свой `rect`.
+        assert_eq!(place("0x1"), PxRect { x: 1125, y: 10, w: 1920, h: 2140 });
+        assert_eq!(place("0x2"), PxRect { x: -805, y: 10, w: 1920, h: 2140 });
+        assert_eq!(place("0x3"), place("0x2"));
+        assert_eq!(place("0x4"), PxRect { x: 2600, y: 1500, w: 600, h: 400 });
+        // Свободные окна — в центр экрана со своим размером, а второе окно того
+        // же класса встаёт на место первого по порядку появления.
+        assert_eq!(place("0x5"), PxRect { x: 1520, y: 780, w: 800, h: 600 });
+        assert_eq!(place("0x6"), place("0x5"));
+        assert_eq!(place("0x7"), PxRect { x: 1420, y: 630, w: 1000, h: 900 });
+        assert_eq!(place("0x8"), PxRect { x: 1670, y: 830, w: 500, h: 500 });
+
+        // Активного workspace на столе нет: остаётся правило «`rect` приложения,
+        // иначе центр экрана».
+        let mut st = State::default();
+        let plan = arrange_plan(&mut st, &cfg, None, &windows, mon);
+        let place = |addr: &str| plan.iter().find(|(a, _)| a == addr).map(|(_, r)| *r).unwrap();
+        assert_eq!(place("0x4"), PxRect { x: 2600, y: 1500, w: 600, h: 400 });
+        assert_eq!(place("0x1"), PxRect { x: 1870, y: 1030, w: 100, h: 100 });
+        assert_eq!(place("0x3"), place("0x2"));
+        // Назначения ячеек расстановка не меняет.
+        assert!(st.cells.is_empty());
     }
 
     #[test]

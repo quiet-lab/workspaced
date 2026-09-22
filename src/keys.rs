@@ -13,7 +13,7 @@ use std::fmt::Write;
 
 use anyhow::{Result, bail};
 
-use crate::config::{Action, Bind, Config, Dispatch, HalfAction, PlaceAction, TargetAction};
+use crate::config::{Action, Bind, Config, Desk, Dispatch, HalfAction, MoveAction, PlaceAction, TargetAction};
 
 /// Одно сочетание в каноническом виде: модификаторы по фиксированному порядку,
 /// клавиша как написана.
@@ -177,6 +177,12 @@ fn expand_range(b: &Bind) -> Vec<Bind> {
             e.range = None;
             e.chain = sub(&b.chain);
             e.exec = b.exec.as_ref().map(sub);
+            // Номер стола в действии `move` подставляется так же, как в цепочке:
+            // одна запись разворачивается в серию Ctrl+Super+1…8.
+            e.action = b.action.as_ref().map(|a| match a {
+                Action::Move(m) => Action::Move(MoveAction { desktop: Desk::Str(sub(&m.desktop.text())) }),
+                other => other.clone(),
+            });
             e.dispatch = b.dispatch.as_ref().map(|d| match d {
                 Dispatch::One(s) => Dispatch::One(sub(s)),
                 Dispatch::Many(v) => Dispatch::Many(v.iter().map(sub).collect()),
@@ -239,10 +245,20 @@ pub fn collect(cfg: &Config) -> Result<Vec<Binding>> {
                         "save-workspace" => "workspaced save-workspace".to_string(),
                         "next-workspace" => "workspaced next".to_string(),
                         "maximize" => "workspaced maximize".to_string(),
+                        "arrange" => "workspaced arrange".to_string(),
                         other => bail!("привязка {:?}: неизвестное действие {other:?}", b.chain),
                     },
                     Action::Half(HalfAction { half }) => format!("workspaced half {half}"),
                     Action::Place(PlaceAction { place }) => format!("workspaced place {place}"),
+                    // Номер стола проверяется здесь, а не при разборе конфига:
+                    // в записи с `range` на его месте стоит `$n`, и число
+                    // появляется только после разворачивания серии.
+                    Action::Move(MoveAction { desktop }) => {
+                        let Some(n) = desktop.number() else {
+                            bail!("привязка {:?}: move должен быть номером стола от 1 до 8, получено {:?}", b.chain, desktop.text())
+                        };
+                        format!("workspaced move-desktop {n}")
+                    }
                     Action::Target(TargetAction { desktop, workspace, app }) => {
                         let mut cmd = match (workspace, app) {
                             (_, Some(a)) => format!("workspaced app {a}"),
@@ -592,6 +608,35 @@ apps = { firefox-chat = "c" }
         let text = base() + "\n[[binds]]\nchain = \"SUPER+mouse:272\"\nmouse = true\ndispatch = \"window.drag()\"\n";
         let lua = to_lua(&Config::parse(&text).unwrap()).unwrap();
         assert!(lua.contains("hl.bind(\"SUPER + mouse:272\", hl.dsp.window.drag(), { mouse = true })"), "{lua}");
+    }
+
+    #[test]
+    fn move_desktop_and_arrange_actions() {
+        // Перенос workspace на стол: серия Ctrl+Super+1…8 из одной записи,
+        // номер стола подставляется в действие так же, как в цепочку.
+        let text = base() + "\n[[binds]]\nchain = \"CTRL+SUPER+$n\"\nrange = [1, 8]\naction = { move = \"$n\" }\n";
+        let cfg = Config::parse(&text).unwrap();
+        let binds = collect(&cfg).unwrap();
+        let series: Vec<&Binding> = binds.iter().filter(|b| b.source.starts_with("binds[0]")).collect();
+        assert_eq!(series.len(), 8);
+        assert_eq!(chain_compact(&series[2].chain), "SUPER+CTRL+3");
+        assert_eq!(series[2].act, Act::Daemon("workspaced move-desktop 3".to_string()));
+        // Число в действии тоже допустимо.
+        let one = base() + "\n[[binds]]\nchain = \"CTRL+SUPER+F1\"\naction = { move = 2 }\n";
+        assert!(to_list(&Config::parse(&one).unwrap()).unwrap().contains("move-desktop 2"));
+        // Стол вне 1…8 отклоняется с указанием цепочки.
+        let bad = base() + "\n[[binds]]\nchain = \"CTRL+SUPER+F1\"\naction = { move = 9 }\n";
+        let err = Config::parse(&bad).unwrap_err().to_string();
+        assert!(err.contains("CTRL+SUPER+F1") && err.contains("9") && err.contains("от 1 до 8"), "{err}");
+
+        // Расстановка окон по конфигу: служебное действие строкой.
+        let text = base() + "\n[[binds]]\nchain = \"CTRL+SUPER+space\"\naction = \"arrange\"\n";
+        let cfg = Config::parse(&text).unwrap();
+        let lua = to_lua(&cfg).unwrap();
+        luac(&lua);
+        assert!(lua.contains("hl.bind(\"SUPER + CTRL + space\", hl.dsp.exec_cmd(\"workspaced arrange\"))"), "{lua}");
+        let bad = base() + "\n[[binds]]\nchain = \"CTRL+SUPER+space\"\naction = \"arange\"\n";
+        assert!(Config::parse(&bad).unwrap_err().to_string().contains("arange"));
     }
 
     #[test]

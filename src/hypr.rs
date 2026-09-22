@@ -51,6 +51,9 @@ pub struct Client {
     /// Полноэкранный режим композитора: 0 — нет, 1 — maximized, 2 — fullscreen.
     #[serde(default)]
     pub fullscreen: i32,
+    /// Номер окна у композитора: чем он меньше, тем раньше окно появилось.
+    #[serde(default, rename = "stableId")]
+    pub stable_id: String,
 }
 
 /// Разбор тега окна `app:<имя>#<номер>`: имя приложения и номер экземпляра.
@@ -92,6 +95,11 @@ impl Client {
     }
     pub fn on_pool(&self) -> bool {
         self.workspace.name == "special:pool"
+    }
+    /// Порядок появления окна: номер `stableId` композитора. Окно без номера
+    /// идёт последним, поэтому порядок остальных не меняется.
+    pub fn stable(&self) -> u64 {
+        self.stable_id.parse().unwrap_or(u64::MAX)
     }
 }
 

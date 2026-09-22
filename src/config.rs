@@ -265,6 +265,37 @@ pub struct PlaceAction {
 /// Допустимые позиции действия `place`.
 pub const PLACES: [&str; 8] = ["top-left", "top-center", "top-right", "bottom-left", "bottom-center", "bottom-right", "center", "full"];
 
+/// Номер стола в действии: число (`{ move = 3 }`) или строка — в записи
+/// с `range` там стоит подстановка `{ move = "$n" }`.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum Desk {
+    Num(i64),
+    Str(String),
+}
+
+impl Desk {
+    pub fn text(&self) -> String {
+        match self {
+            Desk::Num(n) => n.to_string(),
+            Desk::Str(s) => s.clone(),
+        }
+    }
+    /// Номер стола 1…8; `None` — не число или вне диапазона.
+    pub fn number(&self) -> Option<u8> {
+        self.text().trim().parse::<u8>().ok().filter(|n| (1..=8).contains(n))
+    }
+}
+
+/// Перенос активного workspace текущего стола на другой стол:
+/// `{ move = 3 }` либо `{ move = "$n" }` в записи с `range`.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct MoveAction {
+    #[serde(rename = "move")]
+    pub desktop: Desk,
+}
+
 /// Стол, workspace и приложение: `{ desktop = 3, workspace = "dots" }`.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -284,6 +315,7 @@ pub enum Action {
     Named(String),
     Half(HalfAction),
     Place(PlaceAction),
+    Move(MoveAction),
     Target(TargetAction),
 }
 
@@ -479,7 +511,7 @@ impl Config {
                 bail!("привязка {:?}: пустой список dispatch", b.chain);
             }
             match &b.action {
-                Some(Action::Named(n)) if !matches!(n.as_str(), "sessions" | "save-session" | "save-workspace" | "next-workspace" | "maximize") => {
+                Some(Action::Named(n)) if !matches!(n.as_str(), "sessions" | "save-session" | "save-workspace" | "next-workspace" | "maximize" | "arrange") => {
                     bail!("привязка {:?}: неизвестное действие {n:?}", b.chain)
                 }
                 Some(Action::Half(HalfAction { half })) if !matches!(half.as_str(), "left" | "right" | "up" | "down") => {
