@@ -158,15 +158,17 @@ pub fn restore_default(d: &mut Daemon) -> Result<()> {
 /// приложения прежнего состояния здесь как раз заменяются.
 fn apply_lists(d: &mut Daemon, s: &Session) {
     let cfg_ws: Vec<String> = d.cfg_file().workspaces.keys().cloned().collect();
-    let st = d.state_mut();
-    st.desktops.clear();
+    let mut desktops: BTreeMap<u8, Desktop> = BTreeMap::new();
     for (n, dsk) in &s.desktops {
         if let Ok(n) = n.parse::<u8>() {
             let workspaces: Vec<String> = dsk.workspaces.iter().filter(|w| cfg_ws.contains(w)).cloned().collect();
             let active = dsk.active.clone().filter(|a| workspaces.contains(a));
-            st.desktops.insert(n, Desktop { workspaces, active });
+            desktops.insert(n, Desktop { workspaces, active });
         }
     }
+    dedup_desktops(&mut desktops);
+    let st = d.state_mut();
+    st.desktops = desktops;
     st.cells.clear();
     st.extra.clear();
     for (w, sw) in &s.workspaces {
@@ -184,6 +186,33 @@ fn apply_lists(d: &mut Daemon, s: &Session) {
     }
     st.lazy.clear();
     d.rebuild_cfg();
+}
+
+/// Списки столов из снимка приводятся к правилу «workspace числится ровно
+/// на одном столе» (решение D16): снимки прежних версий накопили повторы,
+/// потому что перенос workspace на другой стол не убирал его из списка
+/// прежнего. Столом workspace становится тот, где он активен, а если он
+/// не активен нигде — первый по номеру стол, в списке которого он встретился.
+/// Порядок оставшихся workspace в списке не меняется; стол, потерявший свой
+/// активный workspace, остаётся без активного.
+fn dedup_desktops(desktops: &mut BTreeMap<u8, Desktop>) {
+    let mut owner: BTreeMap<String, u8> = BTreeMap::new();
+    for (n, d) in desktops.iter() {
+        if let Some(a) = &d.active {
+            owner.entry(a.clone()).or_insert(*n);
+        }
+    }
+    for (n, d) in desktops.iter() {
+        for w in &d.workspaces {
+            owner.entry(w.clone()).or_insert(*n);
+        }
+    }
+    for (n, d) in desktops.iter_mut() {
+        d.workspaces.retain(|w| owner.get(w) == Some(n));
+        if d.active.as_deref().is_some_and(|a| !d.workspaces.iter().any(|w| w == a)) {
+            d.active = None;
+        }
+    }
 }
 
 /// Живые окна без тега сопоставляются с посторонними окнами снимка по команде и каталогу.
@@ -342,5 +371,44 @@ mod tests {
         let picked = apps_to_start(&windows, &|app| app == "neovide");
         assert_eq!(picked.len(), 1);
         assert_eq!(picked[0].app.as_deref(), Some("chromium"));
+    }
+
+    fn desk(ws: &[&str], active: Option<&str>) -> Desktop {
+        Desktop { workspaces: ws.iter().map(|w| w.to_string()).collect(), active: active.map(String::from) }
+    }
+
+    #[test]
+    fn restored_lists_keep_workspace_on_one_desktop() {
+        // Снимок, накопленный прежним демоном: surf числится на четырёх
+        // столах, work — на трёх.
+        let mut d: BTreeMap<u8, Desktop> = BTreeMap::new();
+        d.insert(1, desk(&["work", "surf"], Some("work")));
+        d.insert(2, desk(&["surf", "work"], None));
+        d.insert(3, desk(&["work", "surf"], None));
+        d.insert(6, desk(&["surf"], Some("surf")));
+        dedup_desktops(&mut d);
+        // Каждый workspace остаётся на столе, где он активен: work на первом,
+        // surf на шестом, хотя в списке первого стола он стоял раньше.
+        assert_eq!(d[&1].workspaces, vec!["work".to_string()]);
+        assert_eq!(d[&1].active.as_deref(), Some("work"));
+        assert!(d[&2].workspaces.is_empty());
+        assert!(d[&3].workspaces.is_empty());
+        assert_eq!(d[&6].workspaces, vec!["surf".to_string()]);
+        assert_eq!(d[&6].active.as_deref(), Some("surf"));
+
+        // Workspace не активен нигде: он остаётся на первом по номеру столе,
+        // в списке которого встретился, а порядок списка не меняется.
+        let mut d: BTreeMap<u8, Desktop> = BTreeMap::new();
+        d.insert(1, desk(&["chat", "work"], Some("work")));
+        d.insert(2, desk(&["chat"], None));
+        // Снимок, где один workspace записан активным на двух столах: он
+        // достаётся первому по номеру, а второй остаётся без активного.
+        d.insert(3, desk(&["work"], Some("work")));
+        dedup_desktops(&mut d);
+        assert_eq!(d[&1].workspaces, vec!["chat".to_string(), "work".to_string()]);
+        assert_eq!(d[&1].active.as_deref(), Some("work"));
+        assert!(d[&2].workspaces.is_empty());
+        assert!(d[&3].workspaces.is_empty());
+        assert_eq!(d[&3].active, None);
     }
 }

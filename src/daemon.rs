@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use crate::config::{Config, Mode, Placement, PxRect, config_path};
 use crate::hypr::{self, Client, Event, Hypr};
 use crate::session;
-use crate::state::{Cycle, ExtraApp, Foreign, Place, State};
+use crate::state::{Cycle, Desktop, ExtraApp, Foreign, Place, State};
 
 /// Куда поставить окно после появления.
 #[derive(Debug, Clone)]
@@ -856,16 +856,7 @@ impl Daemon {
             ex.push(hypr::d_focus_window(a));
             ex.push(hypr::d_bring_to_top());
         }
-        for (k, d) in self.st.desktops.iter_mut() {
-            if *k != n && d.active.as_deref() == Some(ws) {
-                d.active = None;
-            }
-        }
-        let d = self.st.desktop(n);
-        if !d.workspaces.iter().any(|x| x == ws) {
-            d.workspaces.push(ws.to_string());
-        }
-        d.active = Some(ws.to_string());
+        assign_desktop(&mut self.st, ws, n);
         self.hypr.dispatch_all(&ex)?;
         self.broadcast();
         Ok(())
@@ -1210,11 +1201,9 @@ impl Daemon {
     /// Следующий workspace в списке текущего стола.
     pub fn next(&mut self) -> Result<()> {
         let d = self.st.desktop(self.current).clone();
-        if d.workspaces.is_empty() {
+        let Some(ws) = next_ws(&d) else {
             bail!("на столе {} нет workspace", self.current);
-        }
-        let idx = d.active.as_ref().and_then(|a| d.workspaces.iter().position(|w| w == a)).map(|i| (i + 1) % d.workspaces.len()).unwrap_or(0);
-        let ws = d.workspaces[idx].clone();
+        };
         self.raise(&ws, None)
     }
 
@@ -1742,6 +1731,41 @@ pub fn open_rect(st: &mut State, cfg: &Config, ws: Option<&str>, app: &str, mon:
         Some(w) => st.rect_for(cfg, w, app, mon),
         None => State::app_rect(cfg, app, mon),
     }
+}
+
+/// Стол `n` принимает workspace (спецификация ws-daemon, «Поднятие workspace
+/// на столе», решение D16). Workspace числится ровно на одном столе, поэтому
+/// из списков остальных столов он убирается; стол, где он был активным,
+/// остаётся без активного workspace. Ленивое поднятие, назначенное этому
+/// workspace на прежнем столе, тоже снимается: там его больше нет, и первый
+/// переход на тот стол не должен возвращать workspace туда.
+pub fn assign_desktop(st: &mut State, ws: &str, n: u8) {
+    for (k, d) in st.desktops.iter_mut() {
+        if *k == n {
+            continue;
+        }
+        d.workspaces.retain(|x| x != ws);
+        if d.active.as_deref() == Some(ws) {
+            d.active = None;
+        }
+    }
+    st.lazy.retain(|k, w| *k == n || w != ws);
+    let d = st.desktop(n);
+    if !d.workspaces.iter().any(|x| x == ws) {
+        d.workspaces.push(ws.to_string());
+    }
+    d.active = Some(ws.to_string());
+}
+
+/// Следующий workspace в списке стола (спецификация ws-daemon, сценарий
+/// «Следующий workspace на столе»): тот, что идёт за активным по кругу,
+/// а без активного — первый в списке. Список пуст — следующего нет.
+pub fn next_ws(d: &Desktop) -> Option<String> {
+    if d.workspaces.is_empty() {
+        return None;
+    }
+    let idx = d.active.as_ref().and_then(|a| d.workspaces.iter().position(|w| w == a)).map(|i| (i + 1) % d.workspaces.len()).unwrap_or(0);
+    Some(d.workspaces[idx].clone())
 }
 
 /// Что делает команда переноса workspace на стол.
@@ -2535,6 +2559,42 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
         // На текущем столе активного workspace нет: переносить нечего.
         assert_eq!(move_step(4, 5, None), MoveStep::Nothing);
         assert_eq!(move_step(3, 3, None), MoveStep::Nothing);
+    }
+
+    #[test]
+    fn assign_desktop_keeps_workspace_on_one_desktop() {
+        let mut st = State::default();
+        st.desktops.insert(1, Desktop { workspaces: vec!["work".into(), "surf".into()], active: Some("surf".into()) });
+        st.desktops.insert(2, Desktop { workspaces: vec!["chat".into()], active: Some("chat".into()) });
+        st.lazy.insert(3, "surf".into());
+        assign_desktop(&mut st, "surf", 2);
+        // На прежнем столе surf не числится и активным там никто не стал.
+        assert_eq!(st.desktops[&1].workspaces, vec!["work".to_string()]);
+        assert_eq!(st.desktops[&1].active, None);
+        // На новом столе surf встал в конец списка и стал активным.
+        assert_eq!(st.desktops[&2].workspaces, vec!["chat".to_string(), "surf".to_string()]);
+        assert_eq!(st.desktops[&2].active.as_deref(), Some("surf"));
+        // Ленивое поднятие, назначенное surf на столе 3, снято.
+        assert!(st.lazy.is_empty());
+
+        // Повторное поднятие на том же столе список не удлиняет.
+        assign_desktop(&mut st, "chat", 2);
+        assert_eq!(st.desktops[&2].workspaces, vec!["chat".to_string(), "surf".to_string()]);
+        assert_eq!(st.desktops[&2].active.as_deref(), Some("chat"));
+    }
+
+    #[test]
+    fn next_workspace_does_not_show_the_one_moved_away() {
+        let mut st = State::default();
+        st.desktops.insert(1, Desktop { workspaces: vec!["work".into(), "surf".into()], active: Some("work".into()) });
+        // Пока оба workspace на столе 1, за work идёт surf.
+        assert_eq!(next_ws(&st.desktops[&1]), Some("surf".to_string()));
+        // После переноса surf на стол 2 следующим на столе 1 остаётся work.
+        assign_desktop(&mut st, "surf", 2);
+        assert_eq!(next_ws(&st.desktops[&1]), Some("work".to_string()));
+        assert_eq!(next_ws(&st.desktops[&2]), Some("surf".to_string()));
+        // На столе без workspace следующего нет.
+        assert_eq!(next_ws(&Desktop::default()), None);
     }
 
     #[test]
