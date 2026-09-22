@@ -246,6 +246,7 @@ pub fn collect(cfg: &Config) -> Result<Vec<Binding>> {
                         "next-workspace" => "workspaced next".to_string(),
                         "maximize" => "workspaced maximize".to_string(),
                         "arrange" => "workspaced arrange".to_string(),
+                        "detach" => "workspaced detach".to_string(),
                         other => bail!("привязка {:?}: неизвестное действие {other:?}", b.chain),
                     },
                     Action::Half(HalfAction { half }) => format!("workspaced half {half}"),

@@ -333,7 +333,6 @@ impl Daemon {
                 log::warn!("стартовый workspace {}: {e:#}", st.workspace);
             }
         }
-        self.save_session_file();
         Ok(())
     }
 
@@ -467,9 +466,10 @@ impl Daemon {
         self.mon
     }
 
-    /// Записать снимок сессии `default`. Вызывается в конце обработки события
-    /// или команды, изменивших состояние, — до ответа клиенту, поэтому
-    /// к возврату команды файл уже обновлён.
+    /// Записать снимок сессии `default`. Вызывается только явной командой
+    /// сохранения — `save-session` и загрузкой именованной сессии, которая
+    /// страхует прежнее состояние (решение D6): события композитора и прочие
+    /// команды файл не трогают.
     pub fn save_session_file(&mut self) {
         if let Err(e) = session::save_default(self) {
             log::warn!("запись сессии default: {e:#}");
@@ -479,23 +479,20 @@ impl Daemon {
     // ---- События ----------------------------------------------------------------
 
     fn on_event(&mut self, ev: Event) -> Result<()> {
-        let changed = match ev {
-            Event::OpenWindow { addr, .. } => {
-                self.on_open(&addr)?;
-                true
-            }
+        // Снимок сессии по событию не пишется: файл `default.toml` меняет
+        // только команда сохранения сессии (решение D6).
+        match ev {
+            Event::OpenWindow { addr, .. } => self.on_open(&addr)?,
             Event::CloseWindow { addr } => {
                 self.st.foreign.remove(&addr);
                 self.forget_window(&addr);
                 self.broadcast();
-                true
             }
-            Event::MoveWindow { .. } => {
-                self.broadcast();
-                true
-            }
-            Event::Workspace { name } => match name.parse::<u8>() {
-                Ok(n) if (1..=8).contains(&n) => {
+            Event::MoveWindow { .. } => self.broadcast(),
+            Event::Workspace { name } => {
+                if let Ok(n) = name.parse::<u8>()
+                    && (1..=8).contains(&n)
+                {
                     self.current = n;
                     if let Some(ws) = self.st.lazy.remove(&n) {
                         log::info!("стол {n}: ленивое поднятие {ws}");
@@ -504,30 +501,22 @@ impl Daemon {
                         }
                     }
                     self.broadcast();
-                    true
                 }
-                _ => false,
-            },
+            }
             Event::ActiveWindow { .. } => {
                 // Последнее окно workspace, получавшее фокус: из него берётся
-                // prev, когда цикл начинается с чужого окна. Состояние окон
-                // при этом не меняется, поэтому снимок сессии не пишется.
+                // prev, когда цикл начинается с чужого окна.
                 if let Err(e) = self.on_focus() {
                     log::warn!("смена фокуса: {e:#}");
                 }
-                false
             }
-            Event::Other(_) => false,
-        };
-        // Снимок сессии пишет обработчик события, а не отложенная запись
-        // по таймеру: одна запись на событие, изменившее состояние.
-        if changed {
-            self.save_session_file();
+            Event::Other(_) => {}
         }
         Ok(())
     }
 
-    /// Новое окно: либо ожидаемое приложение, либо постороннее.
+    /// Новое окно: ожидаемое приложение, восстановленное окно из снимка
+    /// сессии либо окно, которое разбирает правило принятия в workspace.
     fn on_open(&mut self, addr: &str) -> Result<()> {
         let clients = self.hypr.clients()?;
         let Some(c) = clients.iter().find(|c| c.address == *addr).cloned() else { return Ok(()) };
@@ -568,15 +557,16 @@ impl Daemon {
                 }
                 self.st.foreign.insert(c.address.clone(), Foreign { rect: e.rect, cmd, cwd });
                 self.hypr.dispatch_all(&ex)?;
-            } else if let Some(app) = app_for_window(&self.cfg, &c) {
-                // Окно приложения конфига: захват сразу, не дожидаясь
-                // поднятия workspace или вызова приложения (design D16).
-                self.capture_new(&c, &app, &clients)?;
             } else {
-                // Постороннее окно остаётся свободным: частью workspace его
-                // делает только команда сохранения — сессии или конфига.
-                self.st.foreign.insert(c.address.clone(), Foreign { rect: c.rect(), cmd, cwd });
-                log::info!("постороннее окно {} ({}) свободно", c.address, c.class);
+                // Окно, появившееся на столе с активным workspace, входит
+                // в этот workspace (решение D1): приложение конфига
+                // захватывается, остальные окна становятся дополнительными
+                // приложениями сессии. На столе без активного workspace окно
+                // остаётся свободным.
+                let ws = c.desktop().and_then(|n| self.st.desktops.get(&n).and_then(|d| d.active.clone()));
+                let taken = taken_names(&self.cfg, &self.st.extra);
+                let join = join_window(&self.cfg, &self.cfg_file, ws.as_deref(), &c, !cmd.is_empty(), &taken);
+                self.join(&c, &clients, ws.as_deref(), join, cmd, cwd)?;
             }
         }
         self.broadcast();
@@ -632,16 +622,18 @@ impl Daemon {
     /// получает тег экземпляра и встаёт на место своего приложения в активном
     /// workspace стола, поверх уже открытых окон приложения. На другой стол
     /// демон его не переносит и фокус не трогает: фокус новому окну уже отдал
-/// композитор, а отбирать его у окна, которое пользователь только что открыл,
-/// незачем.
-    fn capture_new(&mut self, c: &Client, app: &str, clients: &[Client]) -> Result<()> {
+    /// композитор, а отбирать его у окна, которое пользователь только что
+    /// открыл, незачем.
+    fn capture_new(&mut self, c: &Client, app: &str, clients: &[Client], place: Option<PxRect>) -> Result<()> {
         let cfg = self.cfg.clone();
         let num = free_instance(clients, app);
         let mut ex = vec![hypr::d_tag(&c.address, &format!("app:{app}#{num}"))];
         // Место ищется только для окна на обычном столе: окно, открытое сразу
         // на `special:pool` или `special:hidden`, остаётся там, где открылось.
+        // Готовое место приходит от принятия окна в workspace: там оно уже
+        // посчитано и записано дополнительным приложением сессии.
         let ws = c.desktop().and_then(|n| self.st.desktops.get(&n).and_then(|d| d.active.clone()));
-        let rect = c.desktop().and_then(|_| open_rect(&mut self.st, &cfg, ws.as_deref(), app, self.mon));
+        let rect = place.or_else(|| c.desktop().and_then(|_| open_rect(&mut self.st, &cfg, ws.as_deref(), app, self.mon)));
         if let Some(r) = rect {
             ex.extend(hypr::d_place(&c.address, r));
         }
@@ -652,6 +644,81 @@ impl Daemon {
         }
         log::info!("новое окно {} ({}, «{}») → приложение {app}, экземпляр {num}", c.address, c.class, c.title);
         self.hypr.dispatch_all(&ex)
+    }
+
+    /// Выполнить решение о принятии окна (решения D1 и D2).
+    fn join(&mut self, c: &Client, clients: &[Client], ws: Option<&str>, join: Join, cmd: Vec<String>, cwd: Option<String>) -> Result<()> {
+        match join {
+            Join::App(app) => {
+                self.st.foreign.remove(&c.address);
+                self.capture_new(c, &app, clients, None)
+            }
+            Join::AppPlace(app) => {
+                let w = ws.unwrap_or_default().to_string();
+                let cfg = self.cfg.clone();
+                let rect = open_rect(&mut self.st, &cfg, Some(&w), &app, self.mon).unwrap_or_else(|| center_rect(c, self.mon));
+                self.remember_extra(&w, &app, ExtraApp { rect, ..ExtraApp::default() });
+                self.st.foreign.remove(&c.address);
+                log::info!("окно {} ({}) принято в workspace {w} приложением конфига {app}", c.address, c.class);
+                self.capture_new(c, &app, clients, Some(rect))
+            }
+            Join::Extra(name) => {
+                let w = ws.unwrap_or_default().to_string();
+                let rect = center_rect(c, self.mon);
+                self.remember_extra(&w, &name, ExtraApp { class: Some(c.class.clone()), cmd, cwd, rect });
+                self.st.foreign.remove(&c.address);
+                log::info!("окно {} ({}) принято в workspace {w} дополнительным приложением сессии {name}", c.address, c.class);
+                self.capture_new(c, &name, clients, Some(rect))
+            }
+            Join::Free(reason) => {
+                self.st.foreign.insert(c.address.clone(), Foreign { rect: c.rect(), cmd, cwd });
+                log::info!("окно {} ({}, «{}») свободно: {}", c.address, c.class, c.title, reason.text());
+                Ok(())
+            }
+        }
+    }
+
+    /// Записать дополнительное приложение сессии и пересобрать эффективный
+    /// конфиг: после этого приложение живёт наравне с приложениями файла.
+    fn remember_extra(&mut self, ws: &str, name: &str, e: ExtraApp) {
+        self.st.extra.entry(ws.to_string()).or_default().insert(name.to_string(), e);
+        self.rebuild_cfg();
+    }
+
+    /// Убрать активное окно из активного workspace текущего стола
+    /// (спецификация ws-daemon, «Отделение окна»). Общих окон на этом шаге
+    /// нет, поэтому отделённое окно закрывается диспетчером композитора.
+    pub fn detach(&mut self) -> Result<()> {
+        let n = self.sync_current();
+        let clients = self.hypr.clients()?;
+        let active = self.hypr.active_window()?.filter(|c| c.desktop() == Some(n));
+        let ws = self.st.desktops.get(&n).and_then(|d| d.active.clone());
+        let extra = ws.as_deref().and_then(|w| self.st.extra.get(w)).cloned().unwrap_or_default();
+        match detach_step(&self.cfg, &clients, ws.as_deref(), &extra, active.as_ref()) {
+            DetachStep::Skip(why) => {
+                log::info!("отделение окна: {why}");
+                Ok(())
+            }
+            DetachStep::Close { app, drop_extra } => {
+                let addr = active.map(|c| c.address).unwrap_or_default();
+                let w = ws.unwrap_or_default();
+                if drop_extra {
+                    if let Some(apps) = self.st.extra.get_mut(&w) {
+                        apps.remove(&app);
+                    }
+                    self.st.extra.retain(|_, apps| !apps.is_empty());
+                    if let Some(cells) = self.st.cells.get_mut(&w) {
+                        cells.remove(&app);
+                    }
+                    self.rebuild_cfg();
+                    log::info!("workspace {w}: дополнительное приложение сессии {app} снято вместе с последним его окном");
+                }
+                log::info!("workspace {w}: окно {addr} приложения {app} отделено и закрыто");
+                self.hypr.dispatch(&hypr::d_close(&addr))?;
+                self.broadcast();
+                Ok(())
+            }
+        }
     }
 
     /// Свободное окно, подходящее ожиданию запуска номер `i`.
@@ -681,7 +748,6 @@ impl Daemon {
                 log::info!("{}: процесс завершился без окна, принято окно {} ({})", p.app, c.address, c.class);
                 self.st.foreign.remove(&c.address);
                 self.adopt(&c, p)?;
-                self.save_session_file();
                 self.broadcast();
             }
             _ => {
@@ -1378,7 +1444,6 @@ impl Daemon {
         let cmd = req.get("cmd").and_then(|c| c.as_str()).unwrap_or("");
         let s = |k: &str| req.get(k).and_then(|v| v.as_str()).map(String::from);
         let desktop = req.get("desktop").and_then(|v| v.as_u64()).map(|v| v as u8);
-        let changes = changes_state(cmd, s("op").as_deref());
         let r = match cmd {
             "raise" => match s("workspace") {
                 Some(ws) => self.raise(&ws, desktop).map(|_| json!({"ok": true})),
@@ -1399,6 +1464,7 @@ impl Daemon {
                 None => Err(anyhow::anyhow!("нет desktop")),
             },
             "arrange" => self.arrange().map(|_| json!({"ok": true})),
+            "detach" => self.detach().map(|_| json!({"ok": true})),
             "half" => match s("side") {
                 Some(side) => self.half(&side).map(|_| json!({"ok": true})),
                 None => Err(anyhow::anyhow!("нет side")),
@@ -1412,7 +1478,7 @@ impl Daemon {
                 Some(ws) => self.remove(&ws, desktop).map(|_| json!({"ok": true})),
                 None => Err(anyhow::anyhow!("нет workspace")),
             },
-            "save-session" => crate::save::save_session(self).map(|(ws, n)| json!({"ok": true, "workspace": ws, "adopted": n})),
+            "save-session" => crate::save::save_session(self).map(|(ws, windows, adopted)| json!({"ok": true, "workspaces": ws, "windows": windows, "adopted": adopted})),
             "save-workspace" => crate::save::save_workspace(self).map(|ws| json!({"ok": true, "workspace": ws})),
             "sessions" => session::list(self).map(|list| {
                 let ev = json!({"event": "show-sessions", "sessions": list});
@@ -1433,14 +1499,7 @@ impl Daemon {
             other => Err(anyhow::anyhow!("неизвестная команда {other:?}")),
         };
         match r {
-            Ok(v) => {
-                // Снимок сессии пишется здесь, до ответа клиенту: к возврату
-                // команды файл уже обновлён.
-                if changes {
-                    self.save_session_file();
-                }
-                v
-            }
+            Ok(v) => v,
             Err(e) => {
                 log::warn!("{cmd}: {e:#}");
                 err_json(format!("{e:#}"))
@@ -1686,17 +1745,6 @@ pub fn pending_step(exited: bool, window: bool, key: bool) -> PendingStep {
     }
 }
 
-/// Меняет ли команда состояние демона. После такой команды снимок сессии
-/// `default` записывается до ответа клиенту; команды только для чтения
-/// (`status`, `sessions`, `session list`) файла не трогают.
-pub fn changes_state(cmd: &str, op: Option<&str>) -> bool {
-    match cmd {
-        "raise" | "app" | "next" | "move-desktop" | "arrange" | "half" | "maximize" | "place" | "remove" | "save-session" | "save-workspace" => true,
-        "session" => op == Some("load"),
-        _ => false,
-    }
-}
-
 /// Назначения ячеек, переживающие перечитывание конфига: остаются только
 /// workspace, чей раздел в файле не менялся (спецификация ws-config, «Слежение
 /// за конфигом»). Назначения остальных собираются заново при следующем
@@ -1731,6 +1779,137 @@ pub fn open_rect(st: &mut State, cfg: &Config, ws: Option<&str>, app: &str, mon:
         Some(w) => st.rect_for(cfg, w, app, mon),
         None => State::app_rect(cfg, app, mon),
     }
+}
+
+/// Почему окно осталось свободным.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Free {
+    /// Класс окна перечислен в `ignore_classes`.
+    Ignored,
+    /// Заголовок окна подходит `dialog_title` названного приложения.
+    Dialog(String),
+    /// На столе окна нет активного workspace.
+    NoWorkspace,
+    /// Командной строки процесса получить не удалось: запускать окно заново
+    /// было бы нечем, и записывать его в состав workspace незачем.
+    NoCommand,
+}
+
+impl Free {
+    /// Причина для журнала.
+    pub fn text(&self) -> String {
+        match self {
+            Free::Ignored => "класс окна в списке ignore_classes".to_string(),
+            Free::Dialog(app) => format!("заголовок подходит dialog_title приложения {app}"),
+            Free::NoWorkspace => "на столе нет активного workspace".to_string(),
+            Free::NoCommand => "у окна нет командной строки".to_string(),
+        }
+    }
+}
+
+/// Что делать с окном без тега, появившимся в системе (решения D1 и D2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Join {
+    /// Окно приложения эффективного конфига, которое уже входит в workspace
+    /// стола (или стол без активного workspace): только тег и место.
+    App(String),
+    /// Окно приложения конфига, которого в активном workspace нет: кроме тега
+    /// и места, приложение записывается дополнительным приложением сессии.
+    AppPlace(String),
+    /// Новое дополнительное приложение сессии с этим именем.
+    Extra(String),
+    /// Окно остаётся свободным.
+    Free(Free),
+}
+
+/// Имена, которые не может занять новое дополнительное приложение сессии:
+/// приложения эффективного конфига и дополнительные приложения всех workspace.
+pub fn taken_names(cfg: &Config, extra: &BTreeMap<String, BTreeMap<String, ExtraApp>>) -> Vec<String> {
+    let mut v: Vec<String> = cfg.apps.keys().cloned().collect();
+    v.extend(extra.values().flat_map(|m| m.keys().cloned()));
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// Имя дополнительного приложения по классу окна, не совпадающее ни с одним
+/// из занятых.
+pub fn app_name(class: &str, taken: &[String]) -> String {
+    let base: String = class.to_ascii_lowercase().chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' }).collect::<String>().trim_matches('-').to_string();
+    let base = if base.is_empty() { "app".to_string() } else { base };
+    if !taken.contains(&base) {
+        return base;
+    }
+    (2..).map(|i| format!("{base}-{i}")).find(|n| !taken.contains(n)).unwrap()
+}
+
+/// Входит ли приложение в workspace: само или как вариант своего семейства.
+fn ws_has_app(cfg: &Config, ws: &str, app: &str) -> bool {
+    cfg.workspaces.get(ws).is_some_and(|w| w.apps.keys().any(|x| cfg.app_is(app, x)))
+}
+
+/// Решение о принятии окна без тега (спецификация ws-daemon, «Принятие окон
+/// в workspace»). `cfg` — эффективный конфиг, `file` — конфиг файла (по нему
+/// видно, известно ли приложение помимо записей сессии), `ws` — workspace,
+/// активный на столе окна, `has_cmd` — есть ли у процесса окна командная
+/// строка, `taken` — занятые имена приложений.
+///
+/// Порядок правил: класс из `ignore_classes` не принимается никогда; окно,
+/// подходящее приложению конфига, — окно этого приложения, а его диалог
+/// (`dialog_title`) остаётся свободным; на столе без активного workspace
+/// принимать некуда.
+pub fn join_window(cfg: &Config, file: &Config, ws: Option<&str>, c: &Client, has_cmd: bool, taken: &[String]) -> Join {
+    if cfg.ignored_class(&c.class) {
+        return Join::Free(Free::Ignored);
+    }
+    if let Some(app) = app_for_window(cfg, c) {
+        if cfg.apps.get(&app).is_some_and(|a| a.is_dialog(&c.title)) {
+            return Join::Free(Free::Dialog(app));
+        }
+        let Some(w) = ws else { return Join::App(app) };
+        if ws_has_app(cfg, w, &app) {
+            return Join::App(app);
+        }
+        if file.apps.contains_key(&app) {
+            return Join::AppPlace(app);
+        }
+        // Приложение известно только сессии другого workspace: запись о месте
+        // без команды запуска там не выживет, поэтому заводится полная запись.
+        return if has_cmd { Join::Extra(app) } else { Join::Free(Free::NoCommand) };
+    }
+    if ws.is_none() {
+        return Join::Free(Free::NoWorkspace);
+    }
+    if !has_cmd {
+        return Join::Free(Free::NoCommand);
+    }
+    Join::Extra(app_name(&c.class, taken))
+}
+
+/// Что делает команда отделения окна.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DetachStep {
+    /// Закрыть окно; `drop_extra` — снять заодно запись дополнительного
+    /// приложения сессии, потому что закрывается последнее его окно.
+    Close { app: String, drop_extra: bool },
+    /// Ничего не делать, причина для журнала.
+    Skip(&'static str),
+}
+
+/// Решение команды `workspaced detach` (спецификация ws-daemon, «Отделение
+/// окна»): активное окно текущего стола убирается из активного workspace
+/// этого стола. Общих окон на этом шаге нет, поэтому окно, вышедшее
+/// из workspace, не входит ни в один другой и закрывается.
+pub fn detach_step(cfg: &Config, clients: &[Client], ws: Option<&str>, extra: &BTreeMap<String, ExtraApp>, active: Option<&Client>) -> DetachStep {
+    let Some(c) = active else { return DetachStep::Skip("на текущем столе нет активного окна") };
+    let Some(w) = ws else { return DetachStep::Skip("на столе нет активного workspace") };
+    let ws_apps: Vec<String> = cfg.workspaces.get(w).map(|x| x.apps.keys().cloned().collect()).unwrap_or_default();
+    if ws_app_of(cfg, &ws_apps, c).is_none() {
+        return DetachStep::Skip("активное окно не входит в активный workspace стола");
+    }
+    let Some(app) = c.app() else { return DetachStep::Skip("у активного окна нет приложения") };
+    let others = app_windows(cfg, clients, &app).iter().filter(|x| x.address != c.address && x.app().as_deref() == Some(app.as_str())).count();
+    DetachStep::Close { drop_extra: extra.contains_key(&app) && others == 0, app }
 }
 
 /// Стол `n` принимает workspace (спецификация ws-daemon, «Поднятие workspace
@@ -1892,7 +2071,7 @@ fn adopt_plan(cfg: &Config, clients: &[Client], apps: &[String]) -> Result<Vec<(
     let mut plan = Vec::new();
     for i in order {
         let c = &clients[i];
-        if c.on_hidden() || c.app().is_some_and(|a| cfg.apps.contains_key(&a)) {
+        if c.on_hidden() || c.app().is_some_and(|a| cfg.apps.contains_key(&a)) || cfg.ignored_class(&c.class) {
             continue;
         }
         let fitting: Vec<&String> = matchers.iter().filter(|(_, cr, tr)| matcher_fits(Some(cr), tr.as_ref(), c)).map(|(n, _, _)| n).collect();
@@ -2122,6 +2301,121 @@ template = "thirds"
 main = "herdr"
 apps = { herdr = "center", chromium = "left", neovide = "right" }
 "#;
+
+    /// Тот же конфиг с диалогами и списком исключённых классов, а также
+    /// с дополнительным приложением сессии `alacritty` в workspace `work`.
+    fn cfg_with_dialogs() -> Config {
+        let text = format!("ignore_classes = [\"zenity\", \"pinentry.*\"]\n{CFG}").replace(
+            "[apps.chromium]\ncmd = \"chromium\"\n",
+            "[apps.chromium]\ncmd = \"chromium\"\ndialog_title = \"^(Диспетчер задач|Task Manager)$\"\n",
+        );
+        Config::parse(&text).unwrap()
+    }
+
+    #[test]
+    fn join_takes_new_window_into_the_active_workspace() {
+        let cfg = Config::parse(CFG).unwrap();
+        let taken: Vec<String> = cfg.apps.keys().cloned().collect();
+        let join = |ws, c: &Client, has_cmd| join_window(&cfg, &cfg, ws, c, has_cmd, &taken);
+
+        // Окно приложения, уже входящего в workspace: только тег и место.
+        let chromium = client("0x1", "chromium", "Новости", "1", &[]);
+        assert_eq!(join(Some("work"), &chromium, true), Join::App("chromium".into()));
+
+        // Приложение конфига, которого в workspace нет: к тегу добавляется
+        // запись дополнительного приложения сессии — только о месте.
+        let calc = client("0x2", "qalculate-gtk", "Калькулятор", "1", &[]);
+        assert_eq!(join(Some("work"), &calc, true), Join::AppPlace("calc".into()));
+
+        // Приложения в конфиге нет: новое дополнительное приложение по классу.
+        let term = client("0x3", "Alacritty", "mne@dev-lab", "1", &[]);
+        assert_eq!(join(Some("work"), &term, true), Join::Extra("alacritty".into()));
+
+        // На столе без активного workspace окно остаётся свободным, а окно
+        // приложения конфига всё равно захватывается (шаг 2).
+        assert_eq!(join(None, &term, true), Join::Free(Free::NoWorkspace));
+        assert_eq!(join(None, &chromium, true), Join::App("chromium".into()));
+
+        // Окно без командной строки принимать некуда: восстановить его нечем.
+        assert_eq!(join(Some("work"), &term, false), Join::Free(Free::NoCommand));
+    }
+
+    #[test]
+    fn dialogs_and_ignored_classes_stay_free() {
+        let cfg = cfg_with_dialogs();
+        let taken: Vec<String> = cfg.apps.keys().cloned().collect();
+        let join = |c: &Client| join_window(&cfg, &cfg, Some("work"), c, true, &taken);
+
+        // Диалог приложения приходит с классом самого приложения и отличается
+        // только заголовком.
+        let dialog = client("0x1", "chromium", "Диспетчер задач", "1", &[]);
+        assert_eq!(join(&dialog), Join::Free(Free::Dialog("chromium".into())));
+        let page = client("0x2", "chromium", "Новости", "1", &[]);
+        assert_eq!(join(&page), Join::App("chromium".into()));
+
+        // Диалог с отдельным классом снимается списком ignore_classes.
+        let ask = client("0x3", "zenity", "Пароль", "1", &[]);
+        assert_eq!(join(&ask), Join::Free(Free::Ignored));
+        let pin = client("0x4", "pinentry-gtk", "Пароль", "1", &[]);
+        assert_eq!(join(&pin), Join::Free(Free::Ignored));
+    }
+
+    #[test]
+    fn extra_app_names_do_not_repeat() {
+        let cfg = Config::parse(CFG).unwrap();
+        let mut extra: BTreeMap<String, BTreeMap<String, ExtraApp>> = BTreeMap::new();
+        extra.entry("work".into()).or_default().insert("alacritty".into(), ExtraApp::default());
+        let taken = taken_names(&cfg, &extra);
+        assert!(taken.contains(&"chromium".to_string()) && taken.contains(&"alacritty".to_string()));
+        // Имя строится из класса; занятое дополняется номером.
+        assert_eq!(app_name("Alacritty", &taken), "alacritty-2");
+        assert_eq!(app_name("org.telegram.desktop", &taken), "org-telegram-desktop");
+        assert_eq!(app_name("!!!", &taken), "app");
+    }
+
+    #[test]
+    fn detach_closes_window_of_the_active_workspace() {
+        let cfg = Config::parse(CFG).unwrap();
+        let clients = vec![
+            client("0x1", "wezterm-herdr", "herdr · dev-lab", "1", &["app:herdr#1"]),
+            client("0x2", "chromium", "Новости", "1", &["app:chromium#1"]),
+            client("0x3", "Alacritty", "mne@dev-lab", "1", &["app:alacritty#1"]),
+            client("0x4", "firefox", "Видео", "1", &[]),
+        ];
+        let extra: BTreeMap<String, ExtraApp> = BTreeMap::new();
+        let step = |active: Option<&Client>, extra: &BTreeMap<String, ExtraApp>| detach_step(&cfg, &clients, Some("work"), extra, active);
+
+        // Окно приложения workspace закрывается: общих окон на этом шаге нет.
+        assert_eq!(step(Some(&clients[1]), &extra), DetachStep::Close { app: "chromium".into(), drop_extra: false });
+        // Свободное окно ни в какой workspace не входит, трогать его незачем.
+        assert!(matches!(step(Some(&clients[3]), &extra), DetachStep::Skip(_)));
+        // Без активного окна и без активного workspace команда ничего не делает.
+        assert!(matches!(step(None, &extra), DetachStep::Skip(_)));
+        assert!(matches!(detach_step(&cfg, &clients, None, &extra, Some(&clients[1])), DetachStep::Skip(_)));
+
+        // Окно приложения, которого в workspace нет, командой не задевается.
+        let alien = client("0x5", "neovide", "[Scratch]", "1", &["app:neovide#1"]);
+        let others = vec![alien.clone()];
+        assert!(matches!(detach_step(&cfg, &others, Some("surf"), &extra, Some(&alien)), DetachStep::Skip(_)));
+    }
+
+    #[test]
+    fn detach_drops_the_last_window_of_a_session_app() {
+        // Дополнительное приложение сессии `alacritty` живёт в `work`.
+        let text = CFG.replace("apps = { herdr = \"center\", chromium = \"left\", neovide = \"right\" }", "apps = { herdr = \"center\", chromium = \"left\", neovide = \"right\", alacritty = { rect = { x = 0, y = 0, w = 10, h = 10 } } }")
+            .replace("[apps.neovide]", "[apps.alacritty]\ncmd = \"alacritty\"\nclass = \"^Alacritty$\"\n\n[apps.neovide]");
+        let cfg = Config::parse(&text).unwrap();
+        let mut extra: BTreeMap<String, ExtraApp> = BTreeMap::new();
+        extra.insert("alacritty".into(), ExtraApp { class: Some("Alacritty".into()), cmd: vec!["alacritty".into()], cwd: None, rect: PxRect::default() });
+
+        // Последнее окно: запись дополнительного приложения снимается вместе с ним.
+        let one = vec![client("0x1", "Alacritty", "mne@dev-lab", "1", &["app:alacritty#1"])];
+        assert_eq!(detach_step(&cfg, &one, Some("work"), &extra, Some(&one[0])), DetachStep::Close { app: "alacritty".into(), drop_extra: true });
+
+        // Второе окно того же приложения оставляет запись на месте.
+        let two = vec![one[0].clone(), client("0x2", "Alacritty", "htop", "1", &["app:alacritty#2"])];
+        assert_eq!(detach_step(&cfg, &two, Some("work"), &extra, Some(&two[0])), DetachStep::Close { app: "alacritty".into(), drop_extra: false });
+    }
 
     #[test]
     fn matcher_fits_by_class_and_title() {
@@ -2437,17 +2731,6 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
         assert!(!write_finished(&EventKind::Modify(ModifyKind::Data(DataChange::Any))));
         assert!(!write_finished(&EventKind::Create(CreateKind::File)));
         assert!(!write_finished(&EventKind::Access(AccessKind::Close(AccessMode::Read))));
-    }
-
-    #[test]
-    fn only_state_changing_commands_write_the_snapshot() {
-        for cmd in ["raise", "app", "next", "move-desktop", "arrange", "half", "maximize", "place", "remove", "save-session", "save-workspace"] {
-            assert!(changes_state(cmd, None), "{cmd}");
-        }
-        assert!(changes_state("session", Some("load")));
-        for (cmd, op) in [("status", None), ("sessions", None), ("session", Some("list")), ("session", Some("save"))] {
-            assert!(!changes_state(cmd, op), "{cmd}");
-        }
     }
 
     /// Окна `work`: herdr, chromium, neovide и одно свободное.

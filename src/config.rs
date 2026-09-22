@@ -143,6 +143,13 @@ pub struct App {
     /// ничего не говорит.
     #[serde(default)]
     pub rect: Option<Rect>,
+    /// Заголовок диалога: окно приложения, чей заголовок подходит этому
+    /// выражению, в workspace не принимается и остаётся свободным там, где
+    /// его поставил композитор. Нужно потому, что собственный диалог
+    /// приложения приходит с тем же классом, а родителя и модальности
+    /// композитор не сообщает.
+    #[serde(default)]
+    pub dialog_title: Option<String>,
 }
 
 impl App {
@@ -154,6 +161,20 @@ impl App {
         let class_re = regex::Regex::new(&format!("^(?:{class})$")).with_context(|| format!("поле class {class:?}"))?;
         let title_re = self.title.as_deref().map(|t| regex::Regex::new(t).with_context(|| format!("поле title {t:?}"))).transpose()?;
         Ok(Some((class_re, title_re)))
+    }
+
+    /// Скомпилированное выражение заголовка диалога, если оно задано.
+    pub fn dialog_matcher(&self) -> Result<Option<regex::Regex>> {
+        self.dialog_title
+            .as_deref()
+            .map(|t| regex::Regex::new(t).with_context(|| format!("поле dialog_title {t:?}")))
+            .transpose()
+    }
+
+    /// Окно приложения — его диалог: заголовок подходит `dialog_title`.
+    /// Приложение без `dialog_title` диалогов не различает.
+    pub fn is_dialog(&self, title: &str) -> bool {
+        matches!(self.dialog_matcher(), Ok(Some(re)) if re.is_match(title))
     }
 }
 
@@ -387,6 +408,11 @@ pub struct Config {
     pub templates: BTreeMap<String, Template>,
     #[serde(default)]
     pub apps: BTreeMap<String, App>,
+    /// Классы окон, которые никогда не принимаются в workspace: выражения
+    /// сопоставляются с классом целиком. Сюда записываются диалоги, приходящие
+    /// отдельным классом (порталы выбора файла, запрос пароля).
+    #[serde(default)]
+    pub ignore_classes: Vec<String>,
     #[serde(default)]
     pub workspaces: BTreeMap<String, Workspace>,
     #[serde(default)]
@@ -441,7 +467,11 @@ impl Config {
             if a.title.is_some() && a.class.is_none() {
                 bail!("приложение {aname}: поле title без class не имеет смысла");
             }
+            if a.dialog_title.is_some() && a.class.is_none() {
+                bail!("приложение {aname}: поле dialog_title без class не имеет смысла: окно приложения узнаётся по class");
+            }
             a.matchers().with_context(|| format!("приложение {aname}"))?;
+            a.dialog_matcher().with_context(|| format!("приложение {aname}"))?;
             // Уровней ровно два: семейство и его варианты.
             if let Some(f) = &a.family {
                 if f == aname {
@@ -454,6 +484,9 @@ impl Config {
                     bail!("приложение {aname}: семейство {f:?} само вариант семейства {:?}, а уровней ровно два", parent.family.as_deref().unwrap_or(""));
                 }
             }
+        }
+        for c in &self.ignore_classes {
+            regex::Regex::new(&format!("^(?:{c})$")).with_context(|| format!("ignore_classes: выражение {c:?}"))?;
         }
         if let Some(st) = &self.startup {
             if !self.workspaces.contains_key(&st.workspace) {
@@ -511,7 +544,7 @@ impl Config {
                 bail!("привязка {:?}: пустой список dispatch", b.chain);
             }
             match &b.action {
-                Some(Action::Named(n)) if !matches!(n.as_str(), "sessions" | "save-session" | "save-workspace" | "next-workspace" | "maximize" | "arrange") => {
+                Some(Action::Named(n)) if !matches!(n.as_str(), "sessions" | "save-session" | "save-workspace" | "next-workspace" | "maximize" | "arrange" | "detach") => {
                     bail!("привязка {:?}: неизвестное действие {n:?}", b.chain)
                 }
                 Some(Action::Half(HalfAction { half })) if !matches!(half.as_str(), "left" | "right" | "up" | "down") => {
@@ -578,6 +611,20 @@ impl Config {
     /// его семейство (окно варианта — окно своего семейства).
     pub fn app_is(&self, name: &str, target: &str) -> bool {
         name == target || self.family_of(name) == Some(target)
+    }
+
+    /// Класс окна попадает в список `ignore_classes`: такое окно ни при каких
+    /// условиях не принимается в workspace. Выражение с ошибкой пропускается
+    /// с предупреждением: конфиг проверен при чтении, но эффективный конфиг
+    /// собирается и из записей сессии.
+    pub fn ignored_class(&self, class: &str) -> bool {
+        self.ignore_classes.iter().any(|c| match regex::Regex::new(&format!("^(?:{c})$")) {
+            Ok(re) => re.is_match(class),
+            Err(e) => {
+                log::warn!("ignore_classes: выражение {c:?} не разобрано: {e}");
+                false
+            }
+        })
     }
 
     /// Варианты семейства по именам.
@@ -770,6 +817,44 @@ apps = { terminal = "right" }
             let err = Config::parse(&text).unwrap_err().to_string();
             assert!(err.contains(bad), "{err}");
         }
+    }
+
+    #[test]
+    fn dialog_title_and_ignore_classes() {
+        // Диалог приложения отличается заголовком: класс у него тот же.
+        let text = format!(
+            "ignore_classes = [\"termfilechooser\", \"pinentry.*\"]\n{MINIMAL}\n[apps.chrome]\ncmd = \"google-chrome\"\nclass = \"(?i)^google-chrome$\"\ndialog_title = \"^(Диспетчер задач|Task Manager)$\"\n"
+        );
+        let cfg = Config::parse(&text).unwrap();
+        let chrome = &cfg.apps["chrome"];
+        assert!(chrome.is_dialog("Диспетчер задач") && chrome.is_dialog("Task Manager"));
+        assert!(!chrome.is_dialog("Новая вкладка - Google Chrome"));
+        // Приложение без dialog_title диалогов не различает.
+        assert!(!cfg.apps["terminal"].is_dialog("Диспетчер задач"));
+        // Класс из списка исключений сопоставляется целиком.
+        assert!(cfg.ignored_class("termfilechooser") && cfg.ignored_class("pinentry-gtk"));
+        assert!(!cfg.ignored_class("termfilechooser-2") && !cfg.ignored_class("chromium"));
+
+        // dialog_title без class не имеет смысла: окно приложения узнаётся по class.
+        let no_class = format!("{MINIMAL}\n[apps.a]\ncmd = \"a\"\ndialog_title = \"x\"\n");
+        let err = Config::parse(&no_class).unwrap_err().to_string();
+        assert!(err.contains("приложение a") && err.contains("dialog_title"), "{err}");
+        // Ошибка в выражении называет поле.
+        let bad = text.replace("dialog_title = \"^(Диспетчер задач|Task Manager)$\"", "dialog_title = \"(\"");
+        assert!(format!("{:#}", Config::parse(&bad).unwrap_err()).contains("dialog_title"));
+        let bad = text.replace("\"pinentry.*\"", "\"(\"");
+        assert!(format!("{:#}", Config::parse(&bad).unwrap_err()).contains("ignore_classes"));
+    }
+
+    #[test]
+    fn detach_action_in_binds() {
+        // Отделение окна от workspace — действие демона строкой.
+        let ok = format!("{MINIMAL}\n[[binds]]\nchain = \"SUPER+BackSpace\"\naction = \"detach\"\n");
+        let cfg = Config::parse(&ok).unwrap();
+        assert_eq!(cfg.binds[0].action, Some(Action::Named("detach".into())));
+        let bad = ok.replace("\"detach\"", "\"detahc\"");
+        let err = Config::parse(&bad).unwrap_err().to_string();
+        assert!(err.contains("BackSpace") && err.contains("detahc"), "{err}");
     }
 
     #[test]

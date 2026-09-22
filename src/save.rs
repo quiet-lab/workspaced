@@ -1,8 +1,10 @@
-//! Две команды сохранения. «Сохранить сессию» (`save-session`) принимает
-//! посторонние окна текущего стола в активный workspace как дополнительные
-//! приложения сессии и файла конфига не трогает. «Сохранить workspace»
-//! (`save-workspace`) записывает состояние активного workspace в `config.toml`
-//! через toml_edit с сохранением комментариев.
+//! Две команды сохранения. «Сохранить сессию» (`save-session`) записывает
+//! снимок сессии: проходит по всем столам с активным workspace, принимает
+//! в них ещё не учтённые окна, обновляет места дополнительных приложений
+//! по нынешнему положению окон и пишет `default.toml`; файла конфига команда
+//! не трогает. «Сохранить workspace» (`save-workspace`) записывает состояние
+//! активного workspace в `config.toml` через toml_edit с сохранением
+//! комментариев.
 
 use std::collections::BTreeMap;
 
@@ -41,16 +43,6 @@ fn app_item(place: &Place, live: Option<PxRect>, expected: Option<PxRect>) -> It
     }
 }
 
-/// Имя для постороннего окна по классу, уникальное среди приложений.
-fn app_name(class: &str, taken: &[String]) -> String {
-    let base: String = class.to_ascii_lowercase().chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' }).collect::<String>().trim_matches('-').to_string();
-    let base = if base.is_empty() { "app".to_string() } else { base };
-    if !taken.contains(&base) {
-        return base;
-    }
-    (2..).map(|i| format!("{base}-{i}")).find(|n| !taken.contains(n)).unwrap()
-}
-
 /// Описание приложения для раздела `[apps]`: команда, аргументы, каталог
 /// и класс окна как точное совпадение.
 fn app_table(cmd: &[String], cwd: Option<&str>, class: Option<&str>) -> Table {
@@ -83,7 +75,7 @@ fn next_instance(used: &mut Vec<(String, u32)>, app: &str) -> u32 {
 
 // ---- Сохранение сессии ------------------------------------------------------
 
-/// Что сделать с посторонним окном при сохранении сессии.
+/// Что сделать с окном при сохранении сессии.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Adopted {
     pub addr: String,
@@ -93,48 +85,48 @@ pub struct Adopted {
     pub extra: Option<ExtraApp>,
 }
 
-/// План принятия посторонних окон в workspace: окно, подходящее приложению
-/// конфига, получает его имя (и запись только о месте, если в workspace этого
-/// приложения ещё нет); прочие окна становятся новыми дополнительными
-/// приложениями с именем по классу. Окно без командной строки пропускается:
-/// восстановить его было бы нечем.
-fn session_plan(cfg: &Config, ws_apps: &[String], windows: &[(&Client, Option<&Foreign>)]) -> Vec<Adopted> {
-    let mut taken: Vec<String> = cfg.apps.keys().cloned().collect();
+/// План принятия окон в workspace: решение по каждому окну принимает
+/// `join_window` — те же правила, что у окна, появившегося по ходу работы.
+/// Место записывается нынешнее: окно, уже поставленное пользователем куда
+/// нужно, команда не двигает. Окно, которое принимать не следует (диалог,
+/// класс из `ignore_classes`, окно без командной строки), остаётся свободным
+/// со строкой в журнале.
+fn session_plan(cfg: &Config, file: &Config, ws: &str, taken: &mut Vec<String>, windows: &[(&Client, Option<&Foreign>)]) -> Vec<Adopted> {
     let mut out = Vec::new();
     for (c, f) in windows {
-        if let Some(app) = daemon::app_for_window(cfg, c) {
-            let inside = ws_apps.iter().any(|x| cfg.app_is(&app, x));
-            let extra = (!inside).then(|| ExtraApp { rect: c.rect(), ..ExtraApp::default() });
-            out.push(Adopted { addr: c.address.clone(), app, extra });
-            continue;
+        let cmd: Vec<String> = f.map(|f| f.cmd.clone()).unwrap_or_default();
+        match daemon::join_window(cfg, file, Some(ws), c, !cmd.is_empty(), taken) {
+            daemon::Join::App(app) => out.push(Adopted { addr: c.address.clone(), app, extra: None }),
+            daemon::Join::AppPlace(app) => {
+                out.push(Adopted { addr: c.address.clone(), app, extra: Some(ExtraApp { rect: c.rect(), ..ExtraApp::default() }) });
+            }
+            daemon::Join::Extra(name) => {
+                if !taken.contains(&name) {
+                    taken.push(name.clone());
+                }
+                let extra = ExtraApp { class: Some(c.class.clone()), cmd, cwd: f.and_then(|f| f.cwd.clone()), rect: c.rect() };
+                out.push(Adopted { addr: c.address.clone(), app: name, extra: Some(extra) });
+            }
+            daemon::Join::Free(reason) => {
+                log::info!("сохранение сессии: окно {} ({}) осталось свободным: {}", c.address, c.class, reason.text());
+            }
         }
-        let Some(f) = f.filter(|f| !f.cmd.is_empty()) else {
-            log::info!("сохранение сессии: у окна {} ({}) нет командной строки, окно осталось свободным", c.address, c.class);
-            continue;
-        };
-        let app = app_name(&c.class, &taken);
-        taken.push(app.clone());
-        let extra = ExtraApp { class: Some(c.class.clone()), cmd: f.cmd.clone(), cwd: f.cwd.clone(), rect: c.rect() };
-        out.push(Adopted { addr: c.address.clone(), app, extra: Some(extra) });
     }
     out
 }
 
-/// Принять посторонние окна текущего стола в активный workspace этого стола.
-/// Файл конфига не читается и не пишется; места приложений, уже входящих
-/// в workspace, не меняются. Возвращает имя workspace и число принятых окон.
-pub fn save_session(d: &mut Daemon) -> Result<(String, usize)> {
-    let n = d.current_desktop();
-    let Some(ws) = d.state().desktops.get(&n).and_then(|x| x.active.clone()) else { bail!("на столе {n} нет активного workspace") };
+/// Принять в workspace `ws` стола `n` окна, которые в нём ещё не учтены.
+/// Возвращает число принятых окон.
+fn accept_desktop(d: &mut Daemon, n: u8, ws: &str) -> Result<usize> {
     let clients = d.clients()?;
     let cfg = d.cfg().clone();
-    let ws_apps: Vec<String> = cfg.workspaces.get(&ws).map(|w| w.apps.keys().cloned().collect()).unwrap_or_default();
+    let file = d.cfg_file().clone();
     let foreign = d.state().foreign.clone();
     let windows: Vec<(&Client, Option<&Foreign>)> = clients.iter().filter(|c| c.desktop() == Some(n) && c.app().is_none()).map(|c| (c, foreign.get(&c.address))).collect();
-    let plan = session_plan(&cfg, &ws_apps, &windows);
+    let mut taken = daemon::taken_names(&cfg, &d.state().extra);
+    let plan = session_plan(&cfg, &file, ws, &mut taken, &windows);
     if plan.is_empty() {
-        log::info!("сохранение сессии: посторонних окон на столе {n} нет, workspace {ws} не изменён");
-        return Ok((ws, 0));
+        return Ok(0);
     }
     let mut used: Vec<(String, u32)> = clients.iter().filter_map(|c| c.app_instance()).collect();
     let mut ex = Vec::new();
@@ -148,13 +140,68 @@ pub fn save_session(d: &mut Daemon) -> Result<(String, usize)> {
     for a in &plan {
         st.foreign.remove(&a.addr);
         if let Some(e) = &a.extra {
-            st.extra.entry(ws.clone()).or_default().insert(a.app.clone(), e.clone());
+            st.extra.entry(ws.to_string()).or_default().insert(a.app.clone(), e.clone());
         }
     }
     d.rebuild_cfg();
+    Ok(plan.len())
+}
+
+/// Обновить места дополнительных приложений сессии по нынешнему положению
+/// их окон: команда сохраняет то, что на экране. Место берётся у первого
+/// экземпляра, как и при записи workspace в конфиг. Возвращает число
+/// изменённых записей.
+fn update_extra_rects(d: &mut Daemon, ws: &str, clients: &[Client]) -> usize {
+    let cfg = d.cfg().clone();
+    let names: Vec<String> = d.state().extra.get(ws).map(|m| m.keys().cloned().collect()).unwrap_or_default();
+    let mut changed = 0;
+    for name in names {
+        let Some(rect) = daemon::app_windows(&cfg, clients, &name).iter().find(|c| c.desktop().is_some()).map(|c| c.rect()) else { continue };
+        let st = d.state_mut();
+        let Some(e) = st.extra.get_mut(ws).and_then(|m| m.get_mut(&name)) else { continue };
+        if e.rect == rect {
+            continue;
+        }
+        e.rect = rect;
+        // Назначение места в workspace собрано раньше, поэтому новое место
+        // кладётся и туда: иначе поднятие вернуло бы окно на прежнее.
+        if let Some(cells) = st.cells.get_mut(ws) {
+            cells.insert(name.clone(), Place::Rect { rect });
+        }
+        changed += 1;
+        log::info!("сохранение сессии: место {name} в workspace {ws} — {},{} {}×{}", rect.x, rect.y, rect.w, rect.h);
+    }
+    changed
+}
+
+/// Записать снимок сессии (спецификация ws-sessions, «Файлы сессий»).
+/// Команда проходит по всем столам с активным workspace, принимает в них
+/// ещё не учтённые окна по общим правилам, обновляет места дополнительных
+/// приложений и пишет `default.toml`. Файл конфига не читается и не пишется;
+/// места приложений, описанных в конфиге, не меняются. Возвращает число
+/// workspace, окон в них и принятых окон.
+pub fn save_session(d: &mut Daemon) -> Result<(usize, usize, usize)> {
+    let desks: Vec<(u8, String)> = d.state().desktops.iter().filter_map(|(n, x)| Some((*n, x.active.clone()?))).collect();
+    let mut adopted = 0;
+    for (n, ws) in &desks {
+        adopted += accept_desktop(d, *n, ws)?;
+    }
+    let clients = d.clients()?;
+    for (_, ws) in &desks {
+        update_extra_rects(d, ws, &clients);
+    }
+    let cfg = d.cfg().clone();
+    let windows: usize = desks
+        .iter()
+        .map(|(_, ws)| {
+            let apps: Vec<String> = cfg.workspaces.get(ws).map(|w| w.apps.keys().cloned().collect()).unwrap_or_default();
+            clients.iter().filter(|c| c.app().is_some_and(|a| apps.iter().any(|x| cfg.app_is(&a, x)))).count()
+        })
+        .sum();
+    d.save_session_file();
     d.broadcast();
-    log::info!("workspace {ws}: принято окон — {}", plan.len());
-    Ok((ws, plan.len()))
+    log::info!("снимок сессии записан: workspace — {}, окон в них — {windows}, принято окон — {adopted}", desks.len());
+    Ok((desks.len(), windows, adopted))
 }
 
 // ---- Запись workspace в конфиг ----------------------------------------------
@@ -234,7 +281,7 @@ pub fn save_workspace(d: &mut Daemon) -> Result<String> {
                 if f.cmd.is_empty() {
                     continue;
                 }
-                let name = app_name(&c.class, &taken);
+                let name = daemon::app_name(&c.class, &taken);
                 taken.push(name.clone());
                 let apps_root = root.entry("apps").or_insert(Item::Table(Table::new())).as_table_mut().context("[apps] не таблица")?;
                 apps_root.insert(&name, Item::Table(app_table(&f.cmd, f.cwd.as_deref(), Some(&c.class))));
@@ -308,6 +355,11 @@ title = "^Gmail"
 template = "thirds"
 main = "herdr"
 apps = { herdr = "center", chromium = "left" }
+
+[workspaces.solo]
+template = "thirds"
+main = "chromium"
+apps = { chromium = "left" }
 "#;
 
     fn at(addr: &str, tag: &str, r: PxRect) -> crate::hypr::Client {
@@ -324,7 +376,8 @@ apps = { herdr = "center", chromium = "left" }
     #[test]
     fn session_plan_names_windows() {
         let cfg = Config::parse(CFG).unwrap();
-        let ws_apps = ["chromium".to_string()];
+        // В `solo` описан только chromium: окно herdr даёт запись о месте.
+        let ws = "solo";
         let mut alien = test_client("0x1", "Galculator", "Калькулятор", "1", &[]);
         alien.at = (100, 200);
         alien.size = (800, 600);
@@ -338,7 +391,8 @@ apps = { herdr = "center", chromium = "left" }
         let f_mute = foreign(&[]);
         let windows: Vec<(&crate::hypr::Client, Option<&Foreign>)> =
             vec![(&alien, Some(&f_alien)), (&known, Some(&f_known)), (&outside, Some(&f_outside)), (&mute, Some(&f_mute))];
-        let plan = session_plan(&cfg, &ws_apps, &windows);
+        let mut taken: Vec<String> = cfg.apps.keys().cloned().collect();
+        let plan = session_plan(&cfg, &cfg, ws, &mut taken, &windows);
 
         // Окно без подходящего приложения конфига даёт новую запись с классом,
         // командой, каталогом и своим прямоугольником.
@@ -365,7 +419,8 @@ apps = { herdr = "center", chromium = "left" }
         let b = test_client("0x2", "Galculator", "Второй", "1", &[]);
         let f = foreign(&["galculator"]);
         let windows: Vec<(&crate::hypr::Client, Option<&Foreign>)> = vec![(&a, Some(&f)), (&b, Some(&f))];
-        let plan = session_plan(&cfg, &[], &windows);
+        let mut taken: Vec<String> = cfg.apps.keys().cloned().collect();
+        let plan = session_plan(&cfg, &cfg, "solo", &mut taken, &windows);
         assert_eq!(plan.iter().map(|a| a.app.as_str()).collect::<Vec<_>>(), vec!["galculator", "galculator-2"]);
     }
 

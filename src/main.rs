@@ -79,8 +79,10 @@ enum Command {
     },
     /// Расставить окна текущего стола по описанию активного workspace
     Arrange,
-    /// Принять посторонние окна текущего стола в активный workspace на время сессии
+    /// Записать снимок сессии: принять неучтённые окна столов с активным workspace и сохранить состояние
     SaveSession,
+    /// Убрать активное окно из активного workspace текущего стола и закрыть его
+    Detach,
     /// Записать текущее состояние активного workspace в конфиг
     SaveWorkspace,
     /// Убрать workspace из списка стола (окна паркуются)
@@ -151,13 +153,11 @@ fn main() -> anyhow::Result<()> {
         Command::Next => client::call(json!({ "cmd": "next" })).map(|_| ()),
         Command::MoveDesktop { desktop } => client::call(json!({ "cmd": "move-desktop", "desktop": desktop })).map(|_| ()),
         Command::Arrange => client::call(json!({ "cmd": "arrange" })).map(|_| ()),
+        Command::Detach => client::call(json!({ "cmd": "detach" })).map(|_| ()),
         Command::SaveSession => {
             let v = client::call(json!({ "cmd": "save-session" }))?;
-            let ws = v.get("workspace").and_then(|w| w.as_str()).unwrap_or("?");
-            match v.get("adopted").and_then(|n| n.as_u64()).unwrap_or(0) {
-                0 => println!("workspace {ws}: посторонних окон на столе нет"),
-                n => println!("workspace {ws}: принято окон — {n}"),
-            }
+            let n = |k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+            println!("снимок сессии записан: workspace — {}, окон в них — {}, принято окон — {}", n("workspaces"), n("windows"), n("adopted"));
             Ok(())
         }
         Command::SaveWorkspace => {
