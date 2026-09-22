@@ -553,6 +553,10 @@ impl Daemon {
                 }
                 self.st.foreign.insert(c.address.clone(), Foreign { rect: e.rect, cmd, cwd });
                 self.hypr.dispatch_all(&ex)?;
+            } else if let Some(app) = app_for_window(&self.cfg, &c) {
+                // Окно приложения конфига: захват сразу, не дожидаясь
+                // поднятия workspace или вызова приложения (design D16).
+                self.capture_new(&c, &app, &clients)?;
             } else {
                 // Постороннее окно остаётся свободным: частью workspace его
                 // делает только команда сохранения — сессии или конфига.
@@ -605,6 +609,33 @@ impl Daemon {
             }
         }
         log::info!("окно {} → приложение {} (экземпляр {num})", c.address, p.app);
+        self.hypr.dispatch_all(&ex)
+    }
+
+    /// Окно приложения конфига, открытое не демоном (design D16): пользователь
+    /// нажал Ctrl+N в браузере, приложение открыло второе окно само. Окно сразу
+    /// получает тег экземпляра и встаёт на место своего приложения в активном
+    /// workspace стола, поверх уже открытых окон приложения. На другой стол
+    /// демон его не переносит и фокус не трогает: фокус новому окну уже отдал
+/// композитор, а отбирать его у окна, которое пользователь только что открыл,
+/// незачем.
+    fn capture_new(&mut self, c: &Client, app: &str, clients: &[Client]) -> Result<()> {
+        let cfg = self.cfg.clone();
+        let num = free_instance(clients, app);
+        let mut ex = vec![hypr::d_tag(&c.address, &format!("app:{app}#{num}"))];
+        // Место ищется только для окна на обычном столе: окно, открытое сразу
+        // на `special:pool` или `special:hidden`, остаётся там, где открылось.
+        let ws = c.desktop().and_then(|n| self.st.desktops.get(&n).and_then(|d| d.active.clone()));
+        let rect = c.desktop().and_then(|_| open_rect(&mut self.st, &cfg, ws.as_deref(), app, self.mon));
+        if let Some(r) = rect {
+            ex.extend(hypr::d_place(&c.address, r));
+        }
+        // В режиме `stack` прямоугольник окна запоминается сразу (design D9):
+        // ушедшее на `special:pool` и вернувшееся окно встанет туда же.
+        if let Some(w) = ws.filter(|w| cfg.workspaces.get(w).map(|x| x.mode()) == Some(Mode::Stack)) {
+            self.st.geom.entry(w).or_default().insert(c.address.clone(), rect.unwrap_or_else(|| c.rect()));
+        }
+        log::info!("новое окно {} ({}, «{}») → приложение {app}, экземпляр {num}", c.address, c.class, c.title);
         self.hypr.dispatch_all(&ex)
     }
 
@@ -1587,6 +1618,19 @@ pub fn app_for_window(cfg: &Config, c: &Client) -> Option<String> {
         .cloned()
 }
 
+/// Место окна, которое приложение конфига открыло само (design D16). Правило
+/// то же, что у расстановки (спецификация ws-daemon, «Расстановка окон»), но
+/// без последнего шага: ячейка или `rect` приложения в активном workspace
+/// стола, то же у его семейства, `rect` самого приложения. `None` означает,
+/// что места нет ни там, ни там: окно остаётся, где его открыл композитор,
+/// и демон его не центрирует.
+pub fn open_rect(st: &mut State, cfg: &Config, ws: Option<&str>, app: &str, mon: (i32, i32)) -> Option<PxRect> {
+    match ws.filter(|w| cfg.workspaces.contains_key(*w)) {
+        Some(w) => st.rect_for(cfg, w, app, mon),
+        None => State::app_rect(cfg, app, mon),
+    }
+}
+
 /// Окна, которые пора освободить: тег называет приложение, которого
 /// в эффективном конфиге нет. Такое окно никому не принадлежит, поэтому
 /// считается посторонним (спецификация ws-daemon, «Захват открытых окон
@@ -1881,6 +1925,11 @@ title = "^Gmail"
 cmd = "neovide"
 class = "^neovide$"
 
+[apps.calc]
+cmd = "qalculate-gtk"
+class = "^qalculate-gtk$"
+rect = { x = 2600, y = 1500, w = 600, h = 400 }
+
 [workspaces.work]
 template = "thirds"
 main = "herdr"
@@ -2014,6 +2063,29 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
         assert_eq!(app_for_window(&cfg, &news).as_deref(), Some("chromium"));
         // Окно, которому не подходит ни одно приложение конфига.
         assert_eq!(app_for_window(&cfg, &alien), None);
+    }
+
+    #[test]
+    fn new_window_takes_the_place_of_its_app() {
+        let cfg = Config::parse(CFG).unwrap();
+        let mon = (3840, 2160);
+        let mut st = State::default();
+        let left = Some(PxRect { x: -805, y: 10, w: 1920, h: 2140 });
+        let own = Some(PxRect { x: 2600, y: 1500, w: 600, h: 400 });
+        // Второе окно Chromium встаёт в ячейку `chromium`, а не в центр экрана.
+        assert_eq!(open_rect(&mut st, &cfg, Some("work"), "chromium", mon), left);
+        // Окно варианта встаёт в ячейку семейства: своей записи в `work` у него нет.
+        assert_eq!(open_rect(&mut st, &cfg, Some("work"), "chromium-mail", mon), left);
+        // Приложения в активном workspace нет, но своё место у него есть.
+        assert_eq!(open_rect(&mut st, &cfg, Some("work"), "calc", mon), own);
+        assert_eq!(open_rect(&mut st, &cfg, None, "calc", mon), own);
+        // Ни места в активном workspace, ни своего `rect`: окно не двигается.
+        assert_eq!(open_rect(&mut st, &cfg, Some("work"), "wezterm", mon), None);
+        assert_eq!(open_rect(&mut st, &cfg, None, "chromium", mon), None);
+        assert_eq!(open_rect(&mut st, &cfg, Some("нет-такого"), "chromium", mon), None);
+        // Окно встаёт туда, где приложение стоит сейчас, а не где записано в файле.
+        swap_cells(st.cells_of(&cfg, "work", mon), Some("herdr"), "chromium", "center");
+        assert_eq!(open_rect(&mut st, &cfg, Some("work"), "chromium", mon), Some(PxRect { x: 1125, y: 10, w: 1920, h: 2140 }));
     }
 
     #[test]
