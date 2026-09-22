@@ -850,7 +850,13 @@ impl Daemon {
         }
         // Без явного стола workspace, уже активный на другом столе, не переезжает:
         // демон переходит на тот стол и отдаёт фокус главному окну.
-        let n = desktop.unwrap_or_else(|| self.active_desktop_of(ws).unwrap_or(self.current));
+        let was_on = self.active_desktop_of(ws);
+        let n = desktop.unwrap_or_else(|| was_on.unwrap_or(self.current));
+        // Перенос — это поднятие workspace, уже активного на другом столе.
+        // При переносе порядок окон по глубине сохраняется как есть, и главное
+        // окно наверх не поднимается: сверху пользователь оставил то, с чем
+        // работал, и смена стола этого менять не должна.
+        let moving_ws = was_on.is_some_and(|d| d != n);
         // Ленивое поднятие для этого стола больше не нужно: workspace там
         // поднимает эта команда. Иначе событие смены стола пришло бы следом
         // и отдало фокус главному окну поверх того, что сделала команда.
@@ -871,6 +877,8 @@ impl Daemon {
             self.current = n;
         }
         let mut main_addr: Option<String> = None;
+        // Окна workspace, которым демон задаёт порядок по глубине.
+        let mut members: Vec<String> = Vec::new();
         let main_app = w.main.clone().or_else(|| self.st.main_app(&self.cfg, ws, self.mon));
         for app in &apps {
             let rect = self.st.rect_for(&self.cfg, ws, app, self.mon);
@@ -883,6 +891,7 @@ impl Daemon {
                 continue;
             }
             for c in wins.iter().filter(|c| !c.on_hidden()) {
+                members.push(c.address.clone());
                 let moving = c.desktop() != Some(n);
                 if moving {
                     ex.push(hypr::d_move_to(&c.address, &n.to_string()));
@@ -902,8 +911,8 @@ impl Daemon {
                 }
             }
             if main_app.as_deref() == Some(app) {
-                // Фокус получает первый экземпляр, он же поднимается наверх;
-                // порядок остальных окон по глубине не меняется.
+                // Фокус получает первый экземпляр; наверх он поднимается
+                // при поднятии workspace, но не при переносе на другой стол.
                 main_addr = wins.iter().find(|c| !c.on_hidden()).map(|c| c.address.clone());
             }
         }
@@ -920,7 +929,15 @@ impl Daemon {
         }
         if let Some(a) = &main_addr {
             ex.push(hypr::d_focus_window(a));
-            ex.push(hypr::d_bring_to_top());
+        }
+        // Порядок окон по глубине задаётся явно, окно за окном снизу вверх.
+        // Он прочитан у композитора до переноса и восстанавливается после него,
+        // поэтому порядок не зависит от того, как переносы влияют на стопку.
+        // Диспетчер `bring_to_top` здесь не годится: он действует на активное
+        // окно, а нужен произвольный адрес.
+        let depth: Vec<String> = clients.iter().map(|c| c.address.clone()).filter(|a| members.contains(a)).collect();
+        for a in depth_plan(&depth, main_addr.as_deref(), !moving_ws) {
+            ex.push(hypr::d_raise(&a));
         }
         assign_desktop(&mut self.st, ws, n);
         self.hypr.dispatch_all(&ex)?;
@@ -1971,6 +1988,22 @@ pub fn move_step(current: u8, target: u8, active: Option<&str>) -> MoveStep {
     }
 }
 
+/// Порядок, в котором окна workspace поднимаются наверх при его поднятии
+/// (спецификация ws-daemon, «Поднятие workspace на столе»). На вход идут адреса
+/// окон workspace в нынешнем порядке по глубине — снизу вверх, как их
+/// перечисляет композитор, — адрес главного окна и признак, поднимать ли
+/// главное окно наверх. Возвращается тот же порядок снизу вверх: подняв окна
+/// наверх по очереди, демон получает ровно его. При поднятии главное окно
+/// становится верхним, при переносе на другой стол порядок остаётся прежним.
+pub fn depth_plan(order: &[String], main: Option<&str>, main_on_top: bool) -> Vec<String> {
+    let mut plan = order.to_vec();
+    if main_on_top && let Some(i) = main.and_then(|m| plan.iter().position(|a| a == m)) {
+        let top = plan.remove(i);
+        plan.push(top);
+    }
+    plan
+}
+
 /// План расстановки по команде (спецификация ws-daemon, «Расстановка
 /// по команде»): адрес окна и место, которое оно займёт. Окно приложения,
 /// описанного в эффективном конфиге, встаёт на место своего приложения
@@ -2830,6 +2863,23 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
         assert_eq!(st.cells_of(&cfg, "work", mon).get("herdr"), None);
         // У семейства без cmd запускать нечего: место остаётся пустым, демон пишет в журнал.
         assert!(cfg.app_command(None, &cfg.apps["wezterm"]).is_none());
+    }
+
+    #[test]
+    fn depth_plan_keeps_order_and_lifts_main() {
+        let order: Vec<String> = ["0x1", "0x2", "0x3"].iter().map(|s| s.to_string()).collect();
+        // Поднятие workspace: главное окно становится верхним, остальные
+        // сохраняют порядок между собой.
+        assert_eq!(depth_plan(&order, Some("0x2"), true), vec!["0x1", "0x3", "0x2"]);
+        // Главное окно уже наверху — порядок не меняется.
+        assert_eq!(depth_plan(&order, Some("0x3"), true), vec!["0x1", "0x2", "0x3"]);
+        // Перенос на другой стол: порядок по глубине остаётся прежним.
+        assert_eq!(depth_plan(&order, Some("0x2"), false), vec!["0x1", "0x2", "0x3"]);
+        // Главного окна среди окон workspace нет (скрыто или ещё запускается).
+        assert_eq!(depth_plan(&order, None, true), vec!["0x1", "0x2", "0x3"]);
+        assert_eq!(depth_plan(&order, Some("0x9"), true), vec!["0x1", "0x2", "0x3"]);
+        // Окон нет — поднимать нечего.
+        assert!(depth_plan(&[], Some("0x1"), true).is_empty());
     }
 
     #[test]

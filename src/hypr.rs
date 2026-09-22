@@ -282,6 +282,13 @@ pub fn d_bring_to_top() -> String {
     "hl.dsp.window.bring_to_top()".to_string()
 }
 
+/// Поднять наверх стопки названное окно, не меняя фокус. У `bring_to_top` окно
+/// не выбирается — он действует на активное, — поэтому порядок окон по глубине
+/// задаётся `alter_zorder` с явным адресом.
+pub fn d_raise(addr: &str) -> String {
+    format!("hl.dsp.window.alter_zorder({{ mode = \"top\", {} }})", win(addr))
+}
+
 pub fn d_focus_desktop(n: u8) -> String {
     format!("hl.dsp.focus({{ workspace = {n} }})")
 }
