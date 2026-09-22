@@ -23,8 +23,9 @@ use crate::state::{Foreign, Place, State};
 enum Target {
     /// Прямоугольник ячейки или `rect` приложения на столе.
     Place(PxRect),
-    /// Центр экрана поверх остальных (приложение без workspace).
-    Center,
+    /// Приложение вне workspace: своё место по умолчанию (`rect` приложения),
+    /// а без него центр экрана; окно ложится поверх остальных.
+    Free(Option<PxRect>),
     /// Парковка (загрузка сессии для неактивного workspace).
     Pool,
 }
@@ -444,9 +445,11 @@ impl Daemon {
         Ok(())
     }
 
-    /// Окно ожидаемого приложения: тег, стол, место, фокус.
+    /// Окно ожидаемого приложения: тег экземпляра, стол, место, фокус.
     fn adopt(&mut self, c: &Client, p: Pending) -> Result<()> {
-        let mut ex = vec![hypr::d_tag(&c.address, &format!("app:{}", p.app))];
+        let clients = self.hypr.clients().unwrap_or_default();
+        let num = free_instance(&clients, &p.app);
+        let mut ex = vec![hypr::d_tag(&c.address, &format!("app:{}#{num}", p.app))];
         match &p.target {
             Target::Pool => ex.push(hypr::d_move_to(&c.address, "special:pool")),
             Target::Place(r) => {
@@ -455,11 +458,11 @@ impl Daemon {
                 }
                 ex.extend(hypr::d_place(&c.address, *r));
             }
-            Target::Center => {
+            Target::Free(rect) => {
                 if c.desktop() != Some(p.desktop) {
                     ex.push(hypr::d_move_to(&c.address, &p.desktop.to_string()));
                 }
-                let r = PxRect { x: (self.mon.0 - c.size.0) / 2, y: (self.mon.1 - c.size.1) / 2, w: c.size.0, h: c.size.1 };
+                let r = rect.unwrap_or(PxRect { x: (self.mon.0 - c.size.0) / 2, y: (self.mon.1 - c.size.1) / 2, w: c.size.0, h: c.size.1 });
                 ex.extend(hypr::d_place(&c.address, r));
                 let (cmd, cwd) = proc_info(c.pid);
                 self.st.foreign.insert(c.address.clone(), Foreign { rect: r, cmd, cwd });
@@ -475,15 +478,14 @@ impl Daemon {
             let main = self.cfg.workspaces.get(ws).and_then(|w| w.main.clone()).or_else(|| self.st.main_app(&self.cfg, ws, self.mon));
             if let Some(m) = main
                 && m != p.app
-                && let Ok(clients) = self.hypr.clients()
-                && let Some(mw) = Self::find_app_window(&clients, &m)
+                && let Some(mw) = first_window(&self.cfg, &clients, &m)
                 && mw.desktop() == Some(p.desktop)
             {
                 ex.push(hypr::d_focus_window(&mw.address));
                 ex.push(hypr::d_bring_to_top());
             }
         }
-        log::info!("окно {} → приложение {}", c.address, p.app);
+        log::info!("окно {} → приложение {} (экземпляр {num})", c.address, p.app);
         self.hypr.dispatch_all(&ex)
     }
 
@@ -541,7 +543,11 @@ impl Daemon {
         }
         let Some(a) = self.cfg.apps.get(app) else { bail!("приложение {app} не описано") };
         let ws = workspace.and_then(|w| self.cfg.workspaces.get(w));
-        let (cmd, args, cwd, env) = self.cfg.app_command(ws, a);
+        // Приложение без cmd только собирает окна: запускать нечего, место остаётся пустым.
+        let Some((cmd, args, cwd, env)) = self.cfg.app_command(ws, a) else {
+            log::info!("{app}: поля cmd нет, окно не открывается");
+            return Ok(());
+        };
         let mut command = Command::new(&cmd);
         command.args(&args).envs(&env).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
         if let Some(dir) = &cwd {
@@ -568,40 +574,22 @@ impl Daemon {
 
     // ---- Операции ---------------------------------------------------------------
 
-    fn find_app_window<'a>(clients: &'a [Client], app: &str) -> Option<&'a Client> {
-        clients.iter().filter(|c| c.app().as_deref() == Some(app)).min_by_key(|c| c.on_hidden())
-    }
-
-    /// Захват открытых окон для приложений без окна с тегом (design D2–D3
-    /// изменения work-workspace): кандидат — окно подходящего класса и
-    /// заголовка без тега или с тегом приложения, которого нет в конфиге.
-    /// Теги переставляются в композиторе и в локальном списке клиентов.
+    /// Захват открытых окон приложений (спецификация ws-daemon, «Захват
+    /// открытых окон приложения»): берутся все подходящие окна, в том числе
+    /// у приложения, окна которого уже есть. Теги переставляются
+    /// в композиторе и в локальном списке клиентов.
     fn adopt_untagged(&mut self, clients: &mut [Client], apps: &[String]) -> Result<()> {
-        for app in apps {
-            if Self::find_app_window(clients, app).is_some() {
-                continue;
-            }
-            let Some(cfg) = self.cfg.apps.get(app) else {
-                continue;
-            };
-            let Some((class_re, title_re)) = cfg.matchers()? else {
-                continue;
-            };
-            let Some(i) = pick_candidate(clients, &self.cfg, &class_re, title_re.as_ref()) else {
-                continue;
-            };
+        for (i, app, num) in adopt_plan(&self.cfg, clients, apps)? {
             let addr = clients[i].address.clone();
-            let mut ex = Vec::new();
-            if let Some(old) = clients[i].app() {
-                ex.push(hypr::d_tag(&addr, &format!("-app:{old}")));
-            }
-            ex.push(hypr::d_tag(&addr, &format!("app:{app}")));
+            let tag = format!("app:{app}#{num}");
+            let mut ex: Vec<String> = clients[i].app_tags().map(|t| hypr::d_tag(&addr, &format!("-{t}"))).collect();
+            ex.push(hypr::d_tag(&addr, &tag));
             self.hypr.dispatch_all(&ex)?;
             clients[i].tags.retain(|t| !t.starts_with("app:"));
-            clients[i].tags.push(format!("app:{app}"));
+            clients[i].tags.push(tag);
             // Захваченное окно больше не постороннее.
             self.st.foreign.remove(&addr);
-            log::info!("захват: окно {addr} ({}, «{}») → приложение {app}", clients[i].class, clients[i].title);
+            log::info!("захват: окно {addr} ({}, «{}») → приложение {app}, экземпляр {num}", clients[i].class, clients[i].title);
         }
         Ok(())
     }
@@ -632,23 +620,26 @@ impl Daemon {
         let main_app = w.main.clone().or_else(|| self.st.main_app(&self.cfg, ws, self.mon));
         for app in &apps {
             let rect = self.st.rect_for(&self.cfg, ws, app, self.mon);
-            match Self::find_app_window(&clients, app) {
-                Some(c) if !c.on_hidden() => {
-                    if c.desktop() != Some(n) {
-                        ex.push(hypr::d_move_to(&c.address, &n.to_string()));
-                    }
-                    if let Some(r) = rect {
-                        ex.extend(hypr::d_place(&c.address, r));
-                    }
-                    if main_app.as_deref() == Some(app) {
-                        main_addr = Some(c.address.clone());
-                    }
+            // Переезжают и расставляются окна всех экземпляров приложения, окна
+            // его вариантов в том числе; скрытые пользователем не трогаются.
+            let wins = placed_windows(&self.cfg, &clients, &apps, app);
+            if wins.is_empty() {
+                let target = rect.map(Target::Place).unwrap_or(Target::Free(None));
+                self.spawn(app, Some(ws), n, target, main_app.as_deref() == Some(app))?;
+                continue;
+            }
+            for c in wins.iter().filter(|c| !c.on_hidden()) {
+                if c.desktop() != Some(n) {
+                    ex.push(hypr::d_move_to(&c.address, &n.to_string()));
                 }
-                Some(_) => {} // окно скрыто пользователем: не трогаем
-                None => {
-                    let target = rect.map(Target::Place).unwrap_or(Target::Center);
-                    self.spawn(app, Some(ws), n, target, main_app.as_deref() == Some(app))?;
+                if let Some(r) = rect {
+                    ex.extend(hypr::d_place(&c.address, r));
                 }
+            }
+            if main_app.as_deref() == Some(app) {
+                // Фокус получает первый экземпляр, он же поднимается наверх;
+                // порядок остальных окон по глубине не меняется.
+                main_addr = wins.iter().find(|c| !c.on_hidden()).map(|c| c.address.clone());
             }
         }
         // Паркуются только окна живых приложений других workspace. Посторонние
@@ -658,7 +649,7 @@ impl Daemon {
                 continue;
             }
             let Some(a) = c.app() else { continue };
-            if !apps.contains(&a) && self.cfg.apps.contains_key(&a) {
+            if self.cfg.apps.contains_key(&a) && !apps.iter().any(|x| self.cfg.app_is(&a, x)) {
                 ex.push(hypr::d_move_to(&c.address, "special:pool"));
             }
         }
@@ -683,51 +674,45 @@ impl Daemon {
     }
 
     /// Сделать приложение главным в workspace: обмен ячеек с текущим главным.
+    /// Стопки приложений меняются ячейками целиком, фокус и верхнее место
+    /// получает первый экземпляр вызванного приложения.
     fn make_main(&mut self, ws: &str, app: &str) -> Result<()> {
         let mut clients = self.hypr.clients()?;
         self.adopt_untagged(&mut clients, std::slice::from_ref(&app.to_string()))?;
+        let ws_apps: Vec<String> = self.cfg.workspaces[ws].apps.keys().cloned().collect();
         let n = self.current;
         let main_app = self.st.main_app(&self.cfg, ws, self.mon);
         let main_cell = self.cfg.templates[&self.cfg.workspaces[ws].template].main.clone();
         if main_app.as_deref() != Some(app) {
-            let cells = self.st.cells_of(&self.cfg, ws, self.mon);
-            let app_place = cells.get(app).cloned();
-            match (main_app.as_deref(), app_place) {
-                (Some(m), Some(p)) => {
-                    cells.insert(m.to_string(), p);
-                    cells.insert(app.to_string(), Place::Cell(main_cell));
-                }
-                (Some(m), None) => {
-                    cells.remove(m);
-                    cells.insert(app.to_string(), Place::Cell(main_cell));
-                }
-                (None, _) => {
-                    cells.insert(app.to_string(), Place::Cell(main_cell));
-                }
-            }
+            swap_cells(self.st.cells_of(&self.cfg, ws, self.mon), main_app.as_deref(), app, &main_cell);
         }
         let mut ex = Vec::new();
         if let Some(m) = &main_app
             && m != app
-            && let Some(c) = Self::find_app_window(&clients, m)
-            && !c.on_hidden()
             && let Some(r) = self.st.rect_for(&self.cfg, ws, m, self.mon)
         {
-            ex.extend(hypr::d_place(&c.address, r));
+            for c in placed_windows(&self.cfg, &clients, &ws_apps, m).iter().filter(|c| !c.on_hidden()) {
+                ex.extend(hypr::d_place(&c.address, r));
+            }
         }
         let rect = self.st.rect_for(&self.cfg, ws, app, self.mon);
-        match Self::find_app_window(&clients, app) {
-            Some(c) => {
+        let wins = placed_windows(&self.cfg, &clients, &ws_apps, app);
+        if wins.is_empty() {
+            // Приложение без окон запускается; без cmd остаётся без окна, место пустым.
+            self.spawn(app, Some(ws), n, rect.map(Target::Place).unwrap_or(Target::Free(None)), true)?;
+        } else {
+            for c in wins.iter().filter(|c| !c.on_hidden()) {
                 if c.desktop() != Some(n) {
                     ex.push(hypr::d_move_to(&c.address, &n.to_string()));
                 }
                 if let Some(r) = rect {
                     ex.extend(hypr::d_place(&c.address, r));
                 }
+            }
+            if let Some(c) = wins.iter().find(|c| !c.on_hidden()) {
                 ex.push(hypr::d_focus_window(&c.address));
                 ex.push(hypr::d_bring_to_top());
             }
-            None => self.spawn(app, Some(ws), n, rect.map(Target::Place).unwrap_or(Target::Center), true)?,
         }
         self.hypr.dispatch_all(&ex)?;
         self.mark_dirty();
@@ -785,11 +770,15 @@ impl Daemon {
                 return self.make_main(&ws, &a);
             }
         }
-        // 4. Приложение без workspace: плавающее в центре экрана.
+        // 4. Приложение без workspace: плавающее на своём месте по умолчанию
+        // (`rect` приложения, а без него — центр экрана).
         let app = apps[0].clone();
         let mut clients = self.hypr.clients()?;
         self.adopt_untagged(&mut clients, apps)?;
-        if let Some(c) = Self::find_app_window(&clients, &app) {
+        let wins = app_windows(&self.cfg, &clients, &app);
+        if let Some(c) = wins.iter().find(|c| !c.on_hidden()).or_else(|| wins.first()) {
+            // Повторная цепочка только даёт фокус первому экземпляру и поднимает
+            // его окно наверх, места не меняя.
             let mut ex = Vec::new();
             if c.on_hidden() {
                 ex.push(hypr::d_move_to(&c.address, &n.to_string()));
@@ -798,7 +787,8 @@ impl Daemon {
             ex.push(hypr::d_bring_to_top());
             return self.hypr.dispatch_all(&ex);
         }
-        self.spawn(&app, None, n, Target::Center, true)
+        let rect = State::app_rect(&self.cfg, &app, self.mon);
+        self.spawn(&app, None, n, Target::Free(rect), true)
     }
 
     /// Следующий workspace в списке текущего стола.
@@ -827,7 +817,7 @@ impl Daemon {
                 if c.desktop() != Some(n) {
                     continue;
                 }
-                if c.app().is_some_and(|a| apps.contains(&a)) {
+                if c.app().is_some_and(|a| apps.iter().any(|x| self.cfg.app_is(&a, x))) {
                     ex.push(hypr::d_move_to(&c.address, "special:pool"));
                 }
             }
@@ -848,7 +838,7 @@ impl Daemon {
         match desktop {
             Some(n) => {
                 let rect = workspace.and_then(|w| self.st.rect_for(&self.cfg, w, app, self.mon));
-                self.spawn(app, workspace, n, rect.map(Target::Place).unwrap_or(Target::Center), false)
+                self.spawn(app, workspace, n, rect.map(Target::Place).unwrap_or(Target::Free(None)), false)
             }
             None => self.spawn(app, workspace, self.current, Target::Pool, false),
         }
@@ -1049,7 +1039,8 @@ impl Daemon {
                 .map(|ws| {
                     let w = self.cfg.workspaces.get(ws);
                     let apps: Vec<String> = w.map(|w| w.apps.keys().cloned().collect()).unwrap_or_default();
-                    let windows: Vec<String> = clients.iter().filter(|c| c.app().is_some_and(|a| apps.contains(&a))).map(|c| c.address.clone()).collect();
+                    // Окно варианта входит в состав как окно своего семейства.
+                    let windows: Vec<String> = clients.iter().filter(|c| c.app().is_some_and(|a| apps.iter().any(|x| self.cfg.app_is(&a, x)))).map(|c| c.address.clone()).collect();
                     json!({ "name": ws, "icon": w.and_then(|w| w.icon.clone()), "active": d.active.as_deref() == Some(ws), "apps": apps, "windows": windows })
                 })
                 .collect();
@@ -1064,7 +1055,7 @@ impl Daemon {
         let windows: Vec<Value> = clients
             .iter()
             .map(|c| {
-                json!({ "address": c.address, "class": c.class, "title": c.title, "app": c.app(), "workspace": c.workspace.name, "foreign": self.st.foreign.contains_key(&c.address), "rect": c.rect(), "pid": c.pid })
+                json!({ "address": c.address, "class": c.class, "title": c.title, "app": c.app(), "instance": c.app_instance().map(|(_, n)| n), "workspace": c.workspace.name, "foreign": self.st.foreign.contains_key(&c.address), "rect": c.rect(), "pid": c.pid })
             })
             .collect();
         let pending: Vec<Value> = self.pending.iter().map(|p| json!({ "app": p.app, "pid": p.child.id(), "desktop": p.desktop })).collect();
@@ -1139,22 +1130,122 @@ fn maximize_rect(work_area: PxRect, gap: i32) -> PxRect {
     work_area.inset(2 * gap)
 }
 
-/// Кандидат на захват: не на `special:hidden`, класс и заголовок подходят,
-/// тега нет или он принадлежит приложению, которого нет в конфиге. Окно на
-/// обычном столе предпочтительнее окна на `special:pool`.
-fn pick_candidate(clients: &[Client], cfg: &Config, class_re: &regex::Regex, title_re: Option<&regex::Regex>) -> Option<usize> {
-    let fits = |c: &Client| !c.on_hidden() && class_re.is_match(&c.class) && title_re.is_none_or(|t| t.is_match(&c.title)) && c.app().is_none_or(|a| !cfg.apps.contains_key(&a));
-    let mut pool = None;
-    for (i, c) in clients.iter().enumerate() {
-        if !fits(c) {
+/// Окна приложения по возрастанию номера экземпляра. Окно варианта входит
+/// и в набор своего семейства (спецификация ws-daemon, «Идентификация окон»);
+/// номера у семейства и у варианта свои, поэтому при совпадении номеров окна
+/// идут по имени приложения.
+pub fn app_windows<'a>(cfg: &Config, clients: &'a [Client], app: &str) -> Vec<&'a Client> {
+    let mut out: Vec<&Client> = clients.iter().filter(|c| c.app_instance().is_some_and(|(a, _)| cfg.app_is(&a, app))).collect();
+    out.sort_by_key(|c| c.app_instance().map(|(a, n)| (n, a)));
+    out
+}
+
+/// Окна, которые расставляет запись приложения `app` в workspace с набором
+/// приложений `apps`. Окно варианта — окно своего семейства, но если вариант
+/// сам описан в этом workspace, место ему задаёт его собственная запись, а не
+/// запись семейства: более точное совпадение побеждает (спецификация ws-daemon,
+/// «Расстановка окон»).
+fn placed_windows<'a>(cfg: &Config, clients: &'a [Client], apps: &[String], app: &str) -> Vec<&'a Client> {
+    app_windows(cfg, clients, app).into_iter().filter(|c| c.app().is_none_or(|own| own == app || !apps.contains(&own))).collect()
+}
+
+/// Первый экземпляр приложения: окно с наименьшим номером, скрытые последними.
+fn first_window<'a>(cfg: &Config, clients: &'a [Client], app: &str) -> Option<&'a Client> {
+    let wins = app_windows(cfg, clients, app);
+    wins.iter().find(|c| !c.on_hidden()).or_else(|| wins.first()).copied()
+}
+
+/// Наименьший свободный номер, начиная с 1, среди занятых.
+fn free_number(used: &[u32]) -> u32 {
+    let mut used = used.to_vec();
+    used.sort_unstable();
+    let mut num = 1;
+    for u in used {
+        match u.cmp(&num) {
+            std::cmp::Ordering::Equal => num += 1,
+            std::cmp::Ordering::Greater => break,
+            std::cmp::Ordering::Less => {}
+        }
+    }
+    num
+}
+
+/// Наименьший свободный номер экземпляра приложения среди живых окон.
+pub fn free_instance(clients: &[Client], app: &str) -> u32 {
+    let used: Vec<u32> = clients.iter().filter_map(|c| c.app_instance()).filter(|(a, _)| a == app).map(|(_, n)| n).collect();
+    free_number(&used)
+}
+
+/// Что захватить: окно (его номер в списке клиентов), приложение и номер
+/// экземпляра. Кандидат — окно не на `special:hidden`, чей класс и заголовок
+/// подходят приложению, без тега или с тегом приложения, которого нет
+/// в конфиге. Сопоставление идёт сначала по вариантам, затем по семействам:
+/// более точное совпадение побеждает. Окна обычных столов разбираются раньше
+/// окон на `special:pool`, поэтому первый экземпляр — окно на столе.
+fn adopt_plan(cfg: &Config, clients: &[Client], apps: &[String]) -> Result<Vec<(usize, String, u32)>> {
+    // Порядок сопоставления: варианты по именам, затем семейства.
+    let mut variants: Vec<String> = Vec::new();
+    let mut families: Vec<String> = Vec::new();
+    for app in apps {
+        if !cfg.apps.contains_key(app) {
             continue;
         }
-        if !c.on_pool() {
-            return Some(i);
+        if cfg.family_of(app).is_some() {
+            variants.push(app.clone());
+        } else {
+            families.push(app.clone());
+            variants.extend(cfg.variants_of(app).into_iter().map(String::from));
         }
-        pool.get_or_insert(i);
     }
-    pool
+    for list in [&mut variants, &mut families] {
+        list.sort();
+        list.dedup();
+    }
+    let mut matchers: Vec<(String, regex::Regex, Option<regex::Regex>)> = Vec::new();
+    for name in variants.iter().chain(families.iter()) {
+        if let Some((class_re, title_re)) = cfg.apps[name].matchers().with_context(|| format!("приложение {name}"))? {
+            matchers.push((name.clone(), class_re, title_re));
+        }
+    }
+    let mut order: Vec<usize> = (0..clients.len()).collect();
+    order.sort_by_key(|i| clients[*i].on_pool());
+    let mut used: Vec<(String, u32)> = clients.iter().filter_map(|c| c.app_instance()).collect();
+    let mut plan = Vec::new();
+    for i in order {
+        let c = &clients[i];
+        if c.on_hidden() || c.app().is_some_and(|a| cfg.apps.contains_key(&a)) {
+            continue;
+        }
+        let fitting: Vec<&String> = matchers.iter().filter(|(_, cr, tr)| matcher_fits(Some(cr), tr.as_ref(), c)).map(|(n, _, _)| n).collect();
+        let Some(app) = fitting.first().map(|n| (*n).clone()) else { continue };
+        // Пересечение выражений двух вариантов одного семейства статически
+        // не проверить: окно достаётся первому по имени, а об остальных
+        // подходящих вариантах демон пишет предупреждение в журнал.
+        let rivals: Vec<&&String> = fitting.iter().skip(1).filter(|n| cfg.family_of(n).is_some() && cfg.family_of(n) == cfg.family_of(&app)).collect();
+        if !rivals.is_empty() {
+            log::warn!("окно {} ({}) подходит вариантам {app} и {}; отдано {app}", c.address, c.class, rivals.iter().map(|n| n.as_str()).collect::<Vec<_>>().join(", "));
+        }
+        let num = free_number(&used.iter().filter(|(a, _)| *a == app).map(|(_, n)| *n).collect::<Vec<u32>>());
+        used.push((app.clone(), num));
+        plan.push((i, app, num));
+    }
+    Ok(plan)
+}
+
+/// Обмен ячеек: приложение идёт в главную ячейку, прежнее главное — на его
+/// место. Стопка меняется ячейкой целиком, остальные окна не двигаются.
+fn swap_cells(cells: &mut BTreeMap<String, Place>, main_app: Option<&str>, app: &str, main_cell: &str) {
+    let app_place = cells.get(app).cloned();
+    match (main_app, app_place) {
+        (Some(m), Some(p)) => {
+            cells.insert(m.to_string(), p);
+        }
+        (Some(m), None) => {
+            cells.remove(m);
+        }
+        (None, _) => {}
+    }
+    cells.insert(app.to_string(), Place::Cell(main_cell.to_string()));
 }
 
 /// Позиция окна по правилу одинаковых расстояний: рабочая область сужается на
@@ -1233,13 +1324,45 @@ mod tests {
         assert!(place_rect(panel, 5, "left").is_err());
     }
 
-    fn client(addr: &str, class: &str, title: &str, ws: &str, tags: &[&str]) -> Client {
-        serde_json::from_value(json!({
-            "address": addr, "class": class, "title": title, "workspace": { "id": 1, "name": ws },
-            "tags": tags, "at": [0, 0], "size": [10, 10], "floating": true, "mapped": true
-        }))
-        .unwrap()
-    }
+    use crate::hypr::test_client as client;
+
+    /// Семейство `wezterm` с вариантом `herdr`, семейство `chromium`
+    /// с вариантом `chromium-mail` и обычные приложения.
+    const CFG: &str = r#"
+[templates.thirds]
+main = "center"
+[templates.thirds.cells]
+left   = { x = -805, y = 10, w = 1920, h = 2140 }
+center = { x = 1125, y = 10, w = 1920, h = 2140 }
+right  = { x = 3055, y = 10, w = 1920, h = 2140 }
+
+[apps.wezterm]
+class = "^org\\.wezfurlong\\.wezterm$"
+
+[apps.herdr]
+family = "wezterm"
+cmd = "wezterm-gui"
+class = "^wezterm-herdr$"
+
+[apps.chromium]
+cmd = "chromium"
+class = "(?i)^chromium(-browser)?$"
+
+[apps.chromium-mail]
+family = "chromium"
+cmd = "chromium"
+class = "(?i)^chromium(-browser)?$"
+title = "^Gmail"
+
+[apps.neovide]
+cmd = "neovide"
+class = "^neovide$"
+
+[workspaces.work]
+template = "thirds"
+main = "herdr"
+apps = { herdr = "center", chromium = "left", neovide = "right" }
+"#;
 
     #[test]
     fn matcher_fits_by_class_and_title() {
@@ -1258,27 +1381,121 @@ mod tests {
     }
 
     #[test]
-    fn pick_candidate_by_class_title_and_tag() {
-        let cfg = Config::parse(
-            "[templates.t]\nmain = \"c\"\ncells = { c = { x = 0, y = 0, w = 10, h = 10 } }\n[apps.herdr]\ncmd = \"wezterm-gui\"\nclass = \"^org\\\\.wezfurlong\\\\.wezterm$\"\ntitle = \"^herdr · \"\n[apps.neovide]\ncmd = \"neovide\"\nclass = \"^neovide$\"\n[workspaces.work]\ntemplate = \"t\"\napps = { herdr = \"c\" }\n",
-        )
-        .unwrap();
+    fn instance_numbers_fill_gaps() {
+        assert_eq!(free_number(&[]), 1);
+        assert_eq!(free_number(&[1, 2]), 3);
+        assert_eq!(free_number(&[2, 3]), 1);
+        assert_eq!(free_number(&[1, 3]), 2);
         let clients = vec![
-            client("0x1", "org.wezfurlong.wezterm", "bash · mne@dev-lab", "1", &[]),
-            client("0x2", "org.wezfurlong.wezterm", "herdr · dev-lab", "special:pool", &[]),
-            client("0x3", "org.wezfurlong.wezterm", "herdr · dev-lab", "2", &["app:terminal-dots"]),
-            client("0x4", "org.wezfurlong.wezterm", "herdr · dev-lab", "special:hidden", &[]),
-            client("0x5", "org.wezfurlong.wezterm", "herdr · x", "1", &["app:neovide"]),
-            client("0x6", "neovide", "[Scratch]", "1", &["app:editor-dots"]),
+            client("0x1", "chromium", "Новости", "1", &["app:chromium#2"]),
+            // Тег прежней версии без номера читается как экземпляр 1.
+            client("0x2", "neovide", "[Scratch]", "1", &["app:neovide"]),
         ];
-        let (cre, tre) = cfg.apps["herdr"].matchers().unwrap().unwrap();
-        // Заголовок отсекает 0x1, hidden — 0x4, тег живого приложения — 0x5; обычный стол предпочтительнее пула.
-        assert_eq!(pick_candidate(&clients, &cfg, &cre, tre.as_ref()), Some(2));
-        let only_pool = &clients[..2];
-        assert_eq!(pick_candidate(only_pool, &cfg, &cre, tre.as_ref()), Some(1));
-        let (cre, tre) = cfg.apps["neovide"].matchers().unwrap().unwrap();
-        assert_eq!(pick_candidate(&clients, &cfg, &cre, tre.as_ref()), Some(5));
-        assert_eq!(pick_candidate(&clients[..1], &cfg, &cre, tre.as_ref()), None);
+        assert_eq!(free_instance(&clients, "chromium"), 1);
+        assert_eq!(free_instance(&clients, "neovide"), 2);
+        assert_eq!(free_instance(&clients, "herdr"), 1);
+    }
+
+    #[test]
+    fn app_windows_by_instance_and_family() {
+        let cfg = Config::parse(CFG).unwrap();
+        let clients = vec![
+            client("0x1", "chromium", "Новости", "1", &["app:chromium#2"]),
+            client("0x2", "chromium", "Gmail — Входящие", "1", &["app:chromium-mail#1"]),
+            client("0x3", "chromium", "Документы", "1", &["app:chromium#1"]),
+            client("0x4", "org.wezfurlong.wezterm", "bash · mne", "1", &["app:wezterm#1"]),
+            client("0x5", "wezterm-herdr", "herdr · dev-lab", "1", &["app:herdr#1"]),
+        ];
+        let addrs = |app: &str| app_windows(&cfg, &clients, app).iter().map(|c| c.address.clone()).collect::<Vec<_>>();
+        // Экземпляры семейства по возрастанию номера; окно варианта входит в набор.
+        assert_eq!(addrs("chromium"), vec!["0x3", "0x2", "0x1"]);
+        // У варианта только его собственные окна.
+        assert_eq!(addrs("chromium-mail"), vec!["0x2"]);
+        // Совпавшие номера семейства и варианта разводятся по имени приложения.
+        assert_eq!(addrs("wezterm"), vec!["0x5", "0x4"]);
+        assert_eq!(addrs("neovide"), Vec::<String>::new());
+        assert_eq!(first_window(&cfg, &clients, "chromium").map(|c| c.address.clone()), Some("0x3".to_string()));
+    }
+
+    #[test]
+    fn variant_window_is_placed_by_its_own_entry() {
+        let cfg = Config::parse(CFG).unwrap();
+        let clients = vec![
+            client("0x1", "chromium", "Новости", "1", &["app:chromium#1"]),
+            client("0x2", "chromium", "Gmail — Входящие", "1", &["app:chromium-mail#1"]),
+        ];
+        let addrs = |apps: &[String], app: &str| placed_windows(&cfg, &clients, apps, app).iter().map(|c| c.address.clone()).collect::<Vec<_>>();
+        // Workspace описывает и семейство, и вариант: окно варианта ставит
+        // его собственная запись, семейство его не трогает.
+        let both = ["chromium".to_string(), "chromium-mail".to_string()];
+        assert_eq!(addrs(&both, "chromium"), vec!["0x1"]);
+        assert_eq!(addrs(&both, "chromium-mail"), vec!["0x2"]);
+        // Workspace описывает только семейство: окно варианта встаёт в его ячейку.
+        let only_family = ["chromium".to_string()];
+        assert_eq!(addrs(&only_family, "chromium"), vec!["0x1", "0x2"]);
+    }
+
+    #[test]
+    fn adopt_plan_takes_all_fitting_windows() {
+        let cfg = Config::parse(CFG).unwrap();
+        let apps: Vec<String> = ["herdr".to_string(), "chromium".to_string(), "neovide".to_string()].into();
+        // Три окна Chromium без тегов получают номера 1—3; окно на special:hidden
+        // не захватывается, окно с тегом живого приложения тоже.
+        let clients = vec![
+            client("0x1", "chromium", "Новости", "1", &[]),
+            client("0x2", "Chromium-browser", "Документы", "special:pool", &[]),
+            client("0x3", "chromium", "Почта", "3", &[]),
+            client("0x4", "chromium", "Скрытое", "special:hidden", &[]),
+            client("0x5", "neovide", "[Scratch]", "1", &["app:neovide#1"]),
+        ];
+        let plan = adopt_plan(&cfg, &clients, &apps).unwrap();
+        assert_eq!(plan, vec![(0, "chromium".to_string(), 1), (2, "chromium".to_string(), 2), (1, "chromium".to_string(), 3)]);
+
+        // Захват работает и у приложения, окна которого уже есть.
+        let with_window = vec![client("0x1", "chromium", "Новости", "1", &["app:chromium#1"]), client("0x2", "chromium", "Документы", "1", &[])];
+        let plan = adopt_plan(&cfg, &with_window, &apps).unwrap();
+        assert_eq!(plan, vec![(1, "chromium".to_string(), 2)]);
+
+        // Окно с тегом приложения, которого нет в конфиге, переходит к приложению.
+        let stale = vec![client("0x1", "neovide", "[Scratch]", "1", &["app:editor-dots#1"])];
+        assert_eq!(adopt_plan(&cfg, &stale, &apps).unwrap(), vec![(0, "neovide".to_string(), 1)]);
+    }
+
+    #[test]
+    fn adopt_plan_prefers_variant_over_family() {
+        let cfg = Config::parse(CFG).unwrap();
+        let clients = vec![client("0x1", "chromium", "Gmail — Входящие", "1", &[]), client("0x2", "chromium", "Новости", "1", &[])];
+        // Workspace описывает и семейство, и вариант.
+        let apps: Vec<String> = ["chromium".to_string(), "chromium-mail".to_string()].into();
+        let plan = adopt_plan(&cfg, &clients, &apps).unwrap();
+        assert_eq!(plan, vec![(0, "chromium-mail".to_string(), 1), (1, "chromium".to_string(), 1)]);
+        // Workspace описывает только семейство: окно варианта всё равно достаётся
+        // варианту и попадает в ячейку семейства как окно своего семейства.
+        let plan = adopt_plan(&cfg, &clients, &["chromium".to_string()]).unwrap();
+        assert_eq!(plan, vec![(0, "chromium-mail".to_string(), 1), (1, "chromium".to_string(), 1)]);
+        // Окно, подходящее двум вариантам одного семейства, достаётся первому по имени.
+        let two = format!("{CFG}\n[apps.chromium-docs]\nfamily = \"chromium\"\ncmd = \"chromium\"\nclass = \"(?i)^chromium(-browser)?$\"\ntitle = \"Gmail\"\n");
+        let cfg = Config::parse(&two).unwrap();
+        let plan = adopt_plan(&cfg, &clients[..1], &["chromium".to_string()]).unwrap();
+        assert_eq!(plan, vec![(0, "chromium-docs".to_string(), 1)]);
+    }
+
+    #[test]
+    fn swap_cells_exchanges_stacks() {
+        let cfg = Config::parse(CFG).unwrap();
+        let mon = (3840, 2160);
+        let mut st = State::default();
+        swap_cells(st.cells_of(&cfg, "work", mon), Some("herdr"), "chromium", "center");
+        // Стопки меняются ячейками целиком, третье приложение не двигается.
+        assert_eq!(st.rect_for(&cfg, "work", "chromium", mon), Some(PxRect { x: 1125, y: 10, w: 1920, h: 2140 }));
+        assert_eq!(st.rect_for(&cfg, "work", "herdr", mon), Some(PxRect { x: -805, y: 10, w: 1920, h: 2140 }));
+        assert_eq!(st.rect_for(&cfg, "work", "neovide", mon), Some(PxRect { x: 3055, y: 10, w: 1920, h: 2140 }));
+        // Приложение вне ячеек: прежнее главное остаётся без назначения.
+        let mut st = State::default();
+        swap_cells(st.cells_of(&cfg, "work", mon), Some("herdr"), "wezterm", "center");
+        assert_eq!(st.cells_of(&cfg, "work", mon).get("herdr"), None);
+        // У семейства без cmd запускать нечего: место остаётся пустым, демон пишет в журнал.
+        assert!(cfg.app_command(None, &cfg.apps["wezterm"]).is_none());
     }
 
     #[test]

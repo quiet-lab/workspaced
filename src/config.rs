@@ -110,9 +110,12 @@ pub struct Template {
 /// Приложение: команда, аргументы, каталог, окружение, цепочка и, при
 /// необходимости, регулярные выражения класса и заголовка для захвата уже
 /// открытого окна (спецификация ws-daemon, «Захват открытых окон приложения»).
+/// Приложение-вариант называет своё семейство полем `family`; приложение без
+/// `cmd` окон не открывает, а только собирает подходящие по `class`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct App {
-    pub cmd: String,
+    #[serde(default)]
+    pub cmd: Option<String>,
     #[serde(default)]
     pub args: Vec<String>,
     #[serde(default)]
@@ -127,6 +130,13 @@ pub struct App {
     /// Заголовок окна, как написано (например, префикс `^herdr · `).
     #[serde(default)]
     pub title: Option<String>,
+    /// Имя приложения-семейства, если это приложение — его вариант.
+    #[serde(default)]
+    pub family: Option<String>,
+    /// Положение и размер окна, когда активный workspace об этом приложении
+    /// ничего не говорит.
+    #[serde(default)]
+    pub rect: Option<Rect>,
 }
 
 impl App {
@@ -310,7 +320,11 @@ pub struct Config {
     pub startup: Option<Startup>,
 }
 
-/// Имя сущности, безопасное для командной строки и имени тега.
+/// Запуск приложения: программа, аргументы, рабочий каталог и сложенное окружение.
+pub type AppCommand = (String, Vec<String>, Option<String>, BTreeMap<String, String>);
+
+/// Имя сущности, безопасное для командной строки и имени тега. Двоеточие и `#`
+/// недопустимы: ими демон отделяет части тега экземпляра `app:<имя>#<номер>`.
 fn valid_name(name: &str) -> bool {
     !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
 }
@@ -337,7 +351,7 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         for name in self.templates.keys().chain(self.apps.keys()).chain(self.workspaces.keys()) {
             if !valid_name(name) {
-                bail!("недопустимое имя {name:?}: разрешены буквы, цифры, «_», «-», «.»");
+                bail!("недопустимое имя {name:?}: разрешены буквы, цифры, «_», «-», «.»; двоеточие и «#» отделяют части тега экземпляра");
             }
         }
         for (tname, t) in &self.templates {
@@ -346,10 +360,25 @@ impl Config {
             }
         }
         for (aname, a) in &self.apps {
+            if a.cmd.is_none() && a.class.is_none() {
+                bail!("приложение {aname}: нужно хотя бы одно из полей cmd и class: без cmd приложение не открывает окон, без class его окно не узнать");
+            }
             if a.title.is_some() && a.class.is_none() {
                 bail!("приложение {aname}: поле title без class не имеет смысла");
             }
             a.matchers().with_context(|| format!("приложение {aname}"))?;
+            // Уровней ровно два: семейство и его варианты.
+            if let Some(f) = &a.family {
+                if f == aname {
+                    bail!("приложение {aname}: поле family называет само приложение");
+                }
+                let Some(parent) = self.apps.get(f) else {
+                    bail!("приложение {aname}: семейство {f:?} не описано в [apps]");
+                };
+                if parent.family.is_some() {
+                    bail!("приложение {aname}: семейство {f:?} само вариант семейства {:?}, а уровней ровно два", parent.family.as_deref().unwrap_or(""));
+                }
+            }
         }
         if let Some(st) = &self.startup {
             if !self.workspaces.contains_key(&st.workspace) {
@@ -452,13 +481,30 @@ impl Config {
         env
     }
 
-    /// Команда, аргументы и каталог приложения с подстановкой из сложенного окружения.
-    pub fn app_command(&self, workspace: Option<&Workspace>, app: &App) -> (String, Vec<String>, Option<String>, BTreeMap<String, String>) {
+    /// Команда, аргументы и каталог приложения с подстановкой из сложенного
+    /// окружения; `None` у приложения без `cmd` — оно окон не открывает.
+    pub fn app_command(&self, workspace: Option<&Workspace>, app: &App) -> Option<AppCommand> {
         let env = self.app_env(workspace, app);
-        let cmd = expand(&app.cmd, &env);
+        let cmd = expand(app.cmd.as_ref()?, &env);
         let args = app.args.iter().map(|a| expand(a, &env)).collect();
         let cwd = app.cwd.as_ref().map(|c| expand(c, &env));
-        (cmd, args, cwd, env)
+        Some((cmd, args, cwd, env))
+    }
+
+    /// Семейство приложения: имя из поля `family`, если приложение — вариант.
+    pub fn family_of(&self, app: &str) -> Option<&str> {
+        self.apps.get(app)?.family.as_deref()
+    }
+
+    /// Окно приложения `name` принадлежит `target`: это само приложение либо
+    /// его семейство (окно варианта — окно своего семейства).
+    pub fn app_is(&self, name: &str, target: &str) -> bool {
+        name == target || self.family_of(name) == Some(target)
+    }
+
+    /// Варианты семейства по именам.
+    pub fn variants_of(&self, family: &str) -> Vec<&str> {
+        self.apps.iter().filter(|(_, a)| a.family.as_deref() == Some(family)).map(|(n, _)| n.as_str()).collect()
     }
 }
 
@@ -578,6 +624,61 @@ apps = { terminal = "right" }
     }
 
     #[test]
+    fn family_and_variant() {
+        // Вариант называет семейство плоским полем family; уровней ровно два.
+        let ok = format!(
+            "{MINIMAL}\n[apps.wezterm]\ncmd = \"wezterm-gui\"\nclass = \"^org\\\\.wezfurlong\\\\.wezterm$\"\n[apps.herdr]\nfamily = \"wezterm\"\ncmd = \"wezterm-gui\"\nclass = \"^wezterm-herdr$\"\n"
+        );
+        let cfg = Config::parse(&ok).unwrap();
+        assert_eq!(cfg.family_of("herdr"), Some("wezterm"));
+        assert_eq!(cfg.family_of("wezterm"), None);
+        assert_eq!(cfg.variants_of("wezterm"), vec!["herdr"]);
+        assert!(cfg.app_is("herdr", "wezterm") && cfg.app_is("herdr", "herdr") && !cfg.app_is("wezterm", "herdr"));
+
+        let no_family = ok.replace("family = \"wezterm\"", "family = \"weztermm\"");
+        let err = Config::parse(&no_family).unwrap_err().to_string();
+        assert!(err.contains("herdr") && err.contains("weztermm"), "{err}");
+
+        let deep = format!("{ok}[apps.herdr-lab]\nfamily = \"herdr\"\ncmd = \"wezterm-gui\"\nclass = \"^wezterm-herdr-lab$\"\n");
+        let err = Config::parse(&deep).unwrap_err().to_string();
+        assert!(err.contains("herdr-lab") && err.contains("уровней ровно два"), "{err}");
+
+        let selfish = ok.replace("family = \"wezterm\"", "family = \"herdr\"");
+        let err = Config::parse(&selfish).unwrap_err().to_string();
+        assert!(err.contains("herdr") && err.contains("само приложение"), "{err}");
+    }
+
+    #[test]
+    fn app_without_cmd_and_invalid_names() {
+        // Приложение-семейство может только собирать окна; без cmd и без class
+        // его ни запустить, ни узнать.
+        let only_class = format!("{MINIMAL}\n[apps.wezterm]\nclass = \"^org\\\\.wezfurlong\\\\.wezterm$\"\n");
+        let cfg = Config::parse(&only_class).unwrap();
+        assert!(cfg.apps["wezterm"].cmd.is_none());
+        assert!(cfg.app_command(None, &cfg.apps["wezterm"]).is_none());
+
+        let empty = format!("{MINIMAL}\n[apps.wezterm]\nchain = \"SUPER+W\"\n");
+        let err = Config::parse(&empty).unwrap_err().to_string();
+        assert!(err.contains("wezterm") && err.contains("cmd") && err.contains("class"), "{err}");
+
+        // Двоеточие и «#» отделяют части тега экземпляра, в имени их быть не может.
+        for bad in ["chrome#ai", "chrome:ai"] {
+            let text = format!("{MINIMAL}\n[apps.\"{bad}\"]\ncmd = \"x\"\n");
+            let err = Config::parse(&text).unwrap_err().to_string();
+            assert!(err.contains(bad), "{err}");
+        }
+    }
+
+    #[test]
+    fn app_default_rect() {
+        let text = format!("{MINIMAL}\n[apps.calc]\ncmd = \"galculator\"\nrect = {{ x = 2600, y = 1500, w = 600, h = 400 }}\n");
+        let cfg = Config::parse(&text).unwrap();
+        let r = cfg.apps["calc"].rect.as_ref().unwrap().resolve(3840, 2160);
+        assert_eq!(r, PxRect { x: 2600, y: 1500, w: 600, h: 400 });
+        assert!(cfg.apps["terminal"].rect.is_none());
+    }
+
+    #[test]
     fn percent_and_pixels_in_one_cell() {
         let cfg = Config::parse(MINIMAL).unwrap();
         let cell = &cfg.templates["halves"].cells["left"];
@@ -626,7 +727,7 @@ apps = { term = "c", plain = "c" }
         let cfg = Config::parse(text).unwrap();
         let ws = &cfg.workspaces["w"];
         let home = std::env::var("HOME").unwrap();
-        let (_, args, _, env) = cfg.app_command(Some(ws), &cfg.apps["term"]);
+        let (_, args, _, env) = cfg.app_command(Some(ws), &cfg.apps["term"]).unwrap();
         assert_eq!(args, vec!["--cwd".to_string(), format!("{home}/work/front-end")]);
         assert_eq!(env["ROOT"], format!("{home}/work/front-end"));
         assert_eq!(env["NODE_ENV"], "test");
@@ -643,5 +744,10 @@ apps = { term = "c", plain = "c" }
         assert_eq!(expand("$A/${A}/$NOPE_VAR_Q/$", &env), "x/x//$");
         assert_eq!(expand("~", &env), std::env::var("HOME").unwrap());
         assert_eq!(expand("a~b", &env), "a~b");
+        // Тильда подставляется только в начале строки, а $HOME — в любом месте,
+        // поэтому каталог внутри аргумента пишется через $HOME.
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(expand("--user-data-dir=~/.config/x", &env), "--user-data-dir=~/.config/x");
+        assert_eq!(expand("--user-data-dir=$HOME/.config/x", &env), format!("--user-data-dir={home}/.config/x"));
     }
 }

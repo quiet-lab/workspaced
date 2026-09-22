@@ -207,6 +207,24 @@ fn spawn_missing_foreign(d: &mut Daemon, snapshot: &[SessionWindow]) -> Result<(
     Ok(())
 }
 
+/// Окна снимка, для которых нужно запустить приложение: по одному запуску
+/// на приложение, даже если в снимке у него несколько окон. Приложение
+/// с живым окном (`live`) пропускается; из снимка возвращается один экземпляр,
+/// остальные окна открывает сам пользователь.
+fn apps_to_start<'a>(windows: &'a [SessionWindow], live: &dyn Fn(&str) -> bool) -> Vec<&'a SessionWindow> {
+    let mut started: Vec<&str> = Vec::new();
+    let mut out = Vec::new();
+    for w in windows {
+        let Some(app) = w.app.as_deref() else { continue };
+        if started.contains(&app) || live(app) {
+            continue;
+        }
+        started.push(app);
+        out.push(w);
+    }
+    out
+}
+
 /// Загрузка сессии посреди работы: сверка, закрытие лишнего, запуск недостающего.
 pub fn load(d: &mut Daemon, name: &str) -> Result<()> {
     let s = read(name)?;
@@ -239,12 +257,12 @@ pub fn load(d: &mut Daemon, name: &str) -> Result<()> {
     adopt_live_foreign(d, &s.windows);
     spawn_missing_foreign(d, &s.windows)?;
     // Окна приложений: недостающие запускаются в ячейку активного workspace или на парковку.
-    for w in s.windows.iter().filter(|w| w.app.is_some()) {
-        let app = w.app.clone().unwrap();
-        if clients.iter().any(|c| c.app().as_deref() == Some(&app)) {
-            continue;
-        }
-        let desktop = w.desktop.parse::<u8>().ok();
+    let starts: Vec<(String, String)> = apps_to_start(&s.windows, &|app| !crate::daemon::app_windows(d.cfg(), &clients, app).is_empty())
+        .into_iter()
+        .map(|w| (w.app.clone().unwrap_or_default(), w.desktop.clone()))
+        .collect();
+    for (app, desk) in starts {
+        let desktop = desk.parse::<u8>().ok();
         let ws = desktop
             .and_then(|n| s.desktops.get(&n.to_string()))
             .and_then(|x| x.active.clone())
@@ -269,4 +287,31 @@ pub fn load(d: &mut Daemon, name: &str) -> Result<()> {
     d.broadcast();
     log::info!("сессия {name} загружена");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::PxRect;
+
+    fn win(app: Option<&str>, desktop: &str) -> SessionWindow {
+        SessionWindow {
+            app: app.map(String::from),
+            workspace: None,
+            desktop: desktop.to_string(),
+            rect: PxRect { x: 0, y: 0, w: 10, h: 10 },
+            cmd: vec![],
+            cwd: None,
+        }
+    }
+
+    #[test]
+    fn snapshot_with_two_windows_starts_one_instance() {
+        // У chromium в снимке два окна, живых окон нет: запускается один
+        // экземпляр. У neovide окно живо, запускать нечего.
+        let windows = vec![win(Some("chromium"), "1"), win(Some("chromium"), "1"), win(Some("neovide"), "1"), win(None, "3")];
+        let picked = apps_to_start(&windows, &|app| app == "neovide");
+        assert_eq!(picked.len(), 1);
+        assert_eq!(picked[0].app.as_deref(), Some("chromium"));
+    }
 }

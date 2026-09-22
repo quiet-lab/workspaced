@@ -53,10 +53,32 @@ pub struct Client {
     pub fullscreen: i32,
 }
 
+/// Разбор тега окна `app:<имя>#<номер>`: имя приложения и номер экземпляра.
+/// Тег `app:<имя>` без номера остался от прежней версии демона и читается как
+/// экземпляр без номера; звёздочку в конце добавляет правило композитора.
+pub fn parse_app_tag(tag: &str) -> Option<(String, Option<u32>)> {
+    let rest = tag.strip_prefix("app:")?.trim_end_matches('*');
+    if rest.is_empty() {
+        return None;
+    }
+    match rest.rsplit_once('#') {
+        Some((name, num)) if !name.is_empty() && num.parse::<u32>().is_ok() => Some((name.to_string(), num.parse().ok())),
+        _ => Some((rest.to_string(), None)),
+    }
+}
+
 impl Client {
-    /// Имя приложения из тега `app:<имя>` (звёздочка правила отбрасывается).
+    /// Имя приложения из тега экземпляра.
     pub fn app(&self) -> Option<String> {
-        self.tags.iter().find_map(|t| t.strip_prefix("app:").map(|s| s.trim_end_matches('*').to_string()))
+        self.app_instance().map(|(a, _)| a)
+    }
+    /// Приложение и номер экземпляра; у тега прежней версии без номера — 1.
+    pub fn app_instance(&self) -> Option<(String, u32)> {
+        self.tags.iter().find_map(|t| parse_app_tag(t)).map(|(a, n)| (a, n.unwrap_or(1)))
+    }
+    /// Теги приложения, как они записаны у окна (нужны, чтобы снять прежний тег).
+    pub fn app_tags(&self) -> impl Iterator<Item = &str> {
+        self.tags.iter().filter(|t| t.starts_with("app:")).map(|t| t.trim_end_matches('*'))
     }
     pub fn rect(&self) -> PxRect {
         PxRect { x: self.at.0, y: self.at.1, w: self.size.0, h: self.size.1 }
@@ -262,4 +284,39 @@ pub fn d_tag(addr: &str, tag: &str) -> String {
 
 pub fn d_close(addr: &str) -> String {
     format!("hl.dsp.window.close({{ {} }})", win(addr))
+}
+
+/// Окно для модульных тестов: только те поля, которые читает демон.
+#[cfg(test)]
+pub fn test_client(addr: &str, class: &str, title: &str, ws: &str, tags: &[&str]) -> Client {
+    serde_json::from_value(serde_json::json!({
+        "address": addr, "class": class, "title": title, "workspace": { "id": 1, "name": ws },
+        "tags": tags, "at": [0, 0], "size": [10, 10], "floating": true, "mapped": true
+    }))
+    .unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn app_tag_forms() {
+        assert_eq!(parse_app_tag("app:chromium#2"), Some(("chromium".to_string(), Some(2))));
+        // Тег прежней версии без номера и тег правила композитора со звёздочкой.
+        assert_eq!(parse_app_tag("app:neovide"), Some(("neovide".to_string(), None)));
+        assert_eq!(parse_app_tag("app:neovide#1*"), Some(("neovide".to_string(), Some(1))));
+        // Чужой тег и мусор после «#» приложением не считаются.
+        assert_eq!(parse_app_tag("pin:1"), None);
+        assert_eq!(parse_app_tag("app:"), None);
+        assert_eq!(parse_app_tag("app:x#y"), Some(("x#y".to_string(), None)));
+
+        let c = test_client("0x1", "chromium", "Новости", "1", &["app:chromium#3"]);
+        assert_eq!(c.app_instance(), Some(("chromium".to_string(), 3)));
+        assert_eq!(c.app().as_deref(), Some("chromium"));
+        assert_eq!(c.app_tags().collect::<Vec<_>>(), vec!["app:chromium#3"]);
+        // Тег без номера — экземпляр 1.
+        let old = test_client("0x2", "neovide", "[Scratch]", "1", &["app:neovide"]);
+        assert_eq!(old.app_instance(), Some(("neovide".to_string(), 1)));
+    }
 }

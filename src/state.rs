@@ -71,17 +71,27 @@ impl State {
         })
     }
 
-    /// Прямоугольник окна приложения в workspace: ячейка шаблона или `rect`, как
-    /// записано в конфиге, без отступов от демона.
+    /// Место окна приложения по правилу из спецификации ws-daemon
+    /// («Расстановка окон»): ячейка или `rect`, записанные для приложения
+    /// в workspace; то же, записанное для его семейства; `rect` самого
+    /// приложения; иначе места нет и окно встаёт в центр экрана.
+    /// Прямоугольник передаётся композитору как записан, без отступов от демона.
     pub fn rect_for(&mut self, cfg: &Config, ws: &str, app: &str, mon: (i32, i32)) -> Option<PxRect> {
-        let place = self.cells_of(cfg, ws, mon).get(app)?.clone();
+        let cells = self.cells_of(cfg, ws, mon);
+        let place = cells.get(app).cloned().or_else(|| cfg.family_of(app).and_then(|f| cells.get(f).cloned()));
         match place {
-            Place::Cell(c) => {
+            Some(Place::Cell(c)) => {
                 let t = cfg.templates.get(&cfg.workspaces.get(ws)?.template)?;
                 Some(t.cells.get(&c)?.resolve(mon.0, mon.1))
             }
-            Place::Rect { rect } => Some(rect),
+            Some(Place::Rect { rect }) => Some(rect),
+            None => Self::app_rect(cfg, app, mon),
         }
+    }
+
+    /// Положение и размер окна приложения по умолчанию (`rect` у `[apps.<имя>]`).
+    pub fn app_rect(cfg: &Config, app: &str, mon: (i32, i32)) -> Option<PxRect> {
+        cfg.apps.get(app)?.rect.as_ref().map(|r| r.resolve(mon.0, mon.1))
     }
 
     /// Приложение, стоящее сейчас в главной ячейке workspace.
@@ -130,4 +140,55 @@ pub struct Session {
     pub workspaces: BTreeMap<String, SessionWorkspace>,
     #[serde(default)]
     pub windows: Vec<SessionWindow>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CFG: &str = r#"
+[templates.thirds]
+main = "center"
+[templates.thirds.cells]
+left   = { x = -805, y = 10, w = 1920, h = 2140 }
+center = { x = 1125, y = 10, w = 1920, h = 2140 }
+right  = { x = 3055, y = 10, w = 1920, h = 2140 }
+
+[apps.wezterm]
+class = "^org\\.wezfurlong\\.wezterm$"
+
+[apps.herdr]
+family = "wezterm"
+cmd = "wezterm-gui"
+class = "^wezterm-herdr$"
+
+[apps.neovide]
+cmd = "neovide"
+rect = { x = 2600, y = 1500, w = 600, h = 400 }
+
+[workspaces.work]
+template = "thirds"
+main = "wezterm"
+apps = { wezterm = "center" }
+"#;
+
+    #[test]
+    fn place_rule_four_steps() {
+        let cfg = Config::parse(CFG).unwrap();
+        let mon = (3840, 2160);
+        let mut st = State::default();
+        // Ячейка приложения в workspace.
+        assert_eq!(st.rect_for(&cfg, "work", "wezterm", mon), Some(PxRect { x: 1125, y: 10, w: 1920, h: 2140 }));
+        // Вариант в workspace не описан: место берётся у семейства.
+        assert_eq!(st.rect_for(&cfg, "work", "herdr", mon), Some(PxRect { x: 1125, y: 10, w: 1920, h: 2140 }));
+        // Ни приложения, ни семейства в workspace нет: rect приложения.
+        assert_eq!(st.rect_for(&cfg, "work", "neovide", mon), Some(PxRect { x: 2600, y: 1500, w: 600, h: 400 }));
+        // Ни места в workspace, ни rect приложения: места нет, окно идёт в центр экрана.
+        st.cells_of(&cfg, "work", mon).clear();
+        assert_eq!(st.rect_for(&cfg, "work", "wezterm", mon), None);
+        // Вариант с собственным местом в workspace побеждает семейство.
+        let mut st = State::default();
+        st.cells_of(&cfg, "work", mon).insert("herdr".into(), Place::Cell("left".into()));
+        assert_eq!(st.rect_for(&cfg, "work", "herdr", mon), Some(PxRect { x: -805, y: 10, w: 1920, h: 2140 }));
+    }
 }

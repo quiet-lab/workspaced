@@ -204,8 +204,11 @@ fn check() -> anyhow::Result<()> {
     for w in cfg.workspaces.keys() {
         println!("  workspace {w}");
     }
-    for a in cfg.apps.keys() {
-        println!("  приложение {a}");
+    for (a, app) in &cfg.apps {
+        match &app.family {
+            Some(f) => println!("  приложение {a} (вариант семейства {f})"),
+            None => println!("  приложение {a}"),
+        }
     }
     for t in cfg.templates.keys() {
         println!("  шаблон {t}");
