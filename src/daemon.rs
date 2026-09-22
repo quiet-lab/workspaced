@@ -182,6 +182,10 @@ pub fn run() -> Result<()> {
     }
     let mut d = Daemon { cfg: cfg.clone(), cfg_file: cfg, cfg_text, cfg_path, expected: Vec::new(), hypr, st: State::default(), mon, current, pending: Vec::new(), subs: Vec::new(), tx: tx.clone(), maximized: HashMap::new() };
     d.startup()?;
+    // Конфиг при старте прочитан выше, значит привязки в нём могут быть новее
+    // тех, что знает композитор: файл могли поправить, пока демон не работал,
+    // или демон перезапустили с бинарником, где появились новые действия.
+    reload_hypr_binds();
     log::info!("демон запущен, стол {}, монитор {}×{}", d.current, d.mon.0, d.mon.1);
     for msg in rx {
         match msg {
@@ -284,6 +288,21 @@ fn watch_config(path: PathBuf, tx: Sender<Msg>) {
     }
 }
 
+/// Перечитать конфиг композитора, чтобы он заново выполнил `hyprland.lua`,
+/// а тот — `workspaced keys --lua`: только так новые привязки попадают
+/// в Hyprland. Вызывается при старте демона и после каждого удачного
+/// перечитывания файла конфига. Неудача — предупреждение, а не ошибка:
+/// при старте сессии композитор мог ещё не открыть свой сокет, но привязки
+/// там и без того свежие — `hyprland.lua` выполняется при старте сессии
+/// и читает конфиг сам, без демона.
+fn reload_hypr_binds() {
+    match Command::new("hyprctl").arg("reload").arg("config-only").output() {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => log::warn!("hyprctl reload: {}", String::from_utf8_lossy(&o.stderr)),
+        Err(e) => log::warn!("hyprctl reload: {e}"),
+    }
+}
+
 /// Ждать выхода запущенного процесса в отдельном потоке и сообщить о нём
 /// демону. Так выход процесса становится событием, и опрос `try_wait`
 /// по таймеру не нужен; заодно поток забирает код возврата, и процесса-зомби
@@ -331,11 +350,7 @@ impl Daemon {
                 self.drop_stale_pending();
                 self.free_stale_tagged();
                 log::info!("конфиг перечитан: {} workspace, {} приложений", self.cfg.workspaces.len(), self.cfg.apps.len());
-                match Command::new("hyprctl").arg("reload").arg("config-only").output() {
-                    Ok(o) if o.status.success() => {}
-                    Ok(o) => log::warn!("hyprctl reload: {}", String::from_utf8_lossy(&o.stderr)),
-                    Err(e) => log::warn!("hyprctl reload: {e}"),
-                }
+                reload_hypr_binds();
                 self.broadcast();
             }
             Err(e) => log::error!("конфиг не перечитан, действует прежний: {e:#}"),
