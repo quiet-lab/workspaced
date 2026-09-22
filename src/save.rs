@@ -263,7 +263,10 @@ pub fn save_workspace(d: &mut Daemon) -> Result<String> {
     // Дополнительные приложения сессии этого workspace перешли в конфиг.
     d.state_mut().cells.remove(&ws);
     d.state_mut().extra.remove(&ws);
-    d.reload_config();
+    // Перечитывать конфиг здесь не нужно: запись во временный файл
+    // с переименованием — завершённая запись, и наблюдатель каталога
+    // присылает демону событие сам. Явный вызов давал второе перечитывание
+    // и второй `hyprctl reload config-only` на одно сохранение.
     log::info!("workspace {ws} записан в конфиг");
     Ok(ws)
 }

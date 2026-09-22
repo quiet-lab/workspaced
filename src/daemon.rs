@@ -328,6 +328,8 @@ impl Daemon {
                 // в нетронутых workspace сохраняется.
                 keep_cells(&old, &self.cfg_file, &mut self.st.cells);
                 self.rebuild_cfg();
+                self.drop_stale_pending();
+                self.free_stale_tagged();
                 log::info!("конфиг перечитан: {} workspace, {} приложений", self.cfg.workspaces.len(), self.cfg.apps.len());
                 match Command::new("hyprctl").arg("reload").arg("config-only").output() {
                     Ok(o) if o.status.success() => {}
@@ -368,6 +370,47 @@ impl Daemon {
             }
         }
         self.cfg = cfg;
+    }
+
+    /// Снять ожидания окон для приложений, которых в эффективном конфиге
+    /// больше нет: ждать такое окно некому и незачем, а запись с мёртвым pid
+    /// иначе остаётся в `pending` до перезапуска демона. Запущенный процесс
+    /// не убивается — если его окно всё-таки появится, оно придёт посторонним.
+    /// Вызывается там же, где освобождаются окна снятых приложений.
+    pub fn drop_stale_pending(&mut self) {
+        let apps: Vec<String> = self.pending.iter().map(|p| p.app.clone()).collect();
+        let stale = stale_pending(&self.cfg, &apps);
+        for app in &stale {
+            log::info!("ожидание окна {app} снято: приложения в конфиге больше нет");
+        }
+        self.pending.retain(|p| !stale.contains(&p.app));
+    }
+
+    /// Освободить окна, чей тег называет приложение, которого в эффективном
+    /// конфиге больше нет (спецификация ws-daemon, «Захват открытых окон
+    /// приложения»): тег экземпляра снимается в композиторе, окно заводится
+    /// как постороннее. Вызывается после каждой пересборки эффективного
+    /// конфига, потому что именно она решает, какие приложения существуют.
+    pub fn free_stale_tagged(&mut self) {
+        let clients = match self.hypr.clients() {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!("сверка тегов окон с конфигом: {e:#}");
+                return;
+            }
+        };
+        let stale: Vec<Client> = stale_tagged(&self.cfg, &clients).into_iter().cloned().collect();
+        for c in &stale {
+            let app = c.app().unwrap_or_default();
+            let ex: Vec<String> = c.app_tags().map(|t| hypr::d_untag(&c.address, t)).collect();
+            if let Err(e) = self.hypr.dispatch_all(&ex) {
+                log::warn!("окно {} ({}): тег приложения {app} не снят: {e:#}", c.address, c.class);
+                continue;
+            }
+            let (cmd, cwd) = proc_info(c.pid);
+            self.st.foreign.insert(c.address.clone(), Foreign { rect: c.rect(), cmd, cwd });
+            log::info!("окно {} ({}): приложения {app} в конфиге больше нет, окно свободно", c.address, c.class);
+        }
     }
 
     pub fn cfg(&self) -> &Config {
@@ -661,7 +704,7 @@ impl Daemon {
         for (i, app, num) in adopt_plan(&self.cfg, clients, apps)? {
             let addr = clients[i].address.clone();
             let tag = format!("app:{app}#{num}");
-            let mut ex: Vec<String> = clients[i].app_tags().map(|t| hypr::d_tag(&addr, &format!("-{t}"))).collect();
+            let mut ex: Vec<String> = clients[i].app_tags().map(|t| hypr::d_untag(&addr, t)).collect();
             ex.push(hypr::d_tag(&addr, &tag));
             self.hypr.dispatch_all(&ex)?;
             clients[i].tags.retain(|t| !t.starts_with("app:"));
@@ -762,6 +805,9 @@ impl Daemon {
         let main_app = self.st.main_app(&self.cfg, ws, self.mon);
         let main_cell = self.cfg.templates[&self.cfg.workspaces[ws].template].main.clone();
         if main_app.as_deref() != Some(app) {
+            // Обмен виден потом в снимке сессии и в записи workspace, поэтому
+            // след в журнале нужен: иначе причину перестановки не восстановить.
+            log::info!("{ws}: {app} становится главным, прежнее главное — {}", main_app.as_deref().unwrap_or("нет"));
             swap_cells(self.st.cells_of(&self.cfg, ws, self.mon), main_app.as_deref(), app, &main_cell);
         }
         let mut ex = Vec::new();
@@ -1186,10 +1232,56 @@ fn ancestors(pid: i32) -> Vec<i32> {
     chain
 }
 
-/// Командная строка и каталог процесса окна.
+/// Имя юнита systemd с раскодированными последовательностями `\xNN`:
+/// точку и прочие особые символы systemd записывает именно так.
+fn unescape_unit(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match (b[i], b.get(i + 1)) {
+            (b'\\', Some(b'x')) if i + 4 <= b.len() && u8::from_str_radix(&s[i + 2..i + 4], 16).is_ok() => {
+                out.push(u8::from_str_radix(&s[i + 2..i + 4], 16).unwrap());
+                i += 4;
+            }
+            (c, _) => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Идентификатор приложения flatpak по содержимому `/proc/<pid>/cgroup`.
+/// Процесс в песочнице лежит в юните вида `app-flatpak-<идентификатор>-<номер>.scope`;
+/// хвост `-<номер>` добавляет systemd, поэтому он отбрасывается. Если юнита
+/// такого вида нет, процесс работает не в песочнице.
+pub fn flatpak_app_id(cgroup: &str) -> Option<String> {
+    let scope = cgroup.split(['/', '\n']).find(|p| p.starts_with("app-flatpak-") && p.ends_with(".scope"))?;
+    let body = scope.strip_prefix("app-flatpak-")?.strip_suffix(".scope")?;
+    let id = match body.rsplit_once('-') {
+        Some((id, num)) if !id.is_empty() && !num.is_empty() && num.bytes().all(|b| b.is_ascii_digit()) => id,
+        _ => body,
+    };
+    let id = unescape_unit(id);
+    (!id.is_empty()).then_some(id)
+}
+
+/// Командная строка и каталог процесса окна. У процесса в песочнице flatpak
+/// путь к исполняемому файлу (`/app/…`) и рабочий каталог существуют только
+/// внутри песочницы: с хоста по ним ничего не запустить, и окно из снимка
+/// сессии не восстановилось бы. Поэтому командной строкой такого окна
+/// считается `flatpak run <идентификатор>` с исходными аргументами процесса,
+/// а каталог не записывается.
 pub fn proc_info(pid: i32) -> (Vec<String>, Option<String>) {
-    let cmd = std::fs::read(format!("/proc/{pid}/cmdline")).map(|b| b.split(|&x| x == 0).filter(|s| !s.is_empty()).map(|s| String::from_utf8_lossy(s).into_owned()).collect()).unwrap_or_default();
+    let cmd: Vec<String> = std::fs::read(format!("/proc/{pid}/cmdline")).map(|b| b.split(|&x| x == 0).filter(|s| !s.is_empty()).map(|s| String::from_utf8_lossy(s).into_owned()).collect()).unwrap_or_default();
     let cwd = std::fs::read_link(format!("/proc/{pid}/cwd")).ok().map(|p| p.to_string_lossy().into_owned());
+    if let Some(id) = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok().and_then(|c| flatpak_app_id(&c)) {
+        let mut out = vec!["flatpak".to_string(), "run".to_string(), id];
+        out.extend(cmd.into_iter().skip(1));
+        return (out, None);
+    }
     (cmd, cwd)
 }
 
@@ -1338,6 +1430,22 @@ pub fn app_for_window(cfg: &Config, c: &Client) -> Option<String> {
         .into_iter()
         .find(|n| matches!(cfg.apps[*n].matchers(), Ok(Some((cr, tr))) if matcher_fits(Some(&cr), tr.as_ref(), c)))
         .cloned()
+}
+
+/// Окна, которые пора освободить: тег называет приложение, которого
+/// в эффективном конфиге нет. Такое окно никому не принадлежит, поэтому
+/// считается посторонним (спецификация ws-daemon, «Захват открытых окон
+/// приложения»). Дополнительные приложения сессии к этому моменту уже входят
+/// в эффективный конфиг, и их окна здесь не выбираются.
+pub fn stale_tagged<'a>(cfg: &Config, clients: &'a [Client]) -> Vec<&'a Client> {
+    clients.iter().filter(|c| c.app().is_some_and(|a| !cfg.apps.contains_key(&a))).collect()
+}
+
+/// Приложения ожидания, чьи записи пора снять: приложения нет в эффективном
+/// конфиге, значит запускать и ждать нечего. На одно приложение ожидание
+/// заводится не больше одного, поэтому записи выбираются по имени.
+pub fn stale_pending(cfg: &Config, apps: &[String]) -> Vec<String> {
+    apps.iter().filter(|a| !cfg.apps.contains_key(*a)).cloned().collect()
 }
 
 /// Наименьший свободный номер, начиная с 1, среди занятых.
@@ -1676,6 +1784,71 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
         assert_eq!(app_for_window(&cfg, &news).as_deref(), Some("chromium"));
         // Окно, которому не подходит ни одно приложение конфига.
         assert_eq!(app_for_window(&cfg, &alien), None);
+    }
+
+    #[test]
+    fn stale_tags_are_freed_only_for_unknown_apps() {
+        let cfg = Config::parse(CFG).unwrap();
+        let live = client("0x1", "chromium", "Новости", "1", &["app:chromium#1"]);
+        let variant = client("0x2", "wezterm-herdr", "herdr · dev-lab", "1", &["app:herdr#1"]);
+        // Приложение, которого в конфиге нет: сохранение записало его в файл,
+        // а файл откатили.
+        let gone = client("0x3", "Alacritty", "bash", "1", &["app:alacritty#1"]);
+        // Тег прежней версии демона, без номера экземпляра.
+        let gone_old = client("0x4", "Galculator", "Калькулятор", "1", &["app:galculator"]);
+        // Свободное окно: освобождать нечего, тега приложения у него нет.
+        let free = client("0x5", "Galculator", "Калькулятор", "1", &["pin:1"]);
+        let clients = vec![live, variant, gone, gone_old, free];
+
+        let addrs = |cfg: &Config| stale_tagged(cfg, &clients).iter().map(|c| c.address.clone()).collect::<Vec<_>>();
+        assert_eq!(addrs(&cfg), vec!["0x3".to_string(), "0x4".to_string()]);
+
+        // Дополнительное приложение сессии входит в эффективный конфиг,
+        // и его окно свободным не становится.
+        let rect = PxRect { x: 100, y: 200, w: 800, h: 600 };
+        let mut extra: BTreeMap<String, BTreeMap<String, ExtraApp>> = BTreeMap::new();
+        extra.entry("work".into()).or_default().insert("galculator".into(), ExtraApp { class: Some("Galculator".into()), cmd: vec!["galculator".into()], cwd: None, rect });
+        let (eff, dropped) = merge_extra(&cfg, &extra);
+        assert!(dropped.is_empty());
+        assert_eq!(addrs(&eff), vec!["0x3".to_string()]);
+    }
+
+    #[test]
+    fn flatpak_app_id_from_cgroup() {
+        // Строка из живой системы: окно Postman из flatpak.
+        let postman = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-flatpak-com.getpostman.Postman-1890165170.scope\n";
+        assert_eq!(flatpak_app_id(postman).as_deref(), Some("com.getpostman.Postman"));
+        // Обычный процесс: юнита flatpak нет, командная строка берётся как есть.
+        let plain = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/workspaced.service\n";
+        assert_eq!(flatpak_app_id(plain), None);
+        assert_eq!(flatpak_app_id(""), None);
+        // Особые символы systemd записывает как \xNN.
+        let escaped = r"0::/user.slice/app-flatpak-com\x2egetpostman\x2ePostman-17.scope";
+        assert_eq!(flatpak_app_id(escaped).as_deref(), Some("com.getpostman.Postman"));
+        // Идентификатор с дефисом: отбрасывается только числовой хвост.
+        let dashed = "0::/app.slice/app-flatpak-org.gnome.gedit-tools-42.scope";
+        assert_eq!(flatpak_app_id(dashed).as_deref(), Some("org.gnome.gedit-tools"));
+    }
+
+    #[test]
+    fn stale_pending_is_dropped_only_for_unknown_apps() {
+        let cfg = Config::parse(CFG).unwrap();
+        // `failtest` в конфиг добавляли и откатили: ожидание его окна ждёт
+        // приложения, которого больше нет, и снимается вместе с мёртвым pid.
+        let apps = ["chromium".to_string(), "herdr".to_string(), "failtest".to_string()];
+        assert_eq!(stale_pending(&cfg, &apps), vec!["failtest".to_string()]);
+
+        // Дополнительное приложение сессии входит в эффективный конфиг,
+        // и ожидание его окна не снимается.
+        let rect = PxRect { x: 100, y: 200, w: 800, h: 600 };
+        let mut extra: BTreeMap<String, BTreeMap<String, ExtraApp>> = BTreeMap::new();
+        extra.entry("work".into()).or_default().insert("galculator".into(), ExtraApp { class: Some("Galculator".into()), cmd: vec!["galculator".into()], cwd: None, rect });
+        let (eff, dropped) = merge_extra(&cfg, &extra);
+        assert!(dropped.is_empty());
+        let apps = ["galculator".to_string(), "failtest".to_string()];
+        assert_eq!(stale_pending(&eff, &apps), vec!["failtest".to_string()]);
+        // Пока приложение в конфиге есть, ожидание живёт до окна.
+        assert!(stale_pending(&cfg, &["neovide".to_string()]).is_empty());
     }
 
     #[test]

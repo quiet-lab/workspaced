@@ -282,6 +282,12 @@ pub fn d_tag(addr: &str, tag: &str) -> String {
     format!("hl.dsp.window.tag({{ tag = \"{tag}\", {} }})", win(addr))
 }
 
+/// Снять тег с окна. У диспетчера `tagwindow` префикс «-» снимает тег, «+»
+/// ставит, а без префикса тег переключается, поэтому снятие пишется явно.
+pub fn d_untag(addr: &str, tag: &str) -> String {
+    d_tag(addr, &format!("-{tag}"))
+}
+
 pub fn d_close(addr: &str) -> String {
     format!("hl.dsp.window.close({{ {} }})", win(addr))
 }

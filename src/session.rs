@@ -187,7 +187,13 @@ fn apply_lists(d: &mut Daemon, s: &Session) {
 }
 
 /// Живые окна без тега сопоставляются с посторонними окнами снимка по команде и каталогу.
+/// Сверка начинается с приложений, которых в эффективном конфиге уже нет:
+/// ожидания их окон снимаются, а с их окон снимается тег, и такое окно попадает
+/// в сопоставление наравне с прочими посторонними. Список клиентов читается
+/// после освобождения, поэтому теги в нём уже сняты.
 fn adopt_live_foreign(d: &mut Daemon, snapshot: &[SessionWindow]) {
+    d.drop_stale_pending();
+    d.free_stale_tagged();
     let Ok(clients) = d.clients() else { return };
     let mut used = vec![false; snapshot.len()];
     let st = d.state_mut();
