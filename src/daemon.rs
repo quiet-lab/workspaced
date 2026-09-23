@@ -845,6 +845,13 @@ impl Daemon {
     }
 
     pub fn raise(&mut self, ws: &str, desktop: Option<u8>) -> Result<()> {
+        self.raise_on(ws, desktop, true)
+    }
+
+    /// Поднятие workspace. `focus` — перейти на стол и отдать фокус главному
+    /// окну; без него окна встают на стол, но композитор остаётся на прежнем
+    /// столе и фокус не меняется (преемник после переноса workspace).
+    fn raise_on(&mut self, ws: &str, desktop: Option<u8>, focus: bool) -> Result<()> {
         if !self.cfg.workspaces.contains_key(ws) {
             bail!("workspace {ws} не найден");
         }
@@ -872,7 +879,7 @@ impl Daemon {
             self.remember_geometry(&old, &clients);
         }
         let mut ex = Vec::new();
-        if n != self.current {
+        if focus && n != self.current {
             ex.push(hypr::d_focus_desktop(n));
             self.current = n;
         }
@@ -887,7 +894,7 @@ impl Daemon {
             let wins = placed_windows(&self.cfg, &clients, &apps, app);
             if wins.is_empty() {
                 let target = rect.map(Target::Place).unwrap_or(Target::Free(None));
-                self.spawn(app, Some(ws), n, target, main_app.as_deref() == Some(app))?;
+                self.spawn(app, Some(ws), n, target, focus && main_app.as_deref() == Some(app))?;
                 continue;
             }
             for c in wins.iter().filter(|c| !c.on_hidden()) {
@@ -925,7 +932,7 @@ impl Daemon {
                 ex.push(hypr::d_move_to(&c.address, "special:pool"));
             }
         }
-        if let Some(a) = &main_addr {
+        if let Some(a) = main_addr.as_ref().filter(|_| focus) {
             ex.push(hypr::d_focus_window(a));
         }
         // Порядок окон по глубине задаётся явно, окно за окном снизу вверх.
@@ -1210,7 +1217,9 @@ impl Daemon {
     /// (спецификация ws-daemon, «Перенос workspace на стол»). Перенос — это
     /// поднятие с явным столом, поэтому остальное делает `raise`: окна всех
     /// приложений переезжают, а workspace, активный на столе `n`, сворачивается
-    /// на `special:pool` по общему правилу.
+    /// на `special:pool` по общему правилу. На прежнем столе активным становится
+    /// преемник (`successor`): его окна возвращаются на тот стол, а композитор
+    /// остаётся на столе `n`.
     pub fn move_desktop(&mut self, n: u8) -> Result<()> {
         if !(1..=8).contains(&n) {
             bail!("стол должен быть от 1 до 8, получено {n}");
@@ -1227,10 +1236,26 @@ impl Daemon {
                 Ok(())
             }
             MoveStep::Move(ws) => {
+                // Преемник на прежнем столе выбирается по списку и истории
+                // до переноса: перенос убирает workspace из списка.
+                let next = self.st.desktops.get(&cur).and_then(|d| successor(&d.workspaces, &ws, self.st.prev_active.get(&cur).map(String::as_str)));
                 // Окна встают на новом столе туда, где стояли на прежнем,
                 // в обоих режимах: это делает `raise` (`raise_target`).
                 log::info!("перенос workspace {ws} со стола {cur} на стол {n}");
-                self.raise(&ws, Some(n))
+                self.raise(&ws, Some(n))?;
+                // Преемник поднимается сразу, без перехода: его окна
+                // возвращаются на прежний стол, а композитор и фокус остаются
+                // у перенесённого workspace.
+                match next {
+                    Some(p) => {
+                        log::info!("стол {cur}: активным становится {p}");
+                        self.raise_on(&p, Some(cur), false)
+                    }
+                    None => {
+                        log::info!("стол {cur}: других workspace нет, активного не остаётся");
+                        Ok(())
+                    }
+                }
             }
         }
     }
@@ -1926,8 +1951,9 @@ pub fn detach_step(cfg: &Config, clients: &[Client], ws: Option<&str>, extra: &B
 
 /// Стол `n` принимает workspace (спецификация ws-daemon, «Поднятие workspace
 /// на столе», решение D16). Workspace числится ровно на одном столе, поэтому
-/// из списков остальных столов он убирается; стол, где он был активным,
-/// остаётся без активного workspace. Ленивое поднятие, назначенное этому
+/// из списков остальных столов он убирается; на столе, где он был активным,
+/// активного workspace здесь не остаётся, преемника поднимает команда
+/// переноса (`successor`). Ленивое поднятие, назначенное этому
 /// workspace на прежнем столе, тоже снимается: там его больше нет, и первый
 /// переход на тот стол не должен возвращать workspace туда.
 pub fn assign_desktop(st: &mut State, ws: &str, n: u8) {
@@ -1945,7 +1971,33 @@ pub fn assign_desktop(st: &mut State, ws: &str, n: u8) {
     if !d.workspaces.iter().any(|x| x == ws) {
         d.workspaces.push(ws.to_string());
     }
-    d.active = Some(ws.to_string());
+    // История активности стола: вытесненный workspace становится прежним
+    // активным. Стол, с которого workspace ушёл, историю не меняет: там она
+    // по-прежнему называет workspace, активный до ушедшего.
+    let old = d.active.replace(ws.to_string());
+    if let Some(old) = old.filter(|o| o != ws) {
+        st.prev_active.insert(n, old);
+    }
+}
+
+/// Преемник на столе, с которого workspace `moved` перенесён на другой стол
+/// (спецификация ws-daemon, «Перенос workspace на стол»). `list` — список
+/// стола до переноса, `prev` — workspace, активный на столе до перенесённого.
+/// Преемник — `prev`, если он ещё в списке; иначе workspace, стоящий в списке
+/// перед перенесённым, а для первого в списке — последний (по кругу). Кроме
+/// перенесённого, в списке никого нет — преемника нет.
+pub fn successor(list: &[String], moved: &str, prev: Option<&str>) -> Option<String> {
+    if let Some(p) = prev.filter(|p| *p != moved && list.iter().any(|w| w == p)) {
+        return Some(p.to_string());
+    }
+    let rest: Vec<&String> = list.iter().filter(|w| *w != moved).collect();
+    if rest.is_empty() {
+        return None;
+    }
+    let idx = list.iter().position(|w| w == moved).unwrap_or(0);
+    // Workspace перед перенесённым; перенесённый первый — последний в списке.
+    let pick = if idx > 0 { &list[idx - 1] } else { rest[rest.len() - 1] };
+    Some(pick.clone())
 }
 
 /// Следующий workspace в списке стола (спецификация ws-daemon, сценарий
@@ -2945,7 +2997,8 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
         st.desktops.insert(2, Desktop { workspaces: vec!["chat".into()], active: Some("chat".into()) });
         st.lazy.insert(3, "surf".into());
         assign_desktop(&mut st, "surf", 2);
-        // На прежнем столе surf не числится и активным там никто не стал.
+        // На прежнем столе surf не числится и активным там никто не стал:
+        // преемника поднимает команда переноса, а не назначение стола.
         assert_eq!(st.desktops[&1].workspaces, vec!["work".to_string()]);
         assert_eq!(st.desktops[&1].active, None);
         // На новом столе surf встал в конец списка и стал активным.
@@ -2958,6 +3011,64 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
         assign_desktop(&mut st, "chat", 2);
         assert_eq!(st.desktops[&2].workspaces, vec!["chat".to_string(), "surf".to_string()]);
         assert_eq!(st.desktops[&2].active.as_deref(), Some("chat"));
+    }
+
+    #[test]
+    fn assign_desktop_records_previous_active() {
+        let mut st = State::default();
+        assign_desktop(&mut st, "surf", 1);
+        // Первый активный на столе: прежнего нет.
+        assert!(!st.prev_active.contains_key(&1));
+        assign_desktop(&mut st, "work", 1);
+        assert_eq!(st.prev_active.get(&1).map(String::as_str), Some("surf"));
+        // Повторное поднятие того же workspace историю не портит.
+        assign_desktop(&mut st, "work", 1);
+        assert_eq!(st.prev_active.get(&1).map(String::as_str), Some("surf"));
+        // Уход work на другой стол историю стола 1 не меняет: преемник — surf.
+        assign_desktop(&mut st, "work", 5);
+        assert_eq!(st.prev_active.get(&1).map(String::as_str), Some("surf"));
+        assert!(!st.prev_active.contains_key(&5));
+    }
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn successor_prefers_previous_active() {
+        let list = names(&["a", "b", "c", "d"]);
+        // История называет workspace из списка: он и становится активным.
+        assert_eq!(successor(&list, "c", Some("a")).as_deref(), Some("a"));
+        assert_eq!(successor(&list, "a", Some("d")).as_deref(), Some("d"));
+    }
+
+    #[test]
+    fn successor_without_history_takes_previous_in_list() {
+        let list = names(&["a", "b", "c"]);
+        // Средний — предыдущий по списку.
+        assert_eq!(successor(&list, "b", None).as_deref(), Some("a"));
+        assert_eq!(successor(&list, "c", None).as_deref(), Some("b"));
+        // Первый — по кругу последний.
+        assert_eq!(successor(&list, "a", None).as_deref(), Some("c"));
+        // Двое на столе: остаётся второй, с какой стороны ни считать.
+        assert_eq!(successor(&names(&["a", "b"]), "a", None).as_deref(), Some("b"));
+        assert_eq!(successor(&names(&["a", "b"]), "b", None).as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn successor_ignores_stale_history() {
+        let list = names(&["a", "b", "c"]);
+        // Workspace из истории уже не на этом столе: правило списка.
+        assert_eq!(successor(&list, "b", Some("x")).as_deref(), Some("a"));
+        // История называет сам перенесённый workspace: тоже правило списка.
+        assert_eq!(successor(&list, "a", Some("a")).as_deref(), Some("c"));
+    }
+
+    #[test]
+    fn successor_none_for_single_workspace() {
+        assert_eq!(successor(&names(&["a"]), "a", None), None);
+        assert_eq!(successor(&names(&["a"]), "a", Some("b")), None);
+        assert_eq!(successor(&[], "a", None), None);
     }
 
     #[test]
