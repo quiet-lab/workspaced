@@ -397,8 +397,10 @@ pub struct MoveAction {
 /// Стол, workspace и приложение: `{ desktop = 3, workspace = "dots" }`.
 /// Ключ `pull` у действия приложения перетаскивает окна приложения
 /// в активный workspace текущего стола (изменение shared-windows, решение D8):
-/// `{ app = "chrome-ai", pull = true }`.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+/// `{ app = "chrome-ai", pull = true }`. Ключ `new` открывает новый экземпляр
+/// приложения вместо цикла по окнам (изменение sticky-chains, решение D6):
+/// `{ app = "neovide", new = true }`.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct TargetAction {
     #[serde(default)]
@@ -409,6 +411,8 @@ pub struct TargetAction {
     pub app: Option<String>,
     #[serde(default)]
     pub pull: Option<bool>,
+    #[serde(default)]
+    pub new: Option<bool>,
 }
 
 /// Действие демона в записи `[[binds]]` (поле `action`).
@@ -483,6 +487,77 @@ impl Bind {
     }
 }
 
+/// Допустимые значения поля `apps` состояния цепочки с выходом: клавиши
+/// приложений поднимают приложение (`raise`) или открывают новый экземпляр
+/// (`spawn`).
+pub const STICKY_APPS: [&str; 2] = ["raise", "spawn"];
+
+/// Состояние цепочки с выходом (изменение sticky-chains, решение D1). Запись
+/// `[sticky.<имя>]` — корневое состояние с сочетанием входа `enter`;
+/// дочерние состояния лежат в `states` и устроены так же, но без `enter`.
+/// Порядок клавиш и состояний — порядок файла: по нему идут строки подсказки
+/// и индикатора.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+pub struct StickyState {
+    /// Сочетание входа; допустимо только у корня.
+    #[serde(default)]
+    pub enter: Option<String>,
+    /// Подпись состояния для индикатора и подсказки; без неё — имя.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// `raise` или `spawn`: клавиши приложений Super+буква становятся
+    /// клавишами состояния (решение D5).
+    #[serde(default)]
+    pub apps: Option<String>,
+    #[serde(default)]
+    pub keys: IndexMap<String, StickyKey>,
+    #[serde(default)]
+    pub states: IndexMap<String, StickyState>,
+}
+
+/// Клавиша состояния: переход в дочернее состояние либо действие с тем же
+/// смыслом, что у записи `[[binds]]`; `exit` — после действия закрыть
+/// цепочку. Запись без действия дополняет унаследованную клавишу приложения.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct StickyKey {
+    #[serde(default)]
+    pub state: Option<String>,
+    #[serde(default)]
+    pub action: Option<Action>,
+    #[serde(default)]
+    pub exec: Option<String>,
+    #[serde(default)]
+    pub dispatch: Option<Dispatch>,
+    #[serde(default)]
+    pub lua: Option<String>,
+    #[serde(default)]
+    pub exit: bool,
+    #[serde(default)]
+    pub desc: Option<String>,
+}
+
+impl StickyKey {
+    /// Запись `[[binds]]` с действием клавиши: действие проверяется и
+    /// переводится в команду теми же функциями, что у привязок.
+    pub fn as_bind(&self, chain: &str) -> Bind {
+        Bind {
+            chain: chain.to_string(),
+            action: self.action.clone(),
+            exec: self.exec.clone(),
+            dispatch: self.dispatch.clone(),
+            lua: self.lua.clone(),
+            range: None,
+            locked: false,
+            repeating: false,
+            mouse: false,
+            release: false,
+            desc: self.desc.clone(),
+            group: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -508,6 +583,9 @@ pub struct Config {
     pub binds: Vec<Bind>,
     #[serde(default)]
     pub startup: Option<Startup>,
+    /// Цепочки с выходом в порядке файла (изменение sticky-chains).
+    #[serde(default)]
+    pub sticky: IndexMap<String, StickyState>,
 }
 
 /// Запуск приложения: программа, аргументы, рабочий каталог и сложенное окружение.
@@ -640,46 +718,59 @@ impl Config {
             {
                 bail!("привязка {:?}: пустой список dispatch", b.chain);
             }
-            match &b.action {
-                Some(Action::Named(n)) if !matches!(n.as_str(), "sessions" | "save-session" | "save-workspace" | "next-workspace" | "maximize" | "arrange" | "detach") => {
-                    bail!("привязка {:?}: неизвестное действие {n:?}", b.chain)
-                }
-                Some(Action::Half(HalfAction { half })) if !matches!(half.as_str(), "left" | "right" | "up" | "down") => {
-                    bail!("привязка {:?}: half должен быть left, right, up или down, получено {half:?}", b.chain)
-                }
-                Some(Action::Place(PlaceAction { place })) if !PLACES.contains(&place.as_str()) => {
-                    bail!("привязка {:?}: place должен быть одним из {}, получено {place:?}", b.chain, PLACES.join(", "))
-                }
-                Some(Action::Target(TargetAction { desktop, workspace, app, pull })) => {
-                    // Перетаскивание идёт в активный workspace текущего стола,
-                    // поэтому ключ pull имеет смысл только у действия приложения
-                    // без workspace.
-                    if pull.is_some() && (app.is_none() || workspace.is_some()) {
-                        bail!("привязка {:?}: ключ pull допустим только вместе с app и без workspace", b.chain);
-                    }
-                    if workspace.is_none() && app.is_none() {
-                        bail!("привязка {:?}: в action нужен workspace или app", b.chain);
-                    }
-                    if let Some(d) = desktop
-                        && !(1..=8).contains(d)
-                    {
-                        bail!("привязка {:?}: desktop должен быть от 1 до 8", b.chain);
-                    }
-                    if let Some(w) = workspace
-                        && !self.workspaces.contains_key(w)
-                    {
-                        bail!("привязка {:?}: workspace {w:?} не найден", b.chain);
-                    }
-                    if let Some(a) = app
-                        && !self.apps.contains_key(a)
-                    {
-                        bail!("привязка {:?}: приложение {a:?} не найдено", b.chain);
-                    }
-                }
-                _ => {}
-            }
+            self.check_action(b)?;
         }
         crate::keys::check_chains(self)?;
+        Ok(())
+    }
+
+    /// Проверка поля `action` записи `[[binds]]` или клавиши цепочки
+    /// с выходом (у неё `chain` — путь клавиши).
+    pub fn check_action(&self, b: &Bind) -> Result<()> {
+        match &b.action {
+            Some(Action::Named(n)) if !matches!(n.as_str(), "sessions" | "save-session" | "save-workspace" | "next-workspace" | "maximize" | "arrange" | "detach") => {
+                bail!("привязка {:?}: неизвестное действие {n:?}", b.chain)
+            }
+            Some(Action::Half(HalfAction { half })) if !matches!(half.as_str(), "left" | "right" | "up" | "down") => {
+                bail!("привязка {:?}: half должен быть left, right, up или down, получено {half:?}", b.chain)
+            }
+            Some(Action::Place(PlaceAction { place })) if !PLACES.contains(&place.as_str()) => {
+                bail!("привязка {:?}: place должен быть одним из {}, получено {place:?}", b.chain, PLACES.join(", "))
+            }
+            Some(Action::Target(TargetAction { desktop, workspace, app, pull, new })) => {
+                // Перетаскивание идёт в активный workspace текущего стола,
+                // поэтому ключ pull имеет смысл только у действия приложения
+                // без workspace.
+                if pull.is_some() && (app.is_none() || workspace.is_some()) {
+                    bail!("привязка {:?}: ключ pull допустим только вместе с app и без workspace", b.chain);
+                }
+                // Новый экземпляр открывается по правилам клавиши приложения
+                // (решение D6), поэтому workspace и перетаскивание с ним
+                // не сочетаются.
+                if new.is_some() && (app.is_none() || workspace.is_some() || pull.is_some()) {
+                    bail!("привязка {:?}: ключ new допустим только вместе с app и без workspace и pull", b.chain);
+                }
+                if workspace.is_none() && app.is_none() {
+                    bail!("привязка {:?}: в action нужен workspace или app", b.chain);
+                }
+                if let Some(d) = desktop
+                    && !(1..=8).contains(d)
+                {
+                    bail!("привязка {:?}: desktop должен быть от 1 до 8", b.chain);
+                }
+                if let Some(w) = workspace
+                    && !self.workspaces.contains_key(w)
+                {
+                    bail!("привязка {:?}: workspace {w:?} не найден", b.chain);
+                }
+                if let Some(a) = app
+                    && !self.apps.contains_key(a)
+                {
+                    bail!("привязка {:?}: приложение {a:?} не найдено", b.chain);
+                }
+            }
+            _ => {}
+        }
         Ok(())
     }
 
@@ -1158,7 +1249,7 @@ calc = { rect = { x = 2600, y = 1500, w = 600, h = 400 } }
     fn pull_action_in_binds() {
         let ok = format!("{MINIMAL}\n[[binds]]\nchain = \"SUPER+TAB v\"\naction = {{ app = \"terminal\", pull = true }}\n");
         let cfg = Config::parse(&ok).unwrap();
-        assert_eq!(cfg.binds[0].action, Some(Action::Target(TargetAction { desktop: None, workspace: None, app: Some("terminal".into()), pull: Some(true) })));
+        assert_eq!(cfg.binds[0].action, Some(Action::Target(TargetAction { desktop: None, workspace: None, app: Some("terminal".into()), pull: Some(true), new: None })));
         let binds = crate::keys::collect(&cfg).unwrap();
         let b = binds.iter().find(|b| b.source.contains("SUPER+TAB v")).unwrap();
         assert!(matches!(&b.act, crate::keys::Act::Daemon(c) if c == "workspaced app terminal --pull"), "{:?}", b.act);

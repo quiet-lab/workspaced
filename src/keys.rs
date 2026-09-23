@@ -7,13 +7,19 @@
 //! выполняет действие и сбрасывает подкарту; Escape в каждой подкарте сбрасывает
 //! без действия. Действия демона уходят подкомандой `workspaced …`, остальные
 //! (`exec`, `dispatch`, `lua`) композитор выполняет сам.
+//!
+//! Цепочка с выходом (раздел `[sticky.<имя>]`, изменение sticky-chains) —
+//! режим: сочетание входа открывает подкарту корневого состояния, и подкарта
+//! остаётся открытой после каждого действия, пока не нажата клавиша выхода,
+//! Escape или Backspace в корне. Каждое состояние — своя подкарта
+//! `ws-sticky:<имя>/<состояние>/…`; нажатия без привязки поглощает `catchall`.
 
 use std::collections::BTreeMap;
 use std::fmt::Write;
 
 use anyhow::{Result, bail};
 
-use crate::config::{Action, Bind, Config, Desk, Dispatch, HalfAction, MoveAction, PlaceAction, TargetAction};
+use crate::config::{Action, Bind, Config, Desk, Dispatch, HalfAction, MoveAction, PlaceAction, STICKY_APPS, StickyState, TargetAction};
 
 /// Одно сочетание в каноническом виде: модификаторы по фиксированному порядку,
 /// клавиша как написана.
@@ -110,6 +116,8 @@ pub enum Act {
     Dispatch(Vec<String>),
     /// Тело функции на Lua.
     Lua(String),
+    /// Вход в цепочку с выходом: открыть подкарту её корневого состояния.
+    Sticky(String),
 }
 
 impl Act {
@@ -119,10 +127,12 @@ impl Act {
             Act::Daemon(cmd) => {
                 let cmd = cmd.strip_prefix("workspaced ").unwrap_or(cmd);
                 // Цепочка клавиши приложения в списке без кавычек оболочки.
-                match cmd.strip_prefix("key '").and_then(|c| c.strip_suffix('\'')) {
-                    Some(chain) => format!("key {}", chain.replace("'\\''", "'")),
-                    None => cmd.to_string(),
+                for head in ["key --new ", "key "] {
+                    if let Some(chain) = cmd.strip_prefix(head).and_then(|c| c.strip_prefix('\'')).and_then(|c| c.strip_suffix('\'')) {
+                        return format!("{head}{}", chain.replace("'\\''", "'"));
+                    }
                 }
+                cmd.to_string()
             }
             Act::Exec(cmd) => format!("exec {cmd}"),
             Act::Dispatch(v) => format!("dispatch {}", v.join("; ")),
@@ -130,6 +140,7 @@ impl Act {
                 let first = body.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
                 format!("lua {first}{}", if body.trim().lines().count() > 1 { " …" } else { "" })
             }
+            Act::Sticky(name) => format!("sticky {name}"),
         }
     }
 }
@@ -248,7 +259,7 @@ pub(crate) fn bind_act(b: &Bind, strict: bool) -> Result<Act> {
                 None if !strict => format!("workspaced move-desktop {}", desktop.text()),
                 None => bail!("привязка {:?}: move должен быть номером стола от 1 до 8, получено {:?}", b.chain, desktop.text()),
             },
-            Action::Target(TargetAction { desktop, workspace, app, pull }) => {
+            Action::Target(TargetAction { desktop, workspace, app, pull, new }) => {
                 let mut cmd = match (workspace, app) {
                     (_, Some(a)) => format!("workspaced app {a}"),
                     (Some(w), None) => format!("workspaced raise {w}"),
@@ -262,6 +273,9 @@ pub(crate) fn bind_act(b: &Bind, strict: bool) -> Result<Act> {
                 }
                 if *pull == Some(true) {
                     cmd.push_str(" --pull");
+                }
+                if *new == Some(true) {
+                    cmd.push_str(" --new");
                 }
                 cmd
             }
@@ -357,7 +371,229 @@ pub fn collect(cfg: &Config) -> Result<Vec<Binding>> {
             out.push(Binding { chain: parse_chain(&b.chain)?, source, act, flags, origin: Some(i) });
         }
     }
+    // Сочетание входа цепочки с выходом — обычная цепочка сессии из одного
+    // звена: она проходит общие проверки совпадения, начала цепочки
+    // и `reserved` (решение D8). Клавиши состояний сочетаниями сессии
+    // не являются и сюда не попадают.
+    for (name, root) in &cfg.sticky {
+        let Some(enter) = &root.enter else {
+            bail!("sticky.{name}: нужно поле enter — сочетание входа");
+        };
+        let chain = parse_chain(enter)?;
+        if chain.len() != 1 {
+            bail!("sticky.{name}: enter {enter:?} должно быть одним сочетанием, вход звеном многозвенной цепочки не допускается");
+        }
+        out.push(Binding { chain, source: format!("sticky.{name}"), act: Act::Sticky(name.clone()), flags: Flags::default(), origin: None });
+    }
     Ok(out)
+}
+
+/// Префикс имён подкарт цепочек с выходом; по нему их узнаёт индикатор панели.
+pub const STICKY_PREFIX: &str = "ws-sticky:";
+
+/// Куда ведёт клавиша состояния.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StickyGo {
+    /// Перейти в дочернее состояние с этим именем.
+    State(String),
+    /// Выполнить действие.
+    Act(Act),
+}
+
+/// Клавиша состояния цепочки с выходом после наследования и дополнения.
+#[derive(Debug, Clone)]
+pub struct StickyBind {
+    /// Имя клавиши Hyprland без модификаторов.
+    pub key: String,
+    pub go: StickyGo,
+    pub exit: bool,
+    /// Описание из поля `desc`.
+    pub desc: Option<String>,
+    /// Источник унаследованной клавиши приложения (`apps.neovide`,
+    /// `workspaces.surf.apps.chrome-ai`), если действие взято от неё.
+    pub inherited: Option<String>,
+    /// Запись с явным действием: по ней подсказка выводит описание.
+    pub explicit: Option<Bind>,
+}
+
+/// Состояние цепочки с выходом, развёрнутое в плоский список (решение D10).
+#[derive(Debug, Clone)]
+pub struct StickyNode {
+    /// Имя цепочки (`apps`).
+    pub chain: String,
+    /// Имена состояний от корня, без корня: пусто у корня.
+    pub names: Vec<String>,
+    /// Подписи состояний от корня до этого состояния включительно.
+    pub titles: Vec<String>,
+    /// Имя подкарты: `ws-sticky:apps`, `ws-sticky:apps/raise`.
+    pub submap: String,
+    /// Подкарта родителя; у корня нет.
+    pub parent: Option<String>,
+    /// Сочетание входа и клавиши переходов до этого состояния.
+    pub prefix: Chain,
+    /// Раздел конфига: `sticky.apps`, `sticky.apps.raise`.
+    pub source: String,
+    pub keys: Vec<StickyBind>,
+}
+
+impl StickyNode {
+    /// Путь клавиши состояния: вход, переходы и сама клавиша.
+    pub fn key_chain(&self, key: &str) -> Chain {
+        let mut c = self.prefix.clone();
+        c.push(Combo { mods: Vec::new(), key: key.to_string() });
+        c
+    }
+}
+
+/// Имя цепочки или состояния: входит в имя подкарты (решение D9).
+fn sticky_name(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// Клавиши приложений, которые наследует состояние с полем `apps`
+/// (решение D5): цепочки клавиш приложений из одного сочетания
+/// с модификатором ровно Super. Возвращает клавишу в нижнем регистре,
+/// цепочку и источник, в порядке цепочек приложений.
+fn app_keys(binds: &[Binding]) -> Vec<(String, Chain, String)> {
+    binds
+        .iter()
+        .filter(|b| b.origin.is_none() && b.chain.len() == 1 && b.chain[0].mods == ["SUPER"])
+        .filter(|b| matches!(&b.act, Act::Daemon(c) if c.starts_with("workspaced key ")))
+        .map(|b| (b.chain[0].key.to_ascii_lowercase(), b.chain.clone(), b.source.clone()))
+        .collect()
+}
+
+/// Все состояния всех цепочек с выходом в порядке обхода (корень, затем
+/// дочерние по порядку файла, вглубь) с проверками решений D2, D3, D5.
+pub fn sticky_nodes(cfg: &Config) -> Result<Vec<StickyNode>> {
+    let binds = collect(cfg)?;
+    let inherited = app_keys(&binds);
+    let mut out = Vec::new();
+    for (name, root) in &cfg.sticky {
+        if !sticky_name(name) {
+            bail!("sticky.{name}: имя цепочки должно состоять из латинских строчных букв, цифр и дефиса");
+        }
+        let enter = binds.iter().find(|b| b.act == Act::Sticky(name.clone())).map(|b| b.chain.clone()).unwrap_or_default();
+        sticky_state(cfg, &inherited, name, root, Vec::new(), Vec::new(), enter, None, &mut out)?;
+    }
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sticky_state(
+    cfg: &Config,
+    inherited: &[(String, Chain, String)],
+    chain: &str,
+    st: &StickyState,
+    names: Vec<String>,
+    mut titles: Vec<String>,
+    prefix: Chain,
+    parent: Option<String>,
+    out: &mut Vec<StickyNode>,
+) -> Result<()> {
+    let own = names.last().cloned().unwrap_or_else(|| chain.to_string());
+    titles.push(st.title.clone().unwrap_or_else(|| own.clone()));
+    let submap = if names.is_empty() { format!("{STICKY_PREFIX}{chain}") } else { format!("{STICKY_PREFIX}{chain}/{}", names.join("/")) };
+    let source = std::iter::once(format!("sticky.{chain}")).chain(names.iter().cloned()).collect::<Vec<_>>().join(".");
+    let mut node = StickyNode { chain: chain.to_string(), names: names.clone(), titles: titles.clone(), submap: submap.clone(), parent, prefix: prefix.clone(), source, keys: Vec::new() };
+    let at = || format!("sticky.{chain}, {}", node_label(&names));
+    if !names.is_empty() && st.enter.is_some() {
+        bail!("{}: поле enter допустимо только у корня цепочки", at());
+    }
+    let action = match st.apps.as_deref() {
+        None => None,
+        Some("raise") => Some("workspaced key "),
+        Some("spawn") => Some("workspaced key --new "),
+        Some(other) => bail!("{}: apps должно быть одним из {}, получено {other:?}", at(), STICKY_APPS.join(", ")),
+    };
+    let mut rest: Vec<StickyBind> = match action {
+        Some(head) => inherited
+            .iter()
+            .map(|(key, c, src)| StickyBind {
+                key: key.clone(),
+                go: StickyGo::Act(Act::Daemon(format!("{head}{}", shell_quote(&chain_compact(c))))),
+                exit: false,
+                desc: None,
+                inherited: Some(src.clone()),
+                explicit: None,
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    for (key, v) in &st.keys {
+        let lower = key.to_ascii_lowercase();
+        if key.trim().is_empty() || key.contains('+') || key.contains(char::is_whitespace) || lower.starts_with("mouse") || lower == "escape" || lower == "backspace" {
+            bail!("{}: клавиша {key:?} недопустима: нужно имя одной клавиши без модификаторов; Escape, BackSpace и кнопки мыши заняты", at());
+        }
+        if node.keys.iter().any(|k| k.key.eq_ignore_ascii_case(key)) {
+            bail!("{}: клавиша {key:?} задана дважды", at());
+        }
+        let mut fields: Vec<&str> = v.as_bind("").action_fields();
+        if v.state.is_some() {
+            fields.push("state");
+        }
+        if fields.len() > 1 {
+            bail!("{}: клавиша {key:?}: задано несколько действий ({}), допустимо одно", at(), fields.join(", "));
+        }
+        let path = chain_compact(&node.key_chain(key));
+        if let Some(target) = &v.state {
+            if v.exit {
+                bail!("{}: клавиша {key:?}: exit не сочетается с переходом state", at());
+            }
+            if !st.states.contains_key(target) {
+                bail!("{}: клавиша {key:?} ведёт в состояние {target:?}, которого нет среди дочерних состояний этого состояния", at());
+            }
+            node.keys.push(StickyBind { key: key.clone(), go: StickyGo::State(target.clone()), exit: false, desc: v.desc.clone(), inherited: None, explicit: None });
+        } else if fields.is_empty() {
+            // Дополнение унаследованной клавиши: признак выхода и описание.
+            let Some(i) = rest.iter().position(|k| k.key == lower) else {
+                bail!("{}: клавиша {key:?} без действия: такой клавиши нет среди унаследованных клавиш приложений", at());
+            };
+            let mut k = rest.remove(i);
+            k.exit = v.exit;
+            k.desc = v.desc.clone();
+            node.keys.push(k);
+        } else {
+            let b = v.as_bind(&path);
+            cfg.check_action(&b)?;
+            let act = bind_act(&b, true)?;
+            rest.retain(|k| k.key != lower);
+            node.keys.push(StickyBind { key: key.clone(), go: StickyGo::Act(act), exit: v.exit, desc: v.desc.clone(), inherited: None, explicit: Some(b) });
+        }
+    }
+    node.keys.extend(rest);
+    if node.keys.is_empty() {
+        bail!("{}: в состоянии нет ни одной клавиши", at());
+    }
+    for child in st.states.keys() {
+        if !sticky_name(child) {
+            bail!("{}: имя состояния {child:?} должно состоять из латинских строчных букв, цифр и дефиса", at());
+        }
+        if !node.keys.iter().any(|k| k.go == StickyGo::State(child.clone())) {
+            bail!("{}: в состояние {child} не ведёт ни одна клавиша", at());
+        }
+    }
+    let children: Vec<(String, Chain)> = node.keys.iter().filter_map(|k| match &k.go {
+        StickyGo::State(s) => Some((s.clone(), node.key_chain(&k.key))),
+        StickyGo::Act(_) => None,
+    }).collect();
+    out.push(node);
+    for (name, st_child) in &st.states {
+        // Состояние может быть достижимо несколькими клавишами: путь
+        // строится по первой из них.
+        let Some((_, path)) = children.iter().find(|(s, _)| s == name) else { continue };
+        let mut sub_names = names.clone();
+        sub_names.push(name.clone());
+        sticky_state(cfg, inherited, chain, st_child, sub_names, titles.clone(), path.clone(), Some(submap.clone()), out)?;
+    }
+    Ok(())
+}
+
+fn node_label(names: &[String]) -> String {
+    match names.last() {
+        Some(n) => format!("состояние {n}"),
+        None => "корневое состояние".to_string(),
+    }
 }
 
 /// Проверки: одна цепочка не может совпадать с другой или быть её началом;
@@ -365,6 +601,7 @@ pub fn collect(cfg: &Config) -> Result<Vec<Binding>> {
 /// одиночного сочетания с одним диспетчером.
 pub fn check_chains(cfg: &Config) -> Result<()> {
     let binds = collect(cfg)?;
+    sticky_nodes(cfg)?;
     let reserved: Vec<(Combo, String)> = cfg.keys.reserved.iter().map(|r| parse_combo(r).map(|c| (c, r.clone()))).collect::<Result<_>>()?;
     for b in &binds {
         for combo in &b.chain {
@@ -452,6 +689,7 @@ fn action_lua(act: &Act, chain: &Chain, reset: bool) -> String {
             s.push_str("end");
             s
         }
+        Act::Sticky(name) => format!("hl.dsp.submap({})", lua_str(&format!("{STICKY_PREFIX}{name}"))),
     }
 }
 
@@ -472,14 +710,64 @@ pub fn to_lua(cfg: &Config) -> Result<String> {
     out.push_str("-- Источник: ~/.config/workspaced/config.toml\n");
     out.push_str("local function ws_run(cmd)\n  return function()\n    hl.dispatch(hl.dsp.exec_cmd(cmd))\n    hl.dispatch(hl.dsp.submap(\"reset\"))\n  end\nend\n");
     let mut submaps = String::new();
-    emit(&root, &[], &mut out, &mut submaps);
+    let mut names: Vec<String> = Vec::new();
+    emit(&root, &[], &mut out, &mut submaps, &mut names);
     out.push_str(&submaps);
+    for node in sticky_nodes(cfg)? {
+        emit_sticky(&node, &mut out);
+        names.push(node.submap);
+    }
+    // Подкарта, открытая до перечитывания конфига, которой в новом коде нет,
+    // осталась бы без привязок, в том числе без Escape, и все сочетания сессии
+    // перестали бы работать (решение D9): такая подкарта закрывается.
+    // Проверка обёрнута в pcall, чтобы сбой в ней не лишал сессию привязок.
+    out.push_str("do\n  local known = {\n");
+    for n in &names {
+        writeln!(out, "    [{}] = true,", lua_str(n)).unwrap();
+    }
+    out.push_str("  }\n");
+    out.push_str("  pcall(function()\n");
+    out.push_str("    local cur = hl.get_current_submap()\n");
+    writeln!(
+        out,
+        "    if type(cur) == \"string\" and (cur:sub(1, 3) == \"ws:\" or cur:sub(1, {}) == {}) and not known[cur] then",
+        STICKY_PREFIX.len(),
+        lua_str(STICKY_PREFIX)
+    )
+    .unwrap();
+    out.push_str("      hl.dispatch(hl.dsp.submap(\"reset\"))\n    end\n  end)\nend\n");
     Ok(out)
+}
+
+/// Подкарта состояния цепочки с выходом (решения D3, D4, D9): клавиши
+/// состояния с `ignore_mods`, BackSpace к родителю (в корне — выход), Escape
+/// и последним — `catchall` с пустым действием, который поглощает остальные
+/// нажатия. Действие `catchall` должно оставаться пустым: композитор выполняет
+/// его и вместе с совпавшей привязкой.
+fn emit_sticky(node: &StickyNode, out: &mut String) {
+    const FLAGS: &str = "{ ignore_mods = true }";
+    writeln!(out, "hl.define_submap({}, function()", lua_str(&node.submap)).unwrap();
+    for k in &node.keys {
+        let action = match &k.go {
+            StickyGo::State(s) => format!("hl.dsp.submap({})", lua_str(&format!("{}/{s}", node.submap))),
+            StickyGo::Act(act) => action_lua(act, &node.key_chain(&k.key), k.exit),
+        };
+        let action = action.replace('\n', "\n  ");
+        writeln!(out, "  hl.bind({}, {action}, {FLAGS})", lua_str(&k.key)).unwrap();
+    }
+    let back = match &node.parent {
+        Some(p) => lua_str(p),
+        None => lua_str("reset"),
+    };
+    writeln!(out, "  hl.bind(\"BackSpace\", hl.dsp.submap({back}), {FLAGS})").unwrap();
+    writeln!(out, "  hl.bind(\"Escape\", hl.dsp.submap(\"reset\"), {FLAGS})").unwrap();
+    writeln!(out, "  hl.bind(\"catchall\", hl.dsp.no_op(), {FLAGS})").unwrap();
+    out.push_str("end)\n");
 }
 
 /// Привязки узла: листья — действие, ветви — вход в подкарту. Подкарты пишутся
 /// отдельно, чтобы корневые привязки шли первыми и читались подряд.
-fn emit(node: &Node, path: &[Combo], binds: &mut String, submaps: &mut String) {
+fn emit(node: &Node, path: &[Combo], binds: &mut String, submaps: &mut String, names: &mut Vec<String>) {
     for (combo, child) in &node.children {
         let mut sub_path = path.to_vec();
         sub_path.push(combo.clone());
@@ -495,7 +783,8 @@ fn emit(node: &Node, path: &[Combo], binds: &mut String, submaps: &mut String) {
             let name = format!("ws:{}", sub_path.iter().map(Combo::lua).collect::<Vec<_>>().join(" "));
             writeln!(binds, "hl.bind({}, hl.dsp.submap({}))", lua_str(&combo.lua()), lua_str(&name)).unwrap();
             let mut inner = String::new();
-            emit(child, &sub_path, &mut inner, submaps);
+            emit(child, &sub_path, &mut inner, submaps, names);
+            names.push(name.clone());
             writeln!(submaps, "hl.define_submap({}, function()", lua_str(&name)).unwrap();
             for line in inner.lines() {
                 writeln!(submaps, "  {line}").unwrap();
@@ -509,10 +798,18 @@ fn emit(node: &Node, path: &[Combo], binds: &mut String, submaps: &mut String) {
 pub fn to_list(cfg: &Config) -> Result<String> {
     let binds = collect(cfg)?;
     check_chains(cfg)?;
-    let rows: Vec<(String, String, String, String)> = binds
-        .iter()
-        .map(|b| (chain_compact(&b.chain), b.act.describe(), b.flags.describe(), b.source.split(' ').next().unwrap_or("").to_string()))
-        .collect();
+    let nodes = sticky_nodes(cfg)?;
+    let mut rows: Vec<(String, String, String, String)> = Vec::new();
+    for b in &binds {
+        rows.push((chain_compact(&b.chain), b.act.describe(), b.flags.describe(), b.source.split(' ').next().unwrap_or("").to_string()));
+        // Цепочка с выходом — строками путей сразу после сочетания входа
+        // (решение D10).
+        if let Act::Sticky(name) = &b.act {
+            for r in sticky_rows(&nodes, name) {
+                rows.push((chain_compact(&r.chain), r.action, if r.exit { "exit".to_string() } else { String::new() }, r.source));
+            }
+        }
+    }
     let w0 = rows.iter().map(|r| r.0.chars().count()).max().unwrap_or(0);
     let w1 = rows.iter().map(|r| r.1.chars().count()).max().unwrap_or(0);
     let w2 = rows.iter().map(|r| r.2.chars().count()).max().unwrap_or(0);
@@ -523,6 +820,37 @@ pub fn to_list(cfg: &Config) -> Result<String> {
         out.push('\n');
     }
     Ok(out)
+}
+
+/// Строка пути цепочки с выходом для `keys --list` и `keys --json`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StickyRow {
+    /// Путь: вход, переходы и клавиша.
+    pub chain: Chain,
+    /// `state raise`, `key SUPER+V`, `key --new SUPER+V`, `exec …`.
+    pub action: String,
+    pub exit: bool,
+    /// Раздел конфига состояния, которому принадлежит клавиша.
+    pub source: String,
+    /// Номер состояния в списке `sticky_nodes` и номер клавиши в нём.
+    pub node: usize,
+    pub key: usize,
+}
+
+/// Строки путей цепочки `name`: клавиши каждого состояния по порядку
+/// обхода состояний.
+pub fn sticky_rows(nodes: &[StickyNode], name: &str) -> Vec<StickyRow> {
+    let mut out = Vec::new();
+    for (ni, node) in nodes.iter().enumerate().filter(|(_, n)| n.chain == name) {
+        for (ki, k) in node.keys.iter().enumerate() {
+            let action = match &k.go {
+                StickyGo::State(s) => format!("state {s}"),
+                StickyGo::Act(a) => a.describe(),
+            };
+            out.push(StickyRow { chain: node.key_chain(&k.key), action, exit: k.exit, source: node.source.clone(), node: ni, key: ki });
+        }
+    }
+    out
 }
 
 /// Путь копии последнего удачного кода привязок.
@@ -875,5 +1203,259 @@ dispatch = "exit()"
         assert!(list.contains("locked,repeating"), "{list}");
         assert!(list.contains("SUPER+X") && list.contains("maximize"), "{list}");
         assert!(list.contains("Home") && list.contains("place top-left"), "{list}");
+    }
+
+    /// Приложения сессии: собственные клавиши herdr, Chromium и neovide,
+    /// ключи браузеров в `surf` и цепочка `[sticky.apps]` из решения D1.
+    fn sticky_base() -> String {
+        r#"
+[keys]
+sessions = "SHIFT+SUPER+S"
+reserved = ["SUPER+space"]
+[templates.t]
+main = "c"
+cells = { c = { x = 0, y = 0, w = 10, h = 10 }, l = { x = 0, y = 0, w = 5, h = 10 }, r = { x = 5, y = 0, w = 5, h = 10 } }
+[apps.herdr]
+cmd = "wezterm"
+chain = "SUPER+T"
+[apps.chromium]
+cmd = "chromium"
+chain = "SUPER+C"
+[apps.neovide]
+cmd = "neovide"
+chain = "SUPER+E"
+[apps.chrome]
+cmd = "chrome"
+chain = "SUPER+SHIFT+B"
+[apps.chrome-ai]
+cmd = "chrome"
+chain = "SUPER+SHIFT+V"
+[apps.yandex]
+cmd = "yandex"
+chain = "SUPER+SHIFT+Y"
+[workspaces.surf]
+template = "t"
+chain = "SUPER+TAB s"
+[workspaces.surf.apps]
+chrome = { cell = "l", chain = "SUPER+B" }
+chrome-ai = { cell = "r", chain = "SUPER+V" }
+yandex = { cell = "c", chain = "SUPER+Y" }
+"#
+        .to_string()
+    }
+
+    fn sticky_apps() -> String {
+        r#"
+[sticky.apps]
+enter = "SUPER+S"
+title = "Приложения"
+[sticky.apps.keys]
+r = { state = "raise" }
+s = { state = "spawn" }
+[sticky.apps.states.raise]
+title = "Поднять"
+apps = "raise"
+[sticky.apps.states.raise.keys]
+e = { exit = true }
+[sticky.apps.states.spawn]
+title = "Новое окно"
+apps = "spawn"
+[sticky.apps.states.spawn.keys]
+e = { exit = true }
+"#
+        .to_string()
+    }
+
+    fn sticky_cfg() -> Config {
+        Config::parse(&(sticky_base() + &sticky_apps())).unwrap()
+    }
+
+    fn sticky_err(extra: &str) -> String {
+        Config::parse(&(sticky_base() + extra)).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn sticky_nodes_inherit_app_keys() {
+        let cfg = sticky_cfg();
+        let nodes = sticky_nodes(&cfg).unwrap();
+        let subs: Vec<&str> = nodes.iter().map(|n| n.submap.as_str()).collect();
+        assert_eq!(subs, ["ws-sticky:apps", "ws-sticky:apps/raise", "ws-sticky:apps/spawn"]);
+        assert_eq!(nodes[1].titles, ["Приложения", "Поднять"]);
+        assert_eq!(nodes[1].parent.as_deref(), Some("ws-sticky:apps"));
+        assert_eq!(nodes[1].source, "sticky.apps.raise");
+        // Явные клавиши — первыми, затем унаследованные по порядку цепочек;
+        // Shift+Super+буква не наследуется.
+        let keys: Vec<&str> = nodes[1].keys.iter().map(|k| k.key.as_str()).collect();
+        assert_eq!(keys, ["e", "b", "c", "t", "v", "y"]);
+        let e = &nodes[1].keys[0];
+        assert!(e.exit);
+        assert_eq!(e.go, StickyGo::Act(Act::Daemon("workspaced key 'SUPER+E'".into())));
+        assert_eq!(e.inherited.as_deref(), Some("apps.neovide"));
+        let v = nodes[2].keys.iter().find(|k| k.key == "v").unwrap();
+        assert_eq!(v.go, StickyGo::Act(Act::Daemon("workspaced key --new 'SUPER+V'".into())));
+        assert!(!v.exit);
+    }
+
+    #[test]
+    fn sticky_list_rows() {
+        let list = to_list(&sticky_cfg()).unwrap();
+        let row = |chain: &str| list.lines().find(|l| l.split("  ").next().map(str::trim) == Some(chain)).unwrap_or_else(|| panic!("нет строки {chain}:\n{list}")).to_string();
+        let words = |l: String| l.split_whitespace().map(String::from).collect::<Vec<_>>().join(" ");
+        assert_eq!(words(row("SUPER+S")), "SUPER+S sticky apps sticky.apps");
+        assert_eq!(words(row("SUPER+S r")), "SUPER+S r state raise sticky.apps");
+        assert_eq!(words(row("SUPER+S r v")), "SUPER+S r v key SUPER+V sticky.apps.raise");
+        assert_eq!(words(row("SUPER+S s v")), "SUPER+S s v key --new SUPER+V sticky.apps.spawn");
+        assert_eq!(words(row("SUPER+S s e")), "SUPER+S s e key --new SUPER+E exit sticky.apps.spawn");
+        assert_eq!(words(row("SUPER+S r e")), "SUPER+S r e key SUPER+E exit sticky.apps.raise");
+        // Пути в проверке совпадения цепочек не участвуют: «SUPER+S r» —
+        // не цепочка сессии, и Super+S остаётся одиночным сочетанием.
+        assert!(!list.contains("SUPER+SHIFT+V exit"), "{list}");
+    }
+
+    #[test]
+    fn sticky_lua() {
+        let cfg = sticky_cfg();
+        let lua = to_lua(&cfg).unwrap();
+        luac(&lua);
+        assert_eq!(lua, to_lua(&cfg).unwrap());
+        assert!(lua.contains("hl.bind(\"SUPER + S\", hl.dsp.submap(\"ws-sticky:apps\"))"), "{lua}");
+        let block = |name: &str| -> String {
+            let head = format!("hl.define_submap(\"{name}\", function()\n");
+            let start = lua.find(&head).unwrap_or_else(|| panic!("нет подкарты {name}:\n{lua}"));
+            let end = lua[start..].find("end)\n").unwrap() + start;
+            lua[start..end].to_string()
+        };
+        let root = block("ws-sticky:apps");
+        assert!(root.contains("hl.bind(\"r\", hl.dsp.submap(\"ws-sticky:apps/raise\"), { ignore_mods = true })"), "{root}");
+        assert!(root.contains("hl.bind(\"BackSpace\", hl.dsp.submap(\"reset\"), { ignore_mods = true })"), "{root}");
+        let raise = block("ws-sticky:apps/raise");
+        // Действие без выхода подкарту не закрывает, с выходом — закрывает.
+        assert!(raise.contains("hl.bind(\"v\", hl.dsp.exec_cmd(\"workspaced key 'SUPER+V'\"), { ignore_mods = true })"), "{raise}");
+        assert!(raise.contains("hl.bind(\"e\", ws_run(\"workspaced key 'SUPER+E'\"), { ignore_mods = true })"), "{raise}");
+        assert!(raise.contains("hl.bind(\"BackSpace\", hl.dsp.submap(\"ws-sticky:apps\"), { ignore_mods = true })"), "{raise}");
+        assert!(raise.contains("hl.bind(\"Escape\", hl.dsp.submap(\"reset\"), { ignore_mods = true })"), "{raise}");
+        // catchall — последней привязкой подкарты и с пустым действием.
+        assert!(raise.trim_end().ends_with("hl.bind(\"catchall\", hl.dsp.no_op(), { ignore_mods = true })"), "{raise}");
+        assert_eq!(lua.matches("\"catchall\"").count(), 3, "{lua}");
+        let spawn = block("ws-sticky:apps/spawn");
+        assert!(spawn.contains("hl.bind(\"v\", hl.dsp.exec_cmd(\"workspaced key --new 'SUPER+V'\"), { ignore_mods = true })"), "{spawn}");
+        // Одноразовые цепочки catchall не получают.
+        let tab = block("ws:SUPER + TAB");
+        assert!(!tab.contains("catchall"), "{tab}");
+        // Проверка устаревшей подкарты знает все подкарты этого кода.
+        let tail = &lua[lua.rfind("local known").unwrap()..];
+        for name in ["ws:SUPER + TAB", "ws-sticky:apps", "ws-sticky:apps/raise", "ws-sticky:apps/spawn"] {
+            assert!(tail.contains(&format!("[\"{name}\"] = true")), "{tail}");
+        }
+        assert!(tail.contains("hl.get_current_submap()") && tail.contains("hl.dispatch(hl.dsp.submap(\"reset\"))"), "{tail}");
+    }
+
+    #[test]
+    fn sticky_nested_and_explicit_keys() {
+        // Вложенное состояние: BackSpace ведёт к родителю, клавиша lua без
+        // выхода не закрывает подкарту, диспетчер с выходом закрывает.
+        let extra = r#"
+[sticky.win]
+enter = "SUPER+W"
+[sticky.win.keys]
+m = { state = "move" }
+[sticky.win.states.move]
+[sticky.win.states.move.keys]
+h = { action = { half = "left" } }
+q = { dispatch = "window.close()", exit = true, desc = "Закрыть окно" }
+d = { state = "deep" }
+[sticky.win.states.move.states.deep]
+[sticky.win.states.move.states.deep.keys]
+x = { lua = "return" }
+"#;
+        let cfg = Config::parse(&(sticky_base() + extra)).unwrap();
+        let lua = to_lua(&cfg).unwrap();
+        luac(&lua);
+        assert!(lua.contains("hl.define_submap(\"ws-sticky:win/move/deep\", function()"), "{lua}");
+        assert!(lua.contains("hl.bind(\"BackSpace\", hl.dsp.submap(\"ws-sticky:win/move\"), { ignore_mods = true })"), "{lua}");
+        assert!(lua.contains("hl.bind(\"h\", hl.dsp.exec_cmd(\"workspaced half left\"), { ignore_mods = true })"), "{lua}");
+        assert!(lua.contains("hl.bind(\"q\", function() hl.dispatch(hl.dsp.window.close()); hl.dispatch(hl.dsp.submap(\"reset\")) end, { ignore_mods = true })"), "{lua}");
+        let list = to_list(&cfg).unwrap();
+        assert!(list.lines().any(|l| l.starts_with("SUPER+W m d x ") && l.ends_with("sticky.win.move.deep")), "{list}");
+        assert!(list.lines().any(|l| l.starts_with("SUPER+W m q ") && l.contains("exit")), "{list}");
+    }
+
+    #[test]
+    fn sticky_augment_and_replace() {
+        let text = sticky_base() + &sticky_apps().replace("[sticky.apps.states.raise.keys]\ne = { exit = true }", "[sticky.apps.states.raise.keys]\ne = { exit = true }\nc = { exec = \"chromium --incognito\" }");
+        let cfg = Config::parse(&text).unwrap();
+        let list = to_list(&cfg).unwrap();
+        assert!(list.lines().any(|l| l.starts_with("SUPER+S r e ") && l.contains("key SUPER+E") && l.contains("exit")), "{list}");
+        assert!(list.lines().any(|l| l.starts_with("SUPER+S r c ") && l.contains("exec chromium --incognito")), "{list}");
+        assert_eq!(list.lines().filter(|l| l.starts_with("SUPER+S r c ")).count(), 1, "{list}");
+        // Клавиша без действия, которой нет среди унаследованных, — ошибка.
+        let bad = sticky_base() + &sticky_apps().replace("[sticky.apps.states.raise.keys]\ne = { exit = true }", "[sticky.apps.states.raise.keys]\ne = { exit = true }\nq = { exit = true }");
+        let err = Config::parse(&bad).unwrap_err().to_string();
+        assert!(err.contains("sticky.apps") && err.contains("raise") && err.contains("\"q\"") && err.contains("без действия"), "{err}");
+    }
+
+    #[test]
+    fn sticky_errors() {
+        // Вход совпадает с привязкой.
+        let err = sticky_err(&sticky_apps().replace("SUPER+S\"\ntitle", "SHIFT+SUPER+S\"\ntitle"));
+        assert!(err.contains("sticky.apps") && err.contains("keys.sessions"), "{err}");
+        // Вход занимает зарезервированное сочетание.
+        let err = sticky_err(&sticky_apps().replace("enter = \"SUPER+S\"", "enter = \"SUPER+space\""));
+        assert!(err.contains("sticky.apps") && err.contains("\"SUPER+space\"") && err.contains("зарезервированное"), "{err}");
+        // Вход — начало другой цепочки.
+        let err = sticky_err(&sticky_apps().replace("enter = \"SUPER+S\"", "enter = \"SUPER+TAB\""));
+        assert!(err.contains("sticky.apps") && err.contains("workspaces.surf"), "{err}");
+        // Вход звеном многозвенной цепочки.
+        let err = sticky_err(&sticky_apps().replace("enter = \"SUPER+S\"", "enter = \"SUPER+A b\""));
+        assert!(err.contains("sticky.apps") && err.contains("одним сочетанием"), "{err}");
+        // Недопустимые клавиши состояния.
+        for key in ["Escape", "\"SHIFT+v\"", "BackSpace", "\"mouse:272\""] {
+            let err = sticky_err(&sticky_apps().replace("s = { state = \"spawn\" }", &format!("s = {{ state = \"spawn\" }}\n{key} = {{ exec = \"true\" }}")));
+            assert!(err.contains("sticky.apps") && err.contains("корневое состояние") && err.contains(key.trim_matches('"')), "{key}: {err}");
+        }
+        // Переход в чужое состояние.
+        let err = sticky_err(&sticky_apps().replace("[sticky.apps.states.raise.keys]\ne = { exit = true }", "[sticky.apps.states.raise.keys]\ne = { exit = true }\ns = { state = \"spawn\" }"));
+        assert!(err.contains("sticky.apps") && err.contains("состояние raise") && err.contains("spawn"), "{err}");
+        // Недостижимое состояние.
+        let err = sticky_err(&(sticky_apps() + "[sticky.apps.states.move]\napps = \"raise\"\n"));
+        assert!(err.contains("sticky.apps") && err.contains("move") && err.contains("не ведёт"), "{err}");
+        // Состояние без клавиш.
+        let err = sticky_err(&(sticky_apps().replace("s = { state = \"spawn\" }", "s = { state = \"spawn\" }\nm = { state = \"move\" }") + "[sticky.apps.states.move]\ntitle = \"Пусто\"\n"));
+        assert!(err.contains("состояние move") && err.contains("нет ни одной клавиши"), "{err}");
+        // Недопустимое значение apps.
+        let err = sticky_err(&sticky_apps().replace("apps = \"raise\"", "apps = \"lift\""));
+        assert!(err.contains("raise, spawn") && err.contains("lift"), "{err}");
+        // exit вместе с переходом.
+        let err = sticky_err(&sticky_apps().replace("r = { state = \"raise\" }", "r = { state = \"raise\", exit = true }"));
+        assert!(err.contains("exit") && err.contains("\"r\""), "{err}");
+        // Два действия у одной клавиши.
+        let err = sticky_err(&sticky_apps().replace("r = { state = \"raise\" }", "r = { state = \"raise\", exec = \"true\" }"));
+        assert!(err.contains("несколько действий"), "{err}");
+        // Имя цепочки и состояния — строчные латинские буквы, цифры и дефис.
+        let err = sticky_err("[sticky.Apps]\nenter = \"SUPER+S\"\nkeys = { x = { exec = \"true\" } }\n");
+        assert!(err.contains("sticky.Apps") && err.contains("строчных"), "{err}");
+        // Нет сочетания входа.
+        let err = sticky_err("[sticky.apps]\nkeys = { x = { exec = \"true\" } }\n");
+        assert!(err.contains("sticky.apps") && err.contains("enter"), "{err}");
+        // Действие клавиши проходит проверки записи [[binds]].
+        let err = sticky_err("[sticky.apps]\nenter = \"SUPER+S\"\nkeys = { x = { action = { app = \"nope\" } } }\n");
+        assert!(err.contains("nope"), "{err}");
+    }
+
+    #[test]
+    fn new_instance_action() {
+        let text = sticky_base() + "[[binds]]\nchain = \"SUPER+SHIFT+E\"\naction = { app = \"neovide\", new = true }\n";
+        let cfg = Config::parse(&text).unwrap();
+        let list = to_list(&cfg).unwrap();
+        assert!(list.lines().any(|l| l.starts_with("SUPER+SHIFT+E ") && l.contains("app neovide --new")), "{list}");
+        for bad in ["{ workspace = \"surf\", new = true }", "{ app = \"neovide\", workspace = \"surf\", new = true }", "{ app = \"neovide\", pull = true, new = true }"] {
+            let text = sticky_base() + &format!("[[binds]]\nchain = \"SUPER+SHIFT+E\"\naction = {bad}\n");
+            let err = Config::parse(&text).unwrap_err().to_string();
+            assert!(err.contains("SUPER+SHIFT+E") && err.contains("new"), "{bad}: {err}");
+        }
+        // В клавише состояния — то же действие.
+        let text = sticky_base() + "[sticky.apps]\nenter = \"SUPER+S\"\nkeys = { n = { action = { app = \"neovide\", new = true }, exit = true } }\n";
+        let lua = to_lua(&Config::parse(&text).unwrap()).unwrap();
+        assert!(lua.contains("hl.bind(\"n\", ws_run(\"workspaced app neovide --new\"), { ignore_mods = true })"), "{lua}");
     }
 }

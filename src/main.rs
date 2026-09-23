@@ -77,12 +77,18 @@ enum Command {
         /// Перетащить окна приложения в активный workspace текущего стола
         #[arg(long)]
         pull: bool,
+        /// Открыть новый экземпляр приложения вместо цикла по его окнам
+        #[arg(long)]
+        new: bool,
     },
     /// Клавиша приложения: выбрать приложение и workspace по нажатой цепочке и активному workspace текущего стола
     Key {
         /// Цепочка сочетаний («SUPER+V», «SUPER+TAB v»); слова склеиваются пробелом
         #[arg(required = true)]
         chain: Vec<String>,
+        /// Открыть новый экземпляр приложения вместо цикла по его окнам
+        #[arg(long)]
+        new: bool,
     },
     /// Поднять следующий workspace из списка текущего стола
     Next,
@@ -165,8 +171,8 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::Raise { workspace, desktop } => client::call(json!({ "cmd": "raise", "workspace": workspace, "desktop": desktop })).map(|_| ()),
-        Command::App { app, desktop, workspace, pull } => client::call(json!({ "cmd": "app", "apps": app, "desktop": desktop, "workspace": workspace, "pull": pull })).map(|_| ()),
-        Command::Key { chain } => client::call(json!({ "cmd": "key", "chain": chain.join(" ") })).map(|_| ()),
+        Command::App { app, desktop, workspace, pull, new } => client::call(json!({ "cmd": "app", "apps": app, "desktop": desktop, "workspace": workspace, "pull": pull, "new": new })).map(|_| ()),
+        Command::Key { chain, new } => client::call(json!({ "cmd": "key", "chain": chain.join(" "), "new": new })).map(|_| ()),
         Command::Next => client::call(json!({ "cmd": "next" })).map(|_| ()),
         Command::MoveDesktop { desktop } => client::call(json!({ "cmd": "move-desktop", "desktop": desktop })).map(|_| ()),
         Command::Arrange => client::call(json!({ "cmd": "arrange" })).map(|_| ()),
@@ -249,6 +255,9 @@ fn check() -> anyhow::Result<()> {
     }
     for t in cfg.templates.keys() {
         println!("  шаблон {t}");
+    }
+    for (name, root) in &cfg.sticky {
+        println!("  цепочка с выходом {name} ({})", root.enter.as_deref().unwrap_or(""));
     }
     Ok(())
 }

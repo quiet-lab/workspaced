@@ -699,7 +699,7 @@ impl Daemon {
                 }
                 self.st.foreign.insert(c.address.clone(), Foreign { rect: e.rect, cmd, cwd });
                 self.hypr.dispatch_all(&ex)?;
-            } else if let Some(i) = self.pending.iter().position(|p| p.matches(&c, &ancestors)) {
+            } else if let Some(i) = pending_for_window(&self.pending, &c, &ancestors) {
                 let p = self.pending.remove(i);
                 self.adopt(&c, p)?;
             } else if let Some(i) = self.awaited_entry(&c) {
@@ -987,12 +987,16 @@ impl Daemon {
 
     // ---- Запуск -----------------------------------------------------------------
 
-    fn spawn(&mut self, app: &str, workspace: Option<&str>, desktop: u8, target: Target, focus: bool) -> Result<()> {
+    /// Запустить приложение и завести ожидание его окна. `new` — запуск
+    /// нового экземпляра (изменение sticky-chains, решение D7): отдельная
+    /// запись ожидания заводится и тогда, когда прежний запуск того же
+    /// приложения ещё не дал окна.
+    fn spawn(&mut self, app: &str, workspace: Option<&str>, desktop: u8, target: Target, focus: bool, new: bool) -> Result<()> {
         // Пока запуск идёт, повторная клавиша второго экземпляра не заводит.
         // Если процесс уже вышел, а окна так и нет, клавиша не должна остаться
         // без ответа: принимается подходящее свободное окно, а когда его нет —
         // прежнее ожидание снимается и приложение запускается заново.
-        if let Some(i) = self.pending.iter().position(|p| p.app == app) {
+        if let Some(i) = pending_for_key(&self.pending, app, new) {
             let exited = self.pending[i].exited;
             let found = if exited { self.free_window_for(i)? } else { None };
             match pending_step(exited, found.is_some(), true) {
@@ -1023,7 +1027,7 @@ impl Daemon {
         let exe = which(&cmd).and_then(|p| p.canonicalize().ok());
         let cmd_base = Path::new(&cmd).file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
         let (class_re, title_re) = a.matchers()?.map_or((None, None), |(c, t)| (Some(c), t));
-        log::info!("{app}: запущен pid {pid} ({cmd} {})", args.join(" "));
+        log::info!("{app}: запущен{} pid {pid} ({cmd} {})", if new { " новый экземпляр," } else { "" }, args.join(" "));
         self.pending.push(Pending { app: app.to_string(), workspace: workspace.map(String::from), desktop, pid, exe, cmd_base, class_re, title_re, exited: false, target, focus });
         Ok(())
     }
@@ -1184,7 +1188,7 @@ impl Daemon {
                 // остаётся пустым, остальные приложения встают, workspace
                 // становится активным (изменение classless-windows-stay-free,
                 // решение D2).
-                if let Err(e) = self.spawn(app, Some(ws), n, target, focus && main_app.as_deref() == Some(app)) {
+                if let Err(e) = self.spawn(app, Some(ws), n, target, focus && main_app.as_deref() == Some(app), false) {
                     log::warn!("workspace {ws}: {e:#}; поднятие продолжается без этого приложения");
                 }
                 continue;
@@ -1493,7 +1497,7 @@ impl Daemon {
                 }
                 self.hypr.dispatch_all(&ex)?;
                 let rect = self.st.rect_for(&cfg, ws, app, self.mon);
-                self.spawn(app, Some(ws), n, rect.map(Target::Place).unwrap_or(Target::Free(None)), true)
+                self.spawn(app, Some(ws), n, rect.map(Target::Place).unwrap_or(Target::Free(None)), true, false)
             }
             CycleStep::Select(addr) => self.select_window(ws, &addr, &clients, swap && start != Start::Joined),
             CycleStep::Back(addr) => {
@@ -1512,7 +1516,7 @@ impl Daemon {
     /// решение D7). `apps` — кандидаты с одной цепочкой: действует тот из них,
     /// чей workspace найдётся раньше. `pull` — перетащить окна приложения
     /// в активный workspace текущего стола (решение D8).
-    pub fn app(&mut self, apps: &[String], desktop: Option<u8>, workspace: Option<&str>, pull: bool) -> Result<()> {
+    pub fn app(&mut self, apps: &[String], desktop: Option<u8>, workspace: Option<&str>, pull: bool, new: bool) -> Result<()> {
         for a in apps {
             if !self.cfg.apps.contains_key(a) {
                 bail!("приложение {a} не описано");
@@ -1539,6 +1543,10 @@ impl Daemon {
         let n = self.current;
         let tagged = self.tagged_in_active(n)?;
         let route = app_route(&self.cfg, &self.st.desktops, n, apps, pull, &tagged);
+        if new {
+            log::info!("приложение {}: новый экземпляр, {route:?}", apps.join(", "));
+            return self.spawn_new(route);
+        }
         self.follow_route(route, raised, apps)
     }
 
@@ -1557,7 +1565,7 @@ impl Daemon {
     /// workspace текущего стола и ключам приложений в workspace. Цепочка,
     /// на которую не отзывается ни одно приложение, — строка в журнале
     /// без действия.
-    pub fn key(&mut self, chain: &str) -> Result<()> {
+    pub fn key(&mut self, chain: &str, new: bool) -> Result<()> {
         let parsed = crate::keys::parse_chain(chain)?;
         let chain = crate::keys::chain_compact(&parsed);
         let n = self.current;
@@ -1566,12 +1574,64 @@ impl Daemon {
             log::info!("клавиша {chain}: ни одно приложение на неё не отзывается");
             return Ok(());
         };
-        log::info!("клавиша {chain}: {route:?}");
-        let app = match &route {
-            AppRoute::Cycle { app, .. } | AppRoute::Raise { app, .. } | AppRoute::Pull { app, .. } | AppRoute::Open { app, .. } | AppRoute::Free { app } => app.clone(),
-        };
+        log::info!("клавиша {chain}{}: {route:?}", if new { " (новый экземпляр)" } else { "" });
+        let app = route.app().to_string();
         self.end_restore_wait(Some(&app), false, "клавиша приложения");
+        if new {
+            return self.spawn_new(route);
+        }
         self.follow_route(route, false, &[app])
+    }
+
+    /// Новый экземпляр приложения по пути клавиши (спецификация ws-daemon,
+    /// «Новый экземпляр приложения»; изменение sticky-chains, решения D6, D7):
+    /// приложение и workspace выбраны так же, как без ключа `--new`, а вместо
+    /// цикла по окнам запускается новый экземпляр.
+    fn spawn_new(&mut self, route: AppRoute) -> Result<()> {
+        let app = route.app().to_string();
+        let Some(a) = self.cfg.apps.get(&app) else { bail!("приложение {app} не описано") };
+        if a.cmd.is_none() {
+            log::info!("{app}: поля cmd нет, новый экземпляр не открывается");
+            return Ok(());
+        }
+        let n = self.current;
+        match route {
+            AppRoute::Cycle { ws, app } => self.spawn_in(&ws, &app),
+            AppRoute::Raise { ws, app, desktop } => {
+                self.raise(&ws, desktop)?;
+                self.spawn_in(&ws, &app)
+            }
+            AppRoute::Pull { ws, app } | AppRoute::Open { ws, app } => {
+                // Новое окно входит в активный workspace стола по правилам
+                // открытия приложения: запись о месте заводится при появлении.
+                let cfg = self.cfg.clone();
+                let rect = open_rect(&mut self.st, &cfg, Some(&ws), &app, self.mon);
+                self.spawn(&app, Some(&ws), n, Target::Free(rect), true, true)
+            }
+            AppRoute::Free { app } => {
+                let rect = State::app_rect(&self.cfg, &app, self.mon);
+                self.spawn(&app, None, n, Target::Free(rect), true, true)
+            }
+        }
+    }
+
+    /// Новый экземпляр приложения в workspace `ws`, активном на текущем
+    /// столе. В режиме обмена мест приложение сначала занимает главное место,
+    /// как при запуске из цикла, и окно появляется уже на нём.
+    fn spawn_in(&mut self, ws: &str, app: &str) -> Result<()> {
+        let n = self.current;
+        let mut clients = self.hypr.clients()?;
+        self.adopt_untagged(&mut clients, std::slice::from_ref(&app.to_string()), Some(ws))?;
+        self.absorb(ws, n, &clients);
+        let cfg = self.cfg.clone();
+        let (mode, entry) = cycle_mode(&cfg, ws, app);
+        let mut ex = Vec::new();
+        if mode == Mode::Swap {
+            self.swap_to_main(ws, &entry, &clients, &mut ex);
+        }
+        self.hypr.dispatch_all(&ex)?;
+        let rect = self.st.rect_for(&cfg, ws, app, self.mon);
+        self.spawn(app, Some(ws), n, rect.map(Target::Place).unwrap_or(Target::Free(None)), true, true)
     }
 
     /// Выполнить путь клавиши приложения. `raised` — workspace поднят этой
@@ -1611,7 +1671,7 @@ impl Daemon {
         match cycle_step(&order, active.as_deref(), false, None, None) {
             CycleStep::Launch => {
                 let rect = State::app_rect(&self.cfg, app, self.mon);
-                self.spawn(app, None, n, Target::Free(rect), true)
+                self.spawn(app, None, n, Target::Free(rect), true, false)
             }
             CycleStep::Select(addr) | CycleStep::Back(addr) | CycleStep::NextApp(addr) => {
                 self.hypr.dispatch_all(&[hypr::d_focus_window(&addr), hypr::d_bring_to_top()])
@@ -1640,7 +1700,7 @@ impl Daemon {
         let rect = open_rect(&mut self.st, &cfg, Some(ws), app, self.mon);
         let Some(first) = take.first() else {
             log::info!("workspace {ws}: окон {app} нет, приложение запускается в нём");
-            return self.spawn(app, Some(ws), n, Target::Free(rect), true);
+            return self.spawn(app, Some(ws), n, Target::Free(rect), true, false);
         };
         let rect = rect.unwrap_or_else(|| center_rect(first, self.work_area()));
         if !ws_has_app(&cfg, ws, app) {
@@ -1836,9 +1896,9 @@ impl Daemon {
         match desktop {
             Some(n) => {
                 let rect = workspace.and_then(|w| self.st.rect_for(&self.cfg, w, app, self.mon));
-                self.spawn(app, workspace, n, rect.map(Target::Place).unwrap_or(Target::Free(None)), false)
+                self.spawn(app, workspace, n, rect.map(Target::Place).unwrap_or(Target::Free(None)), false, false)
             }
-            None => self.spawn(app, workspace, self.current, Target::Pool, false),
+            None => self.spawn(app, workspace, self.current, Target::Pool, false, false),
         }
     }
 
@@ -2014,7 +2074,7 @@ impl Daemon {
                 Err(_) => (self.current, Target::Pool),
             };
             log::info!("восстановление {}#{}: свободное окно приложения запускается командой приложения", e.app, e.instance);
-            if let Err(err) = self.spawn(&e.app, None, desktop, target, false) {
+            if let Err(err) = self.spawn(&e.app, None, desktop, target, false, false) {
                 log::warn!("восстановление {}#{}: {err:#}", e.app, e.instance);
             }
         }
@@ -2148,6 +2208,8 @@ impl Daemon {
         let cmd = req.get("cmd").and_then(|c| c.as_str()).unwrap_or("");
         let s = |k: &str| req.get(k).and_then(|v| v.as_str()).map(String::from);
         let desktop = req.get("desktop").and_then(|v| v.as_u64()).map(|v| v as u8);
+        // Новый экземпляр вместо цикла по окнам (`key --new`, `app --new`).
+        let new = req.get("new").and_then(|v| v.as_bool()).unwrap_or(false);
         let r = match cmd {
             "raise" => match s("workspace") {
                 Some(ws) => self.raise(&ws, desktop).map(|_| json!({"ok": true})),
@@ -2160,11 +2222,11 @@ impl Daemon {
                 } else {
                     let ws = s("workspace");
                     let pull = req.get("pull").and_then(|v| v.as_bool()).unwrap_or(false);
-                    self.app(&apps, desktop, ws.as_deref(), pull).map(|_| json!({"ok": true}))
+                    self.app(&apps, desktop, ws.as_deref(), pull, new).map(|_| json!({"ok": true}))
                 }
             }
             "key" => match s("chain") {
-                Some(chain) => self.key(&chain).map(|_| json!({"ok": true})),
+                Some(chain) => self.key(&chain, new).map(|_| json!({"ok": true})),
                 None => Err(anyhow::anyhow!("нет цепочки")),
             },
             "next" => self.next().map(|_| json!({"ok": true})),
@@ -2740,6 +2802,33 @@ pub enum AppRoute {
     Open { ws: String, app: String },
     /// Активного workspace на столе нет: цикл по окнам приложения вне workspace.
     Free { app: String },
+}
+
+impl AppRoute {
+    /// Приложение, к которому ведёт путь.
+    pub fn app(&self) -> &str {
+        match self {
+            AppRoute::Cycle { app, .. } | AppRoute::Raise { app, .. } | AppRoute::Pull { app, .. } | AppRoute::Open { app, .. } | AppRoute::Free { app } => app,
+        }
+    }
+}
+
+/// Ожидание запуска, которое решает судьбу нового нажатия клавиши
+/// приложения: запись того же приложения. Запуск нового экземпляра
+/// (`new`) прежних записей не учитывает и заводит свою (изменение
+/// sticky-chains, решение D7).
+fn pending_for_key(pending: &[Pending], app: &str, new: bool) -> Option<usize> {
+    if new {
+        return None;
+    }
+    pending.iter().position(|p| p.app == app)
+}
+
+/// Ожидание, которому достаётся появившееся окно: самая ранняя подходящая
+/// запись (решение D7), поэтому окна нескольких запусков одного приложения
+/// разбираются в порядке запусков.
+fn pending_for_window(pending: &[Pending], c: &Client, ancestors: &[i32]) -> Option<usize> {
+    pending.iter().position(|p| p.matches(c, ancestors))
 }
 
 /// Запущенные workspace в порядке поиска: список текущего стола по порядку,
@@ -5783,5 +5872,71 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
         let mut ld = e.clone();
         assert_eq!(end_wait(&mut ld, &apps, None, true).len(), 3);
         assert!(ld.iter().all(|x| !x.open()));
+    }
+
+    fn pending(app: &str, pid: u32, class: &str) -> Pending {
+        Pending {
+            app: app.to_string(),
+            workspace: Some("surf".into()),
+            desktop: 2,
+            pid,
+            exe: None,
+            cmd_base: String::new(),
+            class_re: Some(regex::Regex::new(&format!("^(?:{class})$")).unwrap()),
+            title_re: None,
+            exited: true,
+            target: Target::Free(None),
+            focus: true,
+        }
+    }
+
+    #[test]
+    fn new_instance_keeps_own_pending() {
+        // Без --new повторная клавиша находит незавершённый запуск и ждёт его;
+        // с --new заводит свою запись (изменение sticky-chains, решение D7).
+        let list = vec![pending("chrome-ai", 10, "google-chrome-ai")];
+        assert_eq!(pending_for_key(&list, "chrome-ai", false), Some(0));
+        assert_eq!(pending_for_key(&list, "chrome-ai", true), None);
+        assert_eq!(pending_for_key(&list, "yandex", false), None);
+        // Три запуска одного приложения: окна достаются записям по порядку
+        // запусков, самой ранней подходящей.
+        let mut list = vec![pending("chrome-ai", 10, "google-chrome-ai"), pending("chrome-ai", 11, "google-chrome-ai"), pending("chrome-ai", 12, "google-chrome-ai")];
+        let mut got = Vec::new();
+        for addr in ["0xa", "0xb", "0xc"] {
+            let c = crate::hypr::test_client(addr, "google-chrome-ai", "Новая вкладка", "2", &[]);
+            let i = pending_for_window(&list, &c, &[]).unwrap();
+            got.push(list.remove(i).pid);
+        }
+        assert_eq!(got, [10, 11, 12]);
+        // Окно, которое подходит только по pid предка, достаётся своей записи.
+        let list = vec![pending("chrome-ai", 10, "google-chrome-ai"), pending("yandex", 11, "yandex-browser")];
+        let c = crate::hypr::test_client("0xd", "other", "", "2", &[]);
+        assert_eq!(pending_for_window(&list, &c, &[1, 11]), Some(1));
+    }
+
+    #[test]
+    fn new_instance_routes() {
+        // Ключ --new выбирает приложение и workspace тем же путём, что клавиша
+        // без него (решение D6): четыре пути таблицы решения.
+        let cfg = overrides_cfg();
+        let s = |v: &str| v.to_string();
+        let mut d: BTreeMap<u8, Desktop> = BTreeMap::new();
+        d.insert(1, desk(&["work"], Some("work")));
+        d.insert(2, desk(&["surf"], Some("surf")));
+        d.insert(4, Desktop::default());
+        // Приложение в активном workspace текущего стола.
+        let r = key_route(&cfg, &d, 2, "SUPER+V", &[]).unwrap();
+        assert_eq!(r, AppRoute::Cycle { ws: s("surf"), app: s("chrome-ai") });
+        assert_eq!(r.app(), "chrome-ai");
+        // Workspace приложения активен на другом столе.
+        let r = key_route(&cfg, &d, 1, "SUPER+V", &[]).unwrap();
+        assert_eq!(r, AppRoute::Raise { ws: s("surf"), app: s("chrome-ai"), desktop: Some(2) });
+        // На столе другой активный workspace: перетаскивание или открытие.
+        assert_eq!(key_route(&cfg, &d, 1, "SUPER+SHIFT+V", &[]).unwrap().app(), "chrome-ai");
+        d.remove(&2);
+        assert_eq!(key_route(&cfg, &d, 1, "SUPER+V", &[]), Some(AppRoute::Open { ws: s("work"), app: s("chrome-ai") }));
+        // На столе нет активного workspace.
+        assert_eq!(key_route(&cfg, &d, 4, "SUPER+V", &[]), Some(AppRoute::Free { app: s("chrome-ai") }));
+        assert_eq!(app_route(&cfg, &d, 4, &[s("neovide")], false, &[]).app(), "neovide");
     }
 }

@@ -5,27 +5,30 @@
 //! задать полями `desc` и `group`; без них они выводятся из действия. Серия
 //! `range` показывается одной строкой с подписью «1…8». Зарезервированные
 //! сочетания `[keys]` попадают в группу «Раскладка» с описаниями из
-//! `keys.reserved_desc`.
+//! `keys.reserved_desc`. Цепочки с выходом дают строки путей в группе
+//! «Цепочки с выходом» и отдельный раздел `sticky` — плоский список состояний
+//! для индикатора панели (изменение sticky-chains, решение D10).
 
 use anyhow::Result;
 use serde_json::{Value, json};
 
 use crate::config::{Action, Bind, Config, TargetAction};
-use crate::keys::{Act, Chain, Combo, bind_act, chain_compact, check_chains, collect, parse_chain, parse_combo, substitute};
+use crate::keys::{Act, Chain, Combo, StickyBind, StickyGo, StickyNode, bind_act, chain_compact, check_chains, collect, parse_chain, parse_combo, sticky_nodes, sticky_rows, substitute};
 
 /// Группы в порядке показа. Группа из поля `group`, которой здесь нет,
 /// идёт после них в порядке первого появления.
-pub const GROUPS: [&str; 9] = ["Workspace", "Столы", "Приложения", "Окна", "Уведомления", "Звук и яркость", "Снимки экрана", "Раскладка", "Сессия и прочее"];
+pub const GROUPS: [&str; 10] = ["Workspace", "Столы", "Приложения", "Цепочки с выходом", "Окна", "Уведомления", "Звук и яркость", "Снимки экрана", "Раскладка", "Сессия и прочее"];
 
 const G_WORKSPACE: &str = GROUPS[0];
 const G_DESKTOPS: &str = GROUPS[1];
 const G_APPS: &str = GROUPS[2];
-const G_WINDOWS: &str = GROUPS[3];
-const G_NOTIFICATIONS: &str = GROUPS[4];
-const G_SOUND: &str = GROUPS[5];
-const G_SCREENSHOTS: &str = GROUPS[6];
-const G_LAYOUT: &str = GROUPS[7];
-const G_OTHER: &str = GROUPS[8];
+const G_STICKY: &str = GROUPS[3];
+const G_WINDOWS: &str = GROUPS[4];
+const G_NOTIFICATIONS: &str = GROUPS[5];
+const G_SOUND: &str = GROUPS[6];
+const G_SCREENSHOTS: &str = GROUPS[7];
+const G_LAYOUT: &str = GROUPS[8];
+const G_OTHER: &str = GROUPS[9];
 
 /// Строка подсказки.
 #[derive(Debug, Clone, PartialEq)]
@@ -233,6 +236,7 @@ fn default_group(b: &Bind, act: &Act) -> &'static str {
             }
         }
         Act::Lua(_) => G_OTHER,
+        Act::Sticky(_) => G_STICKY,
     }
 }
 
@@ -249,13 +253,60 @@ fn default_desc(b: &Bind, act: &Act) -> String {
     act.describe()
 }
 
+/// Описание клавиши состояния без подписи состояния: поле `desc`, для
+/// перехода — подпись дочернего состояния, для унаследованной клавиши —
+/// описание клавиши приложения, иначе описание действия.
+fn sticky_key_desc(nodes: &[StickyNode], node: &StickyNode, k: &StickyBind) -> String {
+    if let Some(d) = &k.desc {
+        return d.clone();
+    }
+    match &k.go {
+        StickyGo::State(s) => {
+            let sub = format!("{}/{s}", node.submap);
+            nodes.iter().find(|n| n.submap == sub).and_then(|n| n.titles.last().cloned()).unwrap_or_else(|| s.clone())
+        }
+        StickyGo::Act(act) => match (&k.inherited, &k.explicit) {
+            (Some(src), _) => app_key_desc(src),
+            (None, Some(b)) => default_desc(b, act),
+            (None, None) => act.describe(),
+        },
+    }
+}
+
 /// Перечень строк подсказки в порядке конфига.
 pub fn entries(cfg: &Config) -> Result<Vec<Entry>> {
     check_chains(cfg)?;
     let binds = collect(cfg)?;
+    let nodes = sticky_nodes(cfg)?;
     let mut out = Vec::new();
     // Клавиши `[keys]`, приложений и workspace.
     for b in binds.iter().filter(|b| b.origin.is_none()) {
+        // Цепочка с выходом: сочетание входа с подписью корня, затем пути
+        // до состояний и клавиш (решение D10).
+        if let Act::Sticky(name) = &b.act {
+            let root = nodes.iter().find(|n| n.chain == *name && n.names.is_empty());
+            out.push(Entry {
+                chain: chain_compact(&b.chain),
+                label: chain_label(&b.chain),
+                desc: root.and_then(|n| n.titles.first().cloned()).unwrap_or_else(|| name.clone()),
+                group: G_STICKY.to_string(),
+                action: b.act.describe(),
+                source: b.source.clone(),
+            });
+            for r in sticky_rows(&nodes, name) {
+                let node = &nodes[r.node];
+                let k = &node.keys[r.key];
+                let desc = match &k.go {
+                    StickyGo::State(_) => sticky_key_desc(&nodes, node, k),
+                    StickyGo::Act(_) => {
+                        let title = node.titles.last().cloned().unwrap_or_default();
+                        format!("{title} · {}{}", sticky_key_desc(&nodes, node, k), if k.exit { " (выход)" } else { "" })
+                    }
+                };
+                out.push(Entry { chain: chain_compact(&r.chain), label: chain_label(&r.chain), desc, group: G_STICKY.to_string(), action: r.action, source: r.source });
+            }
+            continue;
+        }
         let cmd = match &b.act {
             Act::Daemon(c) => c.strip_prefix("workspaced ").unwrap_or(c).to_string(),
             _ => String::new(),
@@ -349,7 +400,21 @@ pub fn to_json(cfg: &Config) -> Result<Value> {
             json!({ "name": name, "keys": keys })
         })
         .collect();
-    Ok(json!({ "groups": groups }))
+    // Раздел для индикатора цепочки с выходом: состояние находится по имени
+    // подкарты из события композитора без разбора строк (решение D10).
+    let nodes = sticky_nodes(cfg)?;
+    let sticky: Vec<Value> = nodes
+        .iter()
+        .map(|n| {
+            let keys: Vec<Value> = n
+                .keys
+                .iter()
+                .map(|k| json!({ "key": k.key, "label": combo_label(&Combo { mods: Vec::new(), key: k.key.clone() }), "desc": sticky_key_desc(&nodes, n, k), "exit": k.exit }))
+                .collect();
+            json!({ "submap": n.submap, "path": n.titles, "keys": keys })
+        })
+        .collect();
+    Ok(json!({ "groups": groups, "sticky": sticky }))
 }
 
 #[cfg(test)]
@@ -482,5 +547,66 @@ group = "Мои программы"
         let mut c = cfg();
         c.keys.reserved.push("SUPER+R".into());
         assert!(entries(&c).is_err());
+    }
+
+    #[test]
+    fn sticky_entries_and_section() {
+        let text = r#"
+[keys]
+sessions = "SHIFT+SUPER+S"
+[templates.t]
+main = "c"
+cells = { c = { x = 0, y = 0, w = 10, h = 10 }, r = { x = 5, y = 0, w = 5, h = 10 } }
+[apps.neovide]
+cmd = "neovide"
+chain = "SUPER+E"
+[apps.chrome-ai]
+cmd = "chrome"
+chain = "SUPER+SHIFT+V"
+[workspaces.surf]
+template = "t"
+[workspaces.surf.apps]
+chrome-ai = { cell = "r", chain = "SUPER+V" }
+[sticky.apps]
+enter = "SUPER+S"
+title = "Приложения"
+[sticky.apps.keys]
+r = { state = "raise" }
+s = { state = "spawn" }
+[sticky.apps.states.raise]
+title = "Поднять"
+apps = "raise"
+[sticky.apps.states.raise.keys]
+e = { exit = true }
+[sticky.apps.states.spawn]
+title = "Новое окно"
+apps = "spawn"
+[sticky.apps.states.spawn.keys]
+e = { exit = true }
+"#;
+        let cfg = Config::parse(text).unwrap();
+        let list = entries(&cfg).unwrap();
+        let row = |chain: &str| {
+            let e = find(&list, chain);
+            (e.label.clone(), e.desc.clone(), e.group.clone())
+        };
+        let g = "Цепочки с выходом".to_string();
+        assert_eq!(row("SUPER+S"), ("Super+S".into(), "Приложения".into(), g.clone()));
+        assert_eq!(row("SUPER+S r"), ("Super+S r".into(), "Поднять".into(), g.clone()));
+        assert_eq!(row("SUPER+S r v"), ("Super+S r v".into(), "Поднять · chrome-ai в workspace surf".into(), g.clone()));
+        assert_eq!(row("SUPER+S s e"), ("Super+S s e".into(), "Новое окно · Приложение neovide (выход)".into(), g.clone()));
+        assert_eq!(find(&list, "SUPER+S s v").action, "key --new SUPER+V");
+        assert_eq!(find(&list, "SUPER+S r v").source, "sticky.apps.raise");
+        let names: Vec<String> = grouped(&cfg).unwrap().into_iter().map(|(n, _)| n).collect();
+        let at = |n: &str| names.iter().position(|x| x == n).unwrap();
+        assert_eq!(at("Цепочки с выходом"), at("Приложения") + 1, "{names:?}");
+        let v = to_json(&cfg).unwrap();
+        let sticky = v["sticky"].as_array().unwrap();
+        assert_eq!(sticky.len(), 3);
+        let raise = sticky.iter().find(|s| s["submap"] == "ws-sticky:apps/raise").unwrap();
+        assert_eq!(raise["path"], json!(["Приложения", "Поднять"]));
+        assert_eq!(raise["keys"][0], json!({ "key": "e", "label": "e", "desc": "Приложение neovide", "exit": true }));
+        let root = sticky.iter().find(|s| s["submap"] == "ws-sticky:apps").unwrap();
+        assert_eq!(root["keys"][0], json!({ "key": "r", "label": "r", "desc": "Поднять", "exit": false }));
     }
 }
