@@ -1357,7 +1357,7 @@ impl Daemon {
     }
 
     /// Клавиша приложения по нажатой цепочке (изменение workspace-overrides,
-    /// решения D3, D4): приложение и workspace выбираются по активному
+    /// решения D3, D4, D16): приложение и workspace выбираются по активному
     /// workspace текущего стола и ключам приложений в workspace. Цепочка,
     /// на которую не отзывается ни одно приложение, — строка в журнале
     /// без действия.
@@ -1365,7 +1365,13 @@ impl Daemon {
         let parsed = crate::keys::parse_chain(chain)?;
         let chain = crate::keys::chain_compact(&parsed);
         let n = self.current;
-        let Some(route) = key_route(&self.cfg, &self.st.desktops, n, &chain) else {
+        // Приложения окон, входящих в активный workspace стола тегом состава:
+        // клавиша ведёт к окну там, где оно сейчас есть (решение D16).
+        let tagged: Vec<String> = match self.st.desktops.get(&n).and_then(|d| d.active.clone()) {
+            Some(w) => self.hypr.clients()?.iter().filter(|c| c.in_ws(&w)).filter_map(Client::app).collect(),
+            None => Vec::new(),
+        };
+        let Some(route) = key_route(&self.cfg, &self.st.desktops, n, &chain, &tagged) else {
             log::info!("клавиша {chain}: ни одно приложение на неё не отзывается");
             return Ok(());
         };
@@ -2297,31 +2303,38 @@ fn running(desktops: &BTreeMap<u8, Desktop>, current: u8) -> Vec<(String, Option
 }
 
 /// Путь клавиши приложения по нажатой цепочке `chain` (изменение
-/// workspace-overrides, решение D4; спецификация ws-daemon, «Цепочка
+/// workspace-overrides, решения D4 и D16; спецификация ws-daemon, «Цепочка
 /// приложения»). `Own` — приложения с собственной клавишей `chain` по именам,
-/// `W` — активный workspace текущего стола:
+/// кандидаты — `Own` и приложения, которым `chain` назначена ключом в каком-либо
+/// workspace конфига (`Config::key_candidates`), `W` — активный workspace
+/// текущего стола, `tagged` — приложения окон, несущих тег состава `W`:
 ///
-/// 1. `W` откликается на цепочку — цикл отозвавшегося приложения в `W`;
-/// 2. приложение из `Own` описано в `W` — цикл его в `W`;
-/// 3. запущенный `V` откликается на цепочку либо описывает приложение из
+/// 1. клавиша ведёт к окну там, где оно сейчас есть (решение D16): `W`
+///    откликается на цепочку своей записью — цикл отозвавшегося приложения
+///    в `W`; иначе кандидат, который входит в `W` (описан в нём, в том числе
+///    через семейство, входит дополнительным приложением сессии или его окно
+///    несёт тег состава `W`), — цикл его в `W`; из нескольких таких — тот,
+///    чья запись стоит в разделе `W` раньше, а приложения, входящие в `W`
+///    только тегом окна, — после описанных;
+/// 2. запущенный `V` откликается на цепочку либо описывает приложение из
 ///    `Own`, не переопределяя его клавишу (решение D13), — поднять `V`;
-/// 4. приложение из `Own` описано только в запущенных workspace, которые
+/// 3. приложение из `Own` описано только в запущенных workspace, которые
 ///    переопределили его клавишу, — перетащить его окна в `W` (случай «в»),
 ///    а без `W` поднять первый такой workspace;
-/// 5. иначе первое приложение из `Own`, а без собственной клавиши — первое
+/// 4. иначе первое приложение из `Own`, а без собственной клавиши — первое
 ///    по имени, которому цепочка назначена ключом в каком-либо workspace:
 ///    открыть в `W` (случай «а») или цикл вне workspace.
 ///
 /// `None` — на цепочку не отзывается ни одно приложение.
-pub fn key_route(cfg: &Config, desktops: &BTreeMap<u8, Desktop>, current: u8, chain: &str) -> Option<AppRoute> {
+pub fn key_route(cfg: &Config, desktops: &BTreeMap<u8, Desktop>, current: u8, chain: &str, tagged: &[String]) -> Option<AppRoute> {
     let own: Vec<String> = cfg.apps.iter().filter(|(_, a)| a.chain.as_deref().is_some_and(|c| same_chain(c, chain))).map(|(n, _)| n.clone()).collect();
     let active = desktops.get(&current).and_then(|d| d.active.clone());
     if let Some(w) = &active {
         if let Some(app) = cfg.responds(w, chain) {
             return Some(AppRoute::Cycle { ws: w.clone(), app });
         }
-        if let Some(app) = own.iter().find(|x| ws_has_app(cfg, w, x)) {
-            return Some(AppRoute::Cycle { ws: w.clone(), app: app.clone() });
+        if let Some(app) = present_candidate(cfg, w, &cfg.key_candidates(chain), tagged) {
+            return Some(AppRoute::Cycle { ws: w.clone(), app });
         }
     }
     let run = running(desktops, current);
@@ -2349,6 +2362,20 @@ pub fn key_route(cfg: &Config, desktops: &BTreeMap<u8, Desktop>, current: u8, ch
         Some(ws) => AppRoute::Open { ws, app },
         None => AppRoute::Free { app },
     })
+}
+
+/// Кандидат клавиши, входящий в workspace `ws` (решение D16): описанный
+/// в нём, в том числе через семейство или дополнительным приложением сессии,
+/// либо приложение, окно которого несёт тег состава `ws` (`tagged` —
+/// приложения таких окон; окно варианта считается и окном семейства).
+/// Из нескольких — тот, чья запись стоит в разделе `ws` раньше; входящие
+/// только тегом окна идут после описанных, по порядку кандидатов.
+fn present_candidate(cfg: &Config, ws: &str, candidates: &[String], tagged: &[String]) -> Option<String> {
+    let entries: Vec<String> = cfg.workspaces.get(ws).map(|w| w.apps.keys().cloned().collect()).unwrap_or_default();
+    let rank = |x: &String| -> Option<usize> {
+        entries.iter().position(|e| cfg.app_is(x, e)).or_else(|| tagged.iter().any(|t| cfg.app_is(t, x)).then_some(entries.len()))
+    };
+    candidates.iter().filter_map(|x| rank(x).map(|r| (r, x))).min_by_key(|(r, _)| *r).map(|(_, x)| x.clone())
 }
 
 /// Путь команды `workspaced app <имя>` — собственной клавиши приложения
@@ -3757,10 +3784,13 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
     /// переопределения. Семейство `chrome` с вариантом `chrome-ai` — в
     /// `family_cfg`.
     fn overrides_cfg() -> Config {
-        let text = CFG.replace("[apps.calc]", "[apps.chrome]\ncmd = \"chrome\"\nchain = \"SUPER+SHIFT+B\"\n\n[apps.chrome-ai]\ncmd = \"chrome\"\nchain = \"SUPER+SHIFT+V\"\n\n[apps.yandex]\ncmd = \"yandex\"\nchain = \"SUPER+SHIFT+Y\"\n\n[apps.calc]")
+        Config::parse(&overrides_text()).unwrap()
+    }
+
+    fn overrides_text() -> String {
+        CFG.replace("[apps.calc]", "[apps.chrome]\ncmd = \"chrome\"\nchain = \"SUPER+SHIFT+B\"\n\n[apps.chrome-ai]\ncmd = \"chrome\"\nchain = \"SUPER+SHIFT+V\"\n\n[apps.yandex]\ncmd = \"yandex\"\nchain = \"SUPER+SHIFT+Y\"\n\n[apps.calc]")
             .replace("[apps.herdr]\n", "[apps.herdr]\nchain = \"SUPER+T\"\n")
-            + "\n[workspaces.surf]\ntemplate = \"thirds\"\nmode = \"stack\"\n[workspaces.surf.apps]\nchrome = { cell = \"left\", chain = \"SUPER+B\" }\nyandex = { cell = \"center\", chain = \"SUPER+Y\" }\nchrome-ai = { cell = \"right\", chain = \"SUPER+V\" }\n\n[workspaces.ai]\ntemplate = \"thirds\"\napps = { chrome-ai = \"center\" }\n";
-        Config::parse(&text).unwrap()
+            + "\n[workspaces.surf]\ntemplate = \"thirds\"\nmode = \"stack\"\n[workspaces.surf.apps]\nchrome = { cell = \"left\", chain = \"SUPER+B\" }\nyandex = { cell = \"center\", chain = \"SUPER+Y\" }\nchrome-ai = { cell = \"right\", chain = \"SUPER+V\" }\n\n[workspaces.ai]\ntemplate = \"thirds\"\napps = { chrome-ai = \"center\" }\n"
     }
 
     fn family_cfg() -> Config {
@@ -3780,47 +3810,89 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
         let mut d: BTreeMap<u8, Desktop> = BTreeMap::new();
         d.insert(1, desk(&["work"], Some("work")));
         d.insert(2, desk(&["surf"], Some("surf")));
-        // Шаги 1 и 2: в surf обе клавиши ведут цикл chrome-ai.
-        assert_eq!(key_route(&cfg, &d, 2, "SUPER+V"), Some(AppRoute::Cycle { ws: s("surf"), app: s("chrome-ai") }));
-        assert_eq!(key_route(&cfg, &d, 2, "super+shift+v"), Some(AppRoute::Cycle { ws: s("surf"), app: s("chrome-ai") }));
+        // Шаг 1: в surf обе клавиши ведут цикл chrome-ai.
+        assert_eq!(key_route(&cfg, &d, 2, "SUPER+V", &[]), Some(AppRoute::Cycle { ws: s("surf"), app: s("chrome-ai") }));
+        assert_eq!(key_route(&cfg, &d, 2, "super+shift+v", &[]), Some(AppRoute::Cycle { ws: s("surf"), app: s("chrome-ai") }));
         // Шаг 1 в work: собственная клавиша приложения work.
-        assert_eq!(key_route(&cfg, &d, 1, "SUPER+T"), Some(AppRoute::Cycle { ws: s("work"), app: s("herdr") }));
-        // Шаг 3: клавиша surf поднимает surf на его столе.
-        assert_eq!(key_route(&cfg, &d, 1, "SUPER+V"), Some(AppRoute::Raise { ws: s("surf"), app: s("chrome-ai"), desktop: Some(2) }));
-        // Шаг 4, случай «в»: собственная клавиша перетаскивает окна в work.
-        assert_eq!(key_route(&cfg, &d, 1, "SUPER+SHIFT+V"), Some(AppRoute::Pull { ws: s("work"), app: s("chrome-ai") }));
-        assert_eq!(key_route(&cfg, &d, 1, "SUPER+SHIFT+Y"), Some(AppRoute::Pull { ws: s("work"), app: s("yandex") }));
+        assert_eq!(key_route(&cfg, &d, 1, "SUPER+T", &[s("chrome-ai")]), Some(AppRoute::Cycle { ws: s("work"), app: s("herdr") }));
+        assert_eq!(key_route(&cfg, &d, 1, "SUPER+T", &[]), Some(AppRoute::Cycle { ws: s("work"), app: s("herdr") }));
+        // Шаг 2: клавиша surf поднимает surf на его столе, пока окна chrome-ai
+        // в work нет.
+        assert_eq!(key_route(&cfg, &d, 1, "SUPER+V", &[]), Some(AppRoute::Raise { ws: s("surf"), app: s("chrome-ai"), desktop: Some(2) }));
+        // Шаг 3, случай «в»: собственная клавиша перетаскивает окна в work.
+        assert_eq!(key_route(&cfg, &d, 1, "SUPER+SHIFT+V", &[]), Some(AppRoute::Pull { ws: s("work"), app: s("chrome-ai") }));
+        assert_eq!(key_route(&cfg, &d, 1, "SUPER+SHIFT+Y", &[]), Some(AppRoute::Pull { ws: s("work"), app: s("yandex") }));
         // Смешанный случай: ai описывает chrome-ai без переопределения — случай «б».
         d.insert(3, desk(&["ai"], Some("ai")));
-        assert_eq!(key_route(&cfg, &d, 1, "SUPER+SHIFT+V"), Some(AppRoute::Raise { ws: s("ai"), app: s("chrome-ai"), desktop: Some(3) }));
+        assert_eq!(key_route(&cfg, &d, 1, "SUPER+SHIFT+V", &[]), Some(AppRoute::Raise { ws: s("ai"), app: s("chrome-ai"), desktop: Some(3) }));
         d.remove(&3);
         // Без активного workspace: обе клавиши поднимают surf.
         d.insert(4, Desktop::default());
-        assert_eq!(key_route(&cfg, &d, 4, "SUPER+V"), Some(AppRoute::Raise { ws: s("surf"), app: s("chrome-ai"), desktop: Some(2) }));
-        assert_eq!(key_route(&cfg, &d, 4, "SUPER+SHIFT+V"), Some(AppRoute::Raise { ws: s("surf"), app: s("chrome-ai"), desktop: Some(2) }));
-        // Шаг 5: surf не запущен — обе клавиши открывают chrome-ai в work,
+        assert_eq!(key_route(&cfg, &d, 4, "SUPER+V", &[]), Some(AppRoute::Raise { ws: s("surf"), app: s("chrome-ai"), desktop: Some(2) }));
+        assert_eq!(key_route(&cfg, &d, 4, "SUPER+SHIFT+V", &[]), Some(AppRoute::Raise { ws: s("surf"), app: s("chrome-ai"), desktop: Some(2) }));
+        // Шаг 4: surf не запущен — обе клавиши открывают chrome-ai в work,
         // а на столе без workspace — цикл вне workspace.
         d.remove(&2);
-        assert_eq!(key_route(&cfg, &d, 1, "SUPER+V"), Some(AppRoute::Open { ws: s("work"), app: s("chrome-ai") }));
-        assert_eq!(key_route(&cfg, &d, 1, "SUPER+SHIFT+V"), Some(AppRoute::Open { ws: s("work"), app: s("chrome-ai") }));
-        assert_eq!(key_route(&cfg, &d, 4, "SUPER+V"), Some(AppRoute::Free { app: s("chrome-ai") }));
+        assert_eq!(key_route(&cfg, &d, 1, "SUPER+V", &[]), Some(AppRoute::Open { ws: s("work"), app: s("chrome-ai") }));
+        assert_eq!(key_route(&cfg, &d, 1, "SUPER+SHIFT+V", &[]), Some(AppRoute::Open { ws: s("work"), app: s("chrome-ai") }));
+        assert_eq!(key_route(&cfg, &d, 4, "SUPER+V", &[]), Some(AppRoute::Free { app: s("chrome-ai") }));
         // На цепочку никто не отзывается.
-        assert_eq!(key_route(&cfg, &d, 1, "SUPER+F12"), None);
+        assert_eq!(key_route(&cfg, &d, 1, "SUPER+F12", &[]), None);
 
         // Семейство (решение D6): mix описывает только семейство, pair — оба.
         let cfg = family_cfg();
         let mut d: BTreeMap<u8, Desktop> = BTreeMap::new();
         d.insert(1, desk(&["mix"], Some("mix")));
         d.insert(2, desk(&["pair"], Some("pair")));
-        assert_eq!(key_route(&cfg, &d, 1, "SUPER+B"), Some(AppRoute::Cycle { ws: s("mix"), app: s("chrome") }));
-        assert_eq!(key_route(&cfg, &d, 1, "SUPER+V"), Some(AppRoute::Cycle { ws: s("mix"), app: s("chrome-ai") }));
-        assert_eq!(key_route(&cfg, &d, 2, "SUPER+B"), Some(AppRoute::Cycle { ws: s("pair"), app: s("chrome") }));
-        assert_eq!(key_route(&cfg, &d, 2, "SUPER+V"), Some(AppRoute::Cycle { ws: s("pair"), app: s("chrome-ai") }));
+        assert_eq!(key_route(&cfg, &d, 1, "SUPER+B", &[]), Some(AppRoute::Cycle { ws: s("mix"), app: s("chrome") }));
+        assert_eq!(key_route(&cfg, &d, 1, "SUPER+V", &[]), Some(AppRoute::Cycle { ws: s("mix"), app: s("chrome-ai") }));
+        assert_eq!(key_route(&cfg, &d, 2, "SUPER+B", &[]), Some(AppRoute::Cycle { ws: s("pair"), app: s("chrome") }));
+        assert_eq!(key_route(&cfg, &d, 2, "SUPER+V", &[]), Some(AppRoute::Cycle { ws: s("pair"), app: s("chrome-ai") }));
         // Вариант, описанный в запущенном mix только через семейство, клавишу
         // не переопределяет: из work mix поднимается (решение D13).
         d.insert(3, desk(&["work"], Some("work")));
         d.remove(&2);
-        assert_eq!(key_route(&cfg, &d, 3, "SUPER+V"), Some(AppRoute::Raise { ws: s("mix"), app: s("chrome-ai"), desktop: Some(1) }));
+        assert_eq!(key_route(&cfg, &d, 3, "SUPER+V", &[]), Some(AppRoute::Raise { ws: s("mix"), app: s("chrome-ai"), desktop: Some(1) }));
+    }
+
+    #[test]
+    fn key_route_follows_window_in_active_ws() {
+        // Решение D16: клавиша ведёт к окну там, где оно сейчас есть.
+        let cfg = overrides_cfg();
+        let s = |v: &str| v.to_string();
+        let mut d: BTreeMap<u8, Desktop> = BTreeMap::new();
+        d.insert(1, desk(&["work"], Some("work")));
+        d.insert(2, desk(&["surf"], Some("surf")));
+        // Общее окно chrome-ai входит в work тегом: клавиша переопределения
+        // surf ведёт цикл в work, стол не меняется.
+        let ai = [s("chrome-ai")];
+        assert_eq!(key_route(&cfg, &d, 1, "SUPER+V", &ai), Some(AppRoute::Cycle { ws: s("work"), app: s("chrome-ai") }));
+        // Собственная клавиша — так же, без перетаскивания.
+        assert_eq!(key_route(&cfg, &d, 1, "SUPER+SHIFT+V", &ai), Some(AppRoute::Cycle { ws: s("work"), app: s("chrome-ai") }));
+        // Окна в work нет — прежние шаги: поднять surf, перетащить собственной
+        // клавишей.
+        assert_eq!(key_route(&cfg, &d, 1, "SUPER+V", &[s("herdr")]), Some(AppRoute::Raise { ws: s("surf"), app: s("chrome-ai"), desktop: Some(2) }));
+        assert_eq!(key_route(&cfg, &d, 1, "SUPER+SHIFT+V", &[]), Some(AppRoute::Pull { ws: s("work"), app: s("chrome-ai") }));
+        // Окно другого приложения клавишу не перехватывает.
+        assert_eq!(key_route(&cfg, &d, 1, "SUPER+B", &ai), Some(AppRoute::Raise { ws: s("surf"), app: s("chrome"), desktop: Some(2) }));
+
+        // Два кандидата: surf назначает Super+V приложению chrome-ai, web —
+        // приложению chrome. В both описаны оба: действует запись, стоящая
+        // раньше; описанное приложение идёт раньше входящего только тегом.
+        let text = format!(
+            "{}\n[workspaces.web]\ntemplate = \"thirds\"\napps = {{ chrome = {{ cell = \"left\", chain = \"SUPER+V\" }} }}\n\n[workspaces.both]\ntemplate = \"thirds\"\n[workspaces.both.apps]\nyandex = \"left\"\nchrome-ai = \"center\"\nchrome = \"right\"\n",
+            overrides_text()
+        );
+        let cfg = Config::parse(&text).unwrap();
+        assert_eq!(cfg.key_candidates("SUPER+V"), vec![s("chrome"), s("chrome-ai")]);
+        d.insert(3, desk(&["both"], Some("both")));
+        assert_eq!(key_route(&cfg, &d, 3, "SUPER+V", &[]), Some(AppRoute::Cycle { ws: s("both"), app: s("chrome-ai") }));
+        // В work оба входят только тегом: первый по порядку кандидатов.
+        assert_eq!(key_route(&cfg, &d, 1, "SUPER+V", &[s("chrome-ai"), s("chrome")]), Some(AppRoute::Cycle { ws: s("work"), app: s("chrome") }));
+        assert_eq!(key_route(&cfg, &d, 1, "SUPER+V", &ai), Some(AppRoute::Cycle { ws: s("work"), app: s("chrome-ai") }));
+        // Ни одного окна в work: поднимается первый откликнувшийся запущенный
+        // workspace, как раньше.
+        assert_eq!(key_route(&cfg, &d, 1, "SUPER+V", &[]), Some(AppRoute::Raise { ws: s("surf"), app: s("chrome-ai"), desktop: Some(2) }));
     }
 
     #[test]

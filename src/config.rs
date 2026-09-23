@@ -785,6 +785,23 @@ impl Config {
         w.apps.keys().find(|a| self.app_key(ws, a).is_some_and(|k| crate::keys::same_chain(k, chain))).cloned()
     }
 
+    /// Приложения, на которые может указывать цепочка (решение D16): сначала
+    /// приложения с такой собственной клавишей, затем приложения, которым она
+    /// назначена ключом записи в каком-либо workspace; порядок внутри групп —
+    /// по именам, без повторов.
+    pub fn key_candidates(&self, chain: &str) -> Vec<String> {
+        let same = |c: Option<&str>| c.is_some_and(|c| crate::keys::same_chain(c, chain));
+        let own = self.apps.iter().filter(|(_, a)| same(a.chain.as_deref())).map(|(n, _)| n.clone());
+        let over = self.apps.keys().filter(|a| self.workspaces.values().any(|w| same(w.apps.get(*a).and_then(|e| e.chain.as_deref())))).cloned();
+        let mut out: Vec<String> = Vec::new();
+        for a in own.chain(over) {
+            if !out.contains(&a) {
+                out.push(a);
+            }
+        }
+        out
+    }
+
     /// Варианты семейства по именам.
     pub fn variants_of(&self, family: &str) -> Vec<&str> {
         self.apps.iter().filter(|(_, a)| a.family.as_deref() == Some(family)).map(|(n, _)| n.as_str()).collect()
