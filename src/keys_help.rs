@@ -7,13 +7,16 @@
 //! сочетания `[keys]` попадают в группу «Раскладка» с описаниями из
 //! `keys.reserved_desc`. Цепочки с выходом дают строки путей в группе
 //! «Цепочки с выходом» и отдельный раздел `sticky` — плоский список состояний
-//! для индикатора панели (изменение sticky-chains, решение D10).
+//! для индикатора панели (изменение sticky-chains, решение D10). В разделе
+//! `sticky` есть и автоматические режимы многозвенных цепочек (изменение
+//! chains-sticky): подпись режима — подпись префикса, описания клавиш — как
+//! у строк подсказки.
 
 use anyhow::Result;
 use serde_json::{Value, json};
 
 use crate::config::{Action, Bind, Config, TargetAction};
-use crate::keys::{Act, Chain, Combo, StickyBind, StickyGo, StickyNode, bind_act, chain_compact, check_chains, collect, parse_chain, parse_combo, sticky_nodes, sticky_rows, substitute};
+use crate::keys::{Act, Binding, Chain, Combo, StickyBind, StickyGo, StickyNode, bind_act, chain_compact, chain_key, check_chains, collect, expand_range, parse_chain, parse_combo, sticky_nodes, sticky_rows, substitute};
 
 /// Группы в порядке показа. Группа из поля `group`, которой здесь нет,
 /// идёт после них в порядке первого появления.
@@ -253,22 +256,64 @@ fn default_desc(b: &Bind, act: &Act) -> String {
     act.describe()
 }
 
+/// Описание и группа привязки из `[keys]`, приложений и workspace.
+fn own_desc(b: &Binding) -> (String, &'static str) {
+    let cmd = match &b.act {
+        Act::Daemon(c) => c.strip_prefix("workspaced ").unwrap_or(c).to_string(),
+        _ => String::new(),
+    };
+    if cmd.starts_with("key ") {
+        (app_key_desc(&b.source), G_APPS)
+    } else if let Some(w) = cmd.strip_prefix("raise ") {
+        (format!("Поднять workspace {w}"), G_WORKSPACE)
+    } else {
+        (daemon_desc(&cmd).unwrap_or_else(|| b.act.describe()), G_WORKSPACE)
+    }
+}
+
+/// Описание привязки сессии, как в подсказке: у записи `[[binds]]` — её
+/// поле `desc` (с подстановкой номера серии) либо описание действия.
+fn binding_desc(cfg: &Config, b: &Binding) -> String {
+    let Some(i) = b.origin else {
+        return own_desc(b).0;
+    };
+    let key = chain_key(&b.chain);
+    let raw = &cfg.binds[i];
+    match expand_range(raw).into_iter().find(|e| parse_chain(&e.chain).is_ok_and(|c| chain_key(&c) == key)) {
+        Some(e) => e.desc.clone().unwrap_or_else(|| default_desc(&e, &b.act)),
+        None => b.act.describe(),
+    }
+}
+
+/// Подпись клавиши состояния с её модификаторами.
+fn sticky_key_label(k: &StickyBind) -> String {
+    combo_label(&k.combo())
+}
+
 /// Описание клавиши состояния без подписи состояния: поле `desc`, для
-/// перехода — подпись дочернего состояния, для унаследованной клавиши —
-/// описание клавиши приложения, иначе описание действия.
-fn sticky_key_desc(nodes: &[StickyNode], node: &StickyNode, k: &StickyBind) -> String {
+/// перехода — подпись дочернего состояния (у автоматического режима —
+/// клавиши следующего звена), для унаследованной клавиши — описание клавиши
+/// приложения, для звена многозвенной цепочки — описание её привязки,
+/// иначе описание действия.
+fn sticky_key_desc(cfg: &Config, nodes: &[StickyNode], node: &StickyNode, k: &StickyBind) -> String {
     if let Some(d) = &k.desc {
         return d.clone();
     }
     match &k.go {
         StickyGo::State(s) => {
             let sub = format!("{}/{s}", node.submap);
-            nodes.iter().find(|n| n.submap == sub).and_then(|n| n.titles.last().cloned()).unwrap_or_else(|| s.clone())
+            let child = nodes.iter().find(|n| n.submap == sub);
+            match child {
+                Some(n) if n.auto => format!("Далее: {}", n.keys.iter().map(sticky_key_label).collect::<Vec<_>>().join(", ")),
+                Some(n) => n.titles.last().cloned().unwrap_or_else(|| s.clone()),
+                None => s.clone(),
+            }
         }
-        StickyGo::Act(act) => match (&k.inherited, &k.explicit) {
-            (Some(src), _) => app_key_desc(src),
-            (None, Some(b)) => default_desc(b, act),
-            (None, None) => act.describe(),
+        StickyGo::Act(act) => match (&k.inherited, &k.explicit, &k.binding) {
+            (Some(src), _, _) => app_key_desc(src),
+            (None, Some(b), _) => default_desc(b, act),
+            (None, None, Some(b)) => binding_desc(cfg, b),
+            (None, None, None) => act.describe(),
         },
     }
 }
@@ -297,27 +342,17 @@ pub fn entries(cfg: &Config) -> Result<Vec<Entry>> {
                 let node = &nodes[r.node];
                 let k = &node.keys[r.key];
                 let desc = match &k.go {
-                    StickyGo::State(_) => sticky_key_desc(&nodes, node, k),
+                    StickyGo::State(_) => sticky_key_desc(cfg, &nodes, node, k),
                     StickyGo::Act(_) => {
                         let title = node.titles.last().cloned().unwrap_or_default();
-                        format!("{title} · {}{}", sticky_key_desc(&nodes, node, k), if k.exit { " (выход)" } else { "" })
+                        format!("{title} · {}{}", sticky_key_desc(cfg, &nodes, node, k), if k.exit { " (выход)" } else { "" })
                     }
                 };
                 out.push(Entry { chain: chain_compact(&r.chain), label: chain_label(&r.chain), desc, group: G_STICKY.to_string(), action: r.action, source: r.source });
             }
             continue;
         }
-        let cmd = match &b.act {
-            Act::Daemon(c) => c.strip_prefix("workspaced ").unwrap_or(c).to_string(),
-            _ => String::new(),
-        };
-        let (desc, group) = if cmd.starts_with("key ") {
-            (app_key_desc(&b.source), G_APPS)
-        } else if let Some(w) = cmd.strip_prefix("raise ") {
-            (format!("Поднять workspace {w}"), G_WORKSPACE)
-        } else {
-            (daemon_desc(&cmd).unwrap_or_else(|| b.act.describe()), G_WORKSPACE)
-        };
+        let (desc, group) = own_desc(b);
         out.push(Entry {
             chain: chain_compact(&b.chain),
             label: chain_label(&b.chain),
@@ -402,6 +437,9 @@ pub fn to_json(cfg: &Config) -> Result<Value> {
         .collect();
     // Раздел для индикатора цепочки с выходом: состояние находится по имени
     // подкарты из события композитора без разбора строк (решение D10).
+    // В нём и автоматические режимы многозвенных цепочек: путь — подписи
+    // звеньев («Super+Tab»), клавиши — последние звенья с описаниями, как
+    // в подсказке (изменение chains-sticky).
     let nodes = sticky_nodes(cfg)?;
     let sticky: Vec<Value> = nodes
         .iter()
@@ -409,7 +447,7 @@ pub fn to_json(cfg: &Config) -> Result<Value> {
             let keys: Vec<Value> = n
                 .keys
                 .iter()
-                .map(|k| json!({ "key": k.key, "label": combo_label(&Combo { mods: Vec::new(), key: k.key.clone() }), "desc": sticky_key_desc(&nodes, n, k), "exit": k.exit }))
+                .map(|k| json!({ "key": k.combo().compact(), "label": sticky_key_label(k), "desc": sticky_key_desc(cfg, &nodes, n, k), "exit": k.exit }))
                 .collect();
             json!({ "submap": n.submap, "path": n.titles, "keys": keys })
         })
@@ -547,6 +585,48 @@ group = "Мои программы"
         let mut c = cfg();
         c.keys.reserved.push("SUPER+R".into());
         assert!(entries(&c).is_err());
+    }
+
+    #[test]
+    fn chain_modes_in_sticky_section() {
+        let mut c = cfg();
+        c.keys.save_workspace = Some("CTRL+SUPER+s CTRL+SUPER+w".into());
+        let text = r#"
+[templates.t]
+main = "c"
+cells = { c = { x = 0, y = 0, w = 10, h = 10 } }
+[workspaces.work]
+template = "t"
+chain = "SUPER+TAB w"
+[[binds]]
+chain = "SUPER+W 3 f"
+exec = "true"
+desc = "Проверка"
+"#;
+        let extra = Config::parse(text).unwrap();
+        let v = to_json(&extra).unwrap();
+        let sticky = v["sticky"].as_array().unwrap();
+        let w = sticky.iter().find(|s| s["submap"] == "ws-sticky:SUPER+W").unwrap();
+        assert_eq!(w["path"], json!(["Super+W"]));
+        assert_eq!(w["keys"][0], json!({ "key": "3", "label": "3", "desc": "Далее: f", "exit": false }));
+        let w3 = sticky.iter().find(|s| s["submap"] == "ws-sticky:SUPER+W/3").unwrap();
+        assert_eq!(w3["path"], json!(["Super+W", "3"]));
+        assert_eq!(w3["keys"][0], json!({ "key": "f", "label": "f", "desc": "Проверка", "exit": true }));
+        let tab = sticky.iter().find(|s| s["submap"] == "ws-sticky:SUPER+TAB").unwrap();
+        assert_eq!(tab["keys"][0], json!({ "key": "w", "label": "w", "desc": "Поднять workspace work", "exit": true }));
+
+        // Сохранение: звенья с модификаторами — подписи с модификаторами.
+        let v = to_json(&c).unwrap();
+        let sticky = v["sticky"].as_array().unwrap();
+        let save = sticky.iter().find(|s| s["submap"] == "ws-sticky:SUPER+CTRL+s").unwrap();
+        assert_eq!(save["path"], json!(["Ctrl+Super+S"]));
+        assert_eq!(save["keys"][0], json!({ "key": "SUPER+CTRL+s", "label": "Ctrl+Super+S", "desc": "Записать снимок сессии", "exit": true }));
+        assert_eq!(save["keys"][1], json!({ "key": "SUPER+CTRL+w", "label": "Ctrl+Super+W", "desc": "Записать workspace в конфиг", "exit": true }));
+        let tab = sticky.iter().find(|s| s["submap"] == "ws-sticky:SUPER+TAB").unwrap();
+        let keys: Vec<(String, String)> = tab["keys"].as_array().unwrap().iter().map(|k| (k["label"].as_str().unwrap().to_string(), k["desc"].as_str().unwrap().to_string())).collect();
+        assert_eq!(keys, [("Tab".to_string(), "Следующий workspace стола".to_string()), ("s".to_string(), "Поднять workspace surf".to_string())]);
+        // Строки групп подсказки остаются прежними.
+        assert_eq!(find(&entries(&c).unwrap(), "SUPER+CTRL+s SUPER+CTRL+w").group, "Workspace");
     }
 
     #[test]

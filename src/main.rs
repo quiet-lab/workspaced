@@ -259,5 +259,8 @@ fn check() -> anyhow::Result<()> {
     for (name, root) in &cfg.sticky {
         println!("  цепочка с выходом {name} ({})", root.enter.as_deref().unwrap_or(""));
     }
+    for node in keys::auto_nodes(&binds)?.iter().filter(|n| n.names.is_empty()) {
+        println!("  режим цепочек {} ({})", keys::chain_compact(&node.prefix), node.source);
+    }
     Ok(())
 }
