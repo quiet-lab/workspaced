@@ -24,7 +24,7 @@ enum Target {
     /// Прямоугольник ячейки или `rect` приложения на столе.
     Place(PxRect),
     /// Приложение вне workspace: своё место по умолчанию (`rect` приложения),
-    /// а без него центр экрана; окно ложится поверх остальных.
+    /// а без него центр рабочей области; окно ложится поверх остальных.
     Free(Option<PxRect>),
     /// Парковка (загрузка сессии для неактивного workspace).
     Pool,
@@ -497,6 +497,19 @@ impl Daemon {
         self.mon
     }
 
+    /// Рабочая область монитора — без зон, объявленных слоями (панель слева).
+    /// Читается у композитора в момент вызова: панель могла запуститься позже
+    /// демона. Если прочитать не удалось, рабочей областью считается весь монитор.
+    pub fn work_area(&self) -> PxRect {
+        match self.hypr.active_monitor() {
+            Ok(m) => m.work_area(),
+            Err(e) => {
+                log::warn!("рабочая область монитора: {e:#}; центр считается по всему монитору");
+                PxRect { x: 0, y: 0, w: self.mon.0, h: self.mon.1 }
+            }
+        }
+    }
+
     /// Записать снимок сессии `default`. Вызывается только явной командой
     /// сохранения — `save-session` и загрузкой именованной сессии, которая
     /// страхует прежнее состояние (решение D6): события композитора и прочие
@@ -752,7 +765,7 @@ impl Daemon {
                 if c.desktop() != Some(p.desktop) {
                     ex.push(hypr::d_move_to(&c.address, &p.desktop.to_string()));
                 }
-                let r = rect.unwrap_or_else(|| center_rect(c, self.mon));
+                let r = rect.unwrap_or_else(|| center_rect(c, self.work_area()));
                 ex.extend(hypr::d_place(&c.address, r));
                 match &joining {
                     Some(w) => match share_record(&self.cfg_file, &self.st.extra, &p.app, r) {
@@ -834,7 +847,7 @@ impl Daemon {
             Join::AppPlace(app) => {
                 let w = ws.unwrap_or_default().to_string();
                 let cfg = self.cfg.clone();
-                let rect = open_rect(&mut self.st, &cfg, Some(&w), &app, self.mon).unwrap_or_else(|| center_rect(c, self.mon));
+                let rect = open_rect(&mut self.st, &cfg, Some(&w), &app, self.mon).unwrap_or_else(|| center_rect(c, self.work_area()));
                 self.remember_extra(&w, &app, ExtraApp { rect, ..ExtraApp::default() });
                 self.st.foreign.remove(&c.address);
                 log::info!("окно {} ({}) принято в workspace {w} приложением конфига {app}", c.address, c.class);
@@ -842,7 +855,7 @@ impl Daemon {
             }
             Join::Extra(name) => {
                 let w = ws.unwrap_or_default().to_string();
-                let rect = center_rect(c, self.mon);
+                let rect = center_rect(c, self.work_area());
                 self.remember_extra(&w, &name, ExtraApp { class: Some(c.class.clone()), cmd, cwd, rect });
                 self.st.foreign.remove(&c.address);
                 log::info!("окно {} ({}) принято в workspace {w} дополнительным приложением сессии {name}", c.address, c.class);
@@ -1581,7 +1594,7 @@ impl Daemon {
     /// Приложение вне workspace: цикл по его окнам без prev и без следующего
     /// приложения, поэтому за последним экземпляром идёт первый. Окно,
     /// которого ещё нет, открывается на своём месте по умолчанию (`rect`
-    /// приложения, а без него — центр экрана).
+    /// приложения, а без него — центр рабочей области).
     fn cycle_free(&mut self, app: &str, apps: &[String], n: u8) -> Result<()> {
         let mut clients = self.hypr.clients()?;
         self.adopt_untagged(&mut clients, apps, None)?;
@@ -1629,7 +1642,7 @@ impl Daemon {
             log::info!("workspace {ws}: окон {app} нет, приложение запускается в нём");
             return self.spawn(app, Some(ws), n, Target::Free(rect), true);
         };
-        let rect = rect.unwrap_or_else(|| center_rect(first, self.mon));
+        let rect = rect.unwrap_or_else(|| center_rect(first, self.work_area()));
         if !ws_has_app(&cfg, ws, app) {
             match share_record(&self.cfg_file, &self.st.extra, app, rect) {
                 Some(e) => {
@@ -1757,7 +1770,8 @@ impl Daemon {
         // Расстановка возвращает раскладку к описанию (изменение live-layout,
         // решение D10): изменённые места снимаются, запомненные прямоугольники
         // окон заменяются местами плана; обмен мест сохраняется.
-        let plan = arrange_layout(&mut self.st, &cfg, ws.as_deref(), &windows, self.mon);
+        let area = self.work_area();
+        let plan = arrange_layout(&mut self.st, &cfg, ws.as_deref(), &windows, self.mon, area);
         let mut ex: Vec<String> = plan.iter().flat_map(|(addr, r)| hypr::d_place(addr, *r)).collect();
         // Фокус остаётся у активного окна, а само окно поднимается наверх своей стопки.
         if let Some(a) = self.hypr.active_window()?.filter(|c| c.desktop() == Some(n)).map(|c| c.address) {
@@ -3419,14 +3433,14 @@ pub fn depth_plan(order: &[String], main: Option<&str>, main_on_top: bool) -> Ve
 /// по правилу мест; окно без описания — в положение по умолчанию, а окна
 /// одного класса без описания образуют одну стопку на месте первого из них.
 /// Окна передаются по порядку появления: он и задаёт это первое окно.
-pub fn arrange_plan(st: &mut State, cfg: &Config, ws: Option<&str>, windows: &[&Client], mon: (i32, i32)) -> Vec<(String, PxRect)> {
+pub fn arrange_plan(st: &mut State, cfg: &Config, ws: Option<&str>, windows: &[&Client], mon: (i32, i32), area: PxRect) -> Vec<(String, PxRect)> {
     let mut stacks: BTreeMap<String, PxRect> = BTreeMap::new();
     let mut plan = Vec::new();
     for c in windows {
         let rect = c.app().filter(|a| cfg.apps.contains_key(a)).and_then(|a| open_rect(st, cfg, ws, &a, mon));
         let r = match rect {
             Some(r) => r,
-            None => *stacks.entry(c.class.clone()).or_insert_with(|| center_rect(c, mon)),
+            None => *stacks.entry(c.class.clone()).or_insert_with(|| center_rect(c, area)),
         };
         plan.push((c.address.clone(), r));
     }
@@ -3439,11 +3453,11 @@ pub fn arrange_plan(st: &mut State, cfg: &Config, ws: Option<&str>, windows: &[&
 /// а запомненные прямоугольники окон `ws` заменяются местами плана у окон
 /// этого стола и забываются у остальных. Назначение мест и главное
 /// приложение не меняются.
-pub fn arrange_layout(st: &mut State, cfg: &Config, ws: Option<&str>, windows: &[&Client], mon: (i32, i32)) -> Vec<(String, PxRect)> {
+pub fn arrange_layout(st: &mut State, cfg: &Config, ws: Option<&str>, windows: &[&Client], mon: (i32, i32), area: PxRect) -> Vec<(String, PxRect)> {
     if let Some(w) = ws {
         st.moved.remove(w);
     }
-    let plan = arrange_plan(st, cfg, ws, windows, mon);
+    let plan = arrange_plan(st, cfg, ws, windows, mon, area);
     if let Some(w) = ws {
         let ws_apps: Vec<String> = cfg.workspaces.get(w).map(|x| x.apps.keys().cloned().collect()).unwrap_or_default();
         let g = st.geom.entry(w.to_string()).or_default();
@@ -3457,10 +3471,13 @@ pub fn arrange_layout(st: &mut State, cfg: &Config, ws: Option<&str>, windows: &
     plan
 }
 
-/// Положение по умолчанию: центр экрана с нынешним размером окна — так ставит
-/// новое окно и композитор по правилам `float-by-default` и `center` сессии.
-fn center_rect(c: &Client, mon: (i32, i32)) -> PxRect {
-    PxRect { x: (mon.0 - c.size.0) / 2, y: (mon.1 - c.size.1) / 2, w: c.size.0, h: c.size.1 }
+/// Положение по умолчанию: центр рабочей области (монитор без зоны, которую
+/// занимает панель) с нынешним размером окна — так ставит новое плавающее
+/// окно и композитор по правилам `float-by-default` и `center` сессии.
+/// Симметричный отступ 10 px от краёв центра не сдвигает, поэтому центр
+/// совпадает с центром ячеек шаблонов (340…3830 при панели 330 px).
+fn center_rect(c: &Client, area: PxRect) -> PxRect {
+    PxRect { x: area.x + (area.w - c.size.0) / 2, y: area.y + (area.h - c.size.1) / 2, w: c.size.0, h: c.size.1 }
 }
 
 /// Окна, которые пора освободить: тег называет приложение, которого
@@ -3890,6 +3907,22 @@ fn grid_cell(work_area: PxRect, gap: i32, cols: i32, rows: i32, col: i32, row: i
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Рабочая область монитора 3840×2160 с панелью 330 px слева.
+    const PANEL_AREA: PxRect = PxRect { x: 330, y: 0, w: 3510, h: 2160 };
+
+    #[test]
+    fn center_rect_in_work_area() {
+        let mut c = client("0x1", "wev", "", "1", &[]);
+        c.size = (1920, 1080);
+        // Центр совпадает с тем, что даёт композитор (hl.dsp.window.center),
+        // и с ячейкой center шаблонов: x = 1125.
+        assert_eq!(center_rect(&c, PANEL_AREA), PxRect { x: 1125, y: 540, w: 1920, h: 1080 });
+        c.size = (640, 480);
+        assert_eq!(center_rect(&c, PANEL_AREA), PxRect { x: 1765, y: 840, w: 640, h: 480 });
+        // Без панели — центр монитора.
+        assert_eq!(center_rect(&c, PxRect { x: 0, y: 0, w: 3840, h: 2160 }), PxRect { x: 1600, y: 840, w: 640, h: 480 });
+    }
 
     #[test]
     fn maximize_rect_with_panel_on_the_left() {
@@ -4946,7 +4979,7 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
         let mut st = State::default();
         let left = Some(PxRect { x: -805, y: 10, w: 1920, h: 2140 });
         let own = Some(PxRect { x: 2600, y: 1500, w: 600, h: 400 });
-        // Второе окно Chromium встаёт в ячейку `chromium`, а не в центр экрана.
+        // Второе окно Chromium встаёт в ячейку `chromium`, а не в центр рабочей области.
         assert_eq!(open_rect(&mut st, &cfg, Some("work"), "chromium", mon), left);
         // Окно варианта встаёт в ячейку семейства: своей записи в `work` у него нет.
         assert_eq!(open_rect(&mut st, &cfg, Some("work"), "chromium-mail", mon), left);
@@ -5375,7 +5408,7 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
             client("0x3", "neovide", "[Scratch]", "1", &["app:neovide#1", "ws:work"]),
         ];
         let windows: Vec<&Client> = clients.iter().collect();
-        let plan = arrange_layout(&mut st, &cfg, Some("work"), &windows, mon);
+        let plan = arrange_layout(&mut st, &cfg, Some("work"), &windows, mon, PANEL_AREA);
         let place = |addr: &str| plan.iter().find(|(a, _)| a == addr).map(|(_, r)| *r).unwrap();
         // Исходные места нынешнего назначения: обмен сохранён.
         assert_eq!(place("0xai"), center);
@@ -5556,7 +5589,7 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
             sized("0x8", "neovide", &["app:editor-dots#1"], 500, 500),
         ];
         let windows: Vec<&Client> = clients.iter().collect();
-        let plan = arrange_plan(&mut st, &cfg, Some("work"), &windows, mon);
+        let plan = arrange_plan(&mut st, &cfg, Some("work"), &windows, mon, PANEL_AREA);
         let place = |addr: &str| plan.iter().find(|(a, _)| a == addr).map(|(_, r)| *r).unwrap();
         // Окна приложений — на свои места по правилу мест: вариант в ячейке
         // семейства, два окна Chromium стопкой в одной ячейке, приложение вне
@@ -5565,20 +5598,21 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
         assert_eq!(place("0x2"), PxRect { x: -805, y: 10, w: 1920, h: 2140 });
         assert_eq!(place("0x3"), place("0x2"));
         assert_eq!(place("0x4"), PxRect { x: 2600, y: 1500, w: 600, h: 400 });
-        // Свободные окна — в центр экрана со своим размером, а второе окно того
-        // же класса встаёт на место первого по порядку появления.
-        assert_eq!(place("0x5"), PxRect { x: 1520, y: 780, w: 800, h: 600 });
+        // Свободные окна — в центр рабочей области (центр 2085 по ширине, как
+        // у ячейки center) со своим размером, а второе окно того же класса
+        // встаёт на место первого по порядку появления.
+        assert_eq!(place("0x5"), PxRect { x: 1685, y: 780, w: 800, h: 600 });
         assert_eq!(place("0x6"), place("0x5"));
-        assert_eq!(place("0x7"), PxRect { x: 1420, y: 630, w: 1000, h: 900 });
-        assert_eq!(place("0x8"), PxRect { x: 1670, y: 830, w: 500, h: 500 });
+        assert_eq!(place("0x7"), PxRect { x: 1585, y: 630, w: 1000, h: 900 });
+        assert_eq!(place("0x8"), PxRect { x: 1835, y: 830, w: 500, h: 500 });
 
         // Активного workspace на столе нет: остаётся правило «`rect` приложения,
-        // иначе центр экрана».
+        // иначе центр рабочей области».
         let mut st = State::default();
-        let plan = arrange_plan(&mut st, &cfg, None, &windows, mon);
+        let plan = arrange_plan(&mut st, &cfg, None, &windows, mon, PANEL_AREA);
         let place = |addr: &str| plan.iter().find(|(a, _)| a == addr).map(|(_, r)| *r).unwrap();
         assert_eq!(place("0x4"), PxRect { x: 2600, y: 1500, w: 600, h: 400 });
-        assert_eq!(place("0x1"), PxRect { x: 1870, y: 1030, w: 100, h: 100 });
+        assert_eq!(place("0x1"), PxRect { x: 2035, y: 1030, w: 100, h: 100 });
         assert_eq!(place("0x3"), place("0x2"));
         // Назначения ячеек расстановка не меняет.
         assert!(st.cells.is_empty());

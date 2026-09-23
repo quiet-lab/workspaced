@@ -160,7 +160,7 @@ impl State {
     /// («Расстановка окон»): место приложения в раскладке workspace —
     /// изменённый прямоугольник, а без него исходное место; то же у его
     /// семейства; `rect` самого приложения; иначе места нет и окно встаёт
-    /// в центр экрана. Прямоугольник передаётся композитору как записан,
+    /// в центр рабочей области. Прямоугольник передаётся композитору как записан,
     /// без отступов от демона.
     pub fn rect_for(&mut self, cfg: &Config, ws: &str, app: &str, mon: (i32, i32)) -> Option<PxRect> {
         let owner = if self.cells_of(cfg, ws, mon).contains_key(app) { Some(app) } else { cfg.family_of(app).filter(|f| self.cells.get(ws).is_some_and(|c| c.contains_key(*f))) };
@@ -435,7 +435,7 @@ chromium = "left"
         assert_eq!(st.rect_for(&cfg, "work", "herdr", mon), Some(PxRect { x: 1125, y: 10, w: 1920, h: 2140 }));
         // Ни приложения, ни семейства в workspace нет: rect приложения.
         assert_eq!(st.rect_for(&cfg, "work", "neovide", mon), Some(PxRect { x: 2600, y: 1500, w: 600, h: 400 }));
-        // Ни места в workspace, ни rect приложения: места нет, окно идёт в центр экрана.
+        // Ни места в workspace, ни rect приложения: места нет, окно идёт в центр рабочей области.
         st.cells_of(&cfg, "work", mon).clear();
         assert_eq!(st.rect_for(&cfg, "work", "wezterm", mon), None);
         // Вариант с собственным местом в workspace побеждает семейство.
