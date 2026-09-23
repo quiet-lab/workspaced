@@ -1482,27 +1482,22 @@ impl Daemon {
             Some(addr) => CycleStep::Select(addr),
             None => cycle_step(&order, active.as_deref(), fresh, prev.as_deref(), next.as_deref()),
         };
+        let swaps = step_swaps(&step, swap, start == Start::Joined);
         match step {
             CycleStep::Launch => {
-                // Запуск — это тоже выбор экземпляра: в режиме обмена мест
-                // приложение сначала занимает главное место, и окно появляется
-                // уже на нём, а прежнее главное уходит на место приложения.
-                let mut ex = Vec::new();
-                if swap {
-                    self.swap_to_main(ws, &entry, &clients, &mut ex);
-                }
-                self.hypr.dispatch_all(&ex)?;
+                // Окон нет — обмена мест нет (решение D7): окно появляется на
+                // месте приложения из раскладки в памяти, главное не меняется.
                 let rect = self.st.rect_for(&cfg, ws, app, self.mon);
                 self.spawn(app, Some(ws), n, rect.map(Target::Place).unwrap_or(Target::Free(None)), true)
             }
-            CycleStep::Select(addr) => self.select_window(ws, &addr, &clients, swap && start != Start::Joined),
+            CycleStep::Select(addr) => self.select_window(ws, &addr, &clients, swaps),
             CycleStep::Back(addr) => {
                 log::info!("{ws}: цикл {app} закончен, возврат к окну {addr}");
-                self.select_window(ws, &addr, &clients, swap)
+                self.select_window(ws, &addr, &clients, swaps)
             }
             CycleStep::NextApp(addr) => {
                 log::info!("{ws}: цикл {app} закончен, prev нет — следующее приложение workspace, окно {addr}");
-                self.select_window(ws, &addr, &clients, swap)
+                self.select_window(ws, &addr, &clients, swaps)
             }
         }
     }
@@ -3788,6 +3783,21 @@ pub fn cycle_step(order: &[String], active: Option<&str>, fresh: bool, prev: Opt
     }
 }
 
+/// Выполняет ли шаг цикла обмен мест перед выбором окна (изменение
+/// live-layout, решение D7). Обмен ставит на главное место приложение
+/// выбранного окна, поэтому он возможен только когда окно есть: запуск
+/// приложения без окон места не меняет, и новое окно встаёт на место
+/// приложения. Первый экземпляр приложения, открытого или перетащенного
+/// в workspace этой же цепочкой (`joined`), выбирается без обмена (решение
+/// D15 изменения shared-windows).
+pub fn step_swaps(step: &CycleStep, swap: bool, joined: bool) -> bool {
+    match step {
+        CycleStep::Launch => false,
+        CycleStep::Select(_) => swap && !joined,
+        CycleStep::Back(_) | CycleStep::NextApp(_) => swap,
+    }
+}
+
 /// Окно, к которому вернёт конец цикла (prev). В режиме обмена мест это
 /// первое окно главного приложения на начало цикла (`main_window`): конец
 /// цикла обязан вернуть расстановку. В режиме `stack` — активное окно
@@ -5183,6 +5193,26 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
             client("0x3", "neovide", "[Scratch]", "1", &["app:neovide#1", "ws:work"]),
             client("0x9", "Galculator", "Калькулятор", "1", &[]),
         ]
+    }
+
+    #[test]
+    fn launch_without_windows_does_not_swap() {
+        // Окон приложения нет: цикл запускает его, а не выбирает окно,
+        // и обмена мест нет даже в режиме swap у неглавного приложения.
+        let none: Vec<String> = Vec::new();
+        assert_eq!(swap_start(&none, None, false), None);
+        let step = cycle_step(&none, None, false, Some("0xmain"), None);
+        assert_eq!(step, CycleStep::Launch);
+        assert!(!step_swaps(&step, true, false));
+        assert!(!step_swaps(&step, true, true));
+        // Окно есть: выбор в режиме swap меняет места (решение D7),
+        // кроме первого экземпляра только что открытого приложения.
+        let sel = CycleStep::Select("0xa".into());
+        assert!(step_swaps(&sel, true, false));
+        assert!(!step_swaps(&sel, true, true));
+        assert!(!step_swaps(&sel, false, false));
+        assert!(step_swaps(&CycleStep::Back("0xb".into()), true, true));
+        assert!(!step_swaps(&CycleStep::NextApp("0xb".into()), false, false));
     }
 
     #[test]
