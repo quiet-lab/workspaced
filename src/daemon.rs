@@ -363,6 +363,7 @@ impl Daemon {
                 self.rebuild_cfg();
                 self.drop_stale_pending();
                 self.free_stale_tagged();
+                self.sync_membership(false);
                 log::info!("конфиг перечитан: {} workspace, {} приложений", self.cfg.workspaces.len(), self.cfg.apps.len());
                 reload_hypr_binds();
                 self.broadcast();
@@ -515,6 +516,11 @@ impl Daemon {
                             log::warn!("ленивое поднятие {ws}: {e:#}");
                         }
                     }
+                    // Общие окна активного workspace стола приходят за
+                    // пользователем (изменение shared-windows, решение D5).
+                    if let Err(e) = self.follow() {
+                        log::warn!("следование окон за столом: {e:#}");
+                    }
                     self.broadcast();
                 }
             }
@@ -528,6 +534,82 @@ impl Daemon {
             Event::Other(_) => {}
         }
         Ok(())
+    }
+
+    /// Следование окон за столом (решения D5, D6): окна активного workspace
+    /// стола, где находится композитор, переезжают туда с других столов
+    /// и с `special:pool` в состояние, запомненное для этого workspace.
+    /// Стол спрашивается у композитора: событие смены стола приходит отдельным
+    /// соединением и может отстать от команды демона, и по такому событию
+    /// окно не должно уехать со стола, где пользователь уже находится. Фокус
+    /// не меняется; окно с фокусом поднимается наверх, чтобы пришедшие окна
+    /// его не заслонили. Всё уходит одной последовательностью диспетчеров.
+    fn follow(&mut self) -> Result<()> {
+        let n = self.sync_current();
+        let clients = self.hypr.clients()?;
+        let cfg = self.cfg.clone();
+        let plan = follow_plan(&mut self.st, &cfg, &clients, n, self.mon);
+        let Some(ws) = self.st.desktops.get(&n).and_then(|d| d.active.clone()) else { return Ok(()) };
+        if plan.is_empty() {
+            return Ok(());
+        }
+        let stack = cfg.workspaces.get(&ws).map(|w| w.mode()) == Some(Mode::Stack);
+        let mut ex = Vec::new();
+        for f in &plan {
+            if let Some((v, r)) = &f.leave {
+                self.st.geom.entry(v.clone()).or_default().insert(f.addr.clone(), *r);
+            }
+            ex.push(hypr::d_move_to(&f.addr, &n.to_string()));
+            if let Some(r) = f.rect {
+                ex.extend(hypr::d_place(&f.addr, r));
+            }
+            if stack {
+                self.st.geom.entry(ws.clone()).or_default().insert(f.addr.clone(), f.rect.unwrap_or(f.now));
+            }
+        }
+        if let Some(a) = self.hypr.active_window()?.filter(|c| c.desktop() == Some(n)) {
+            ex.push(hypr::d_raise(&a.address));
+        }
+        self.hypr.dispatch_all(&ex)?;
+        let list: Vec<&str> = plan.iter().map(|f| f.addr.as_str()).collect();
+        log::info!("стол {n}: окна workspace {ws} пришли за пользователем: {}", list.join(", "));
+        Ok(())
+    }
+
+    /// Сверка тегов состава с эффективным конфигом (решение D2): тег `ws:W`
+    /// снимается, если `W` нет или он не описывает приложение окна. С `derive`
+    /// окна прежней версии демона — с тегом экземпляра, но без тегов состава —
+    /// получают состав по прежнему правилу (`derive_membership`); это
+    /// делается при старте демона и после загрузки сессии. Окно, чьи теги
+    /// сняты сверкой, свободным и остаётся: состав выдаётся только окнам,
+    /// у которых тегов состава не было и до сверки.
+    pub fn sync_membership(&mut self, derive: bool) {
+        let clients = match self.hypr.clients() {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!("сверка состава workspace: {e:#}");
+                return;
+            }
+        };
+        let mut ex = Vec::new();
+        for (addr, w) in stale_ws_tags(&self.cfg, &clients) {
+            let c = clients.iter().find(|c| c.address == addr);
+            log::info!("окно {addr} ({}): тег ws:{w} снят — workspace {w} не описывает его приложение {}", c.map(|c| c.class.as_str()).unwrap_or(""), c.and_then(|c| c.app()).unwrap_or_else(|| "(нет)".into()));
+            ex.push(hypr::d_untag(&addr, &hypr::ws_tag(&w)));
+        }
+        if derive {
+            let given = derive_membership(&self.cfg, &self.st, &clients);
+            for (addr, w) in &given {
+                ex.push(hypr::d_tag(addr, &hypr::ws_tag(w)));
+            }
+            if !given.is_empty() {
+                let list: Vec<String> = given.iter().map(|(a, w)| format!("{a} → {w}")).collect();
+                log::info!("состав выдан окнам прежней версии демона ({}): {}", given.len(), list.join(", "));
+            }
+        }
+        if let Err(e) = self.hypr.dispatch_all(&ex) {
+            log::warn!("сверка состава workspace: {e:#}");
+        }
     }
 
     /// Новое окно: ожидаемое приложение, восстановленное окно из снимка
@@ -588,11 +670,15 @@ impl Daemon {
         Ok(())
     }
 
-    /// Окно ожидаемого приложения: тег экземпляра, стол, место, фокус.
+    /// Окно ожидаемого приложения: тег экземпляра, тег состава workspace,
+    /// для которого приложение запущено, стол, место, фокус. Если workspace
+    /// приложение не описывает (приложение открыто в нём клавишей, решение
+    /// D7), workspace получает запись о месте приложения.
     fn adopt(&mut self, c: &Client, p: Pending) -> Result<()> {
         let clients = self.hypr.clients().unwrap_or_default();
         let num = free_instance(&clients, &p.app);
-        let mut ex = vec![hypr::d_tag(&c.address, &format!("app:{}#{num}", p.app))];
+        let mut ex = entry_tags(&c.address, &p.app, num, p.workspace.as_deref());
+        let joining = p.workspace.as_deref().filter(|w| !ws_has_app(&self.cfg, w, &p.app)).map(String::from);
         match &p.target {
             Target::Pool => ex.push(hypr::d_move_to(&c.address, "special:pool")),
             Target::Place(r) => {
@@ -607,8 +693,19 @@ impl Daemon {
                 }
                 let r = rect.unwrap_or_else(|| center_rect(c, self.mon));
                 ex.extend(hypr::d_place(&c.address, r));
-                let (cmd, cwd) = proc_info(c.pid);
-                self.st.foreign.insert(c.address.clone(), Foreign { rect: r, cmd, cwd });
+                match &joining {
+                    Some(w) => match share_record(&self.cfg_file, &self.st.extra, &p.app, r) {
+                        Some(e) => {
+                            log::info!("workspace {w}: приложение {} принято записью о месте вместе с окном {}", p.app, c.address);
+                            self.remember_extra(w, &p.app, e);
+                        }
+                        None => log::warn!("workspace {w}: приложение {} нечем описать", p.app),
+                    },
+                    None => {
+                        let (cmd, cwd) = proc_info(c.pid);
+                        self.st.foreign.insert(c.address.clone(), Foreign { rect: r, cmd, cwd });
+                    }
+                }
             }
         }
         if p.focus {
@@ -639,25 +736,27 @@ impl Daemon {
     /// демон его не переносит и фокус не трогает: фокус новому окну уже отдал
     /// композитор, а отбирать его у окна, которое пользователь только что
     /// открыл, незачем.
-    fn capture_new(&mut self, c: &Client, app: &str, clients: &[Client], place: Option<PxRect>) -> Result<()> {
+    fn capture_new(&mut self, c: &Client, app: &str, clients: &[Client], place: Option<PxRect>, ws: Option<&str>) -> Result<()> {
         let cfg = self.cfg.clone();
         let num = free_instance(clients, app);
-        let mut ex = vec![hypr::d_tag(&c.address, &format!("app:{app}#{num}"))];
+        // Окно входит в workspace, активный на его столе (изменение
+        // shared-windows, решение D2).
+        let mut ex = entry_tags(&c.address, app, num, ws);
+        let ws = ws.map(String::from);
         // Место ищется только для окна на обычном столе: окно, открытое сразу
         // на `special:pool` или `special:hidden`, остаётся там, где открылось.
         // Готовое место приходит от принятия окна в workspace: там оно уже
         // посчитано и записано дополнительным приложением сессии.
-        let ws = c.desktop().and_then(|n| self.st.desktops.get(&n).and_then(|d| d.active.clone()));
         let rect = place.or_else(|| c.desktop().and_then(|_| open_rect(&mut self.st, &cfg, ws.as_deref(), app, self.mon)));
         if let Some(r) = rect {
             ex.extend(hypr::d_place(&c.address, r));
         }
         // В режиме `stack` прямоугольник окна запоминается сразу (design D9):
         // ушедшее на `special:pool` и вернувшееся окно встанет туда же.
-        if let Some(w) = ws.filter(|w| cfg.workspaces.get(w).map(|x| x.mode()) == Some(Mode::Stack)) {
+        if let Some(w) = ws.clone().filter(|w| cfg.workspaces.get(w).map(|x| x.mode()) == Some(Mode::Stack)) {
             self.st.geom.entry(w).or_default().insert(c.address.clone(), rect.unwrap_or_else(|| c.rect()));
         }
-        log::info!("новое окно {} ({}, «{}») → приложение {app}, экземпляр {num}", c.address, c.class, c.title);
+        log::info!("новое окно {} ({}, «{}») → приложение {app}, экземпляр {num}, workspace {}", c.address, c.class, c.title, ws.as_deref().unwrap_or("нет"));
         self.hypr.dispatch_all(&ex)
     }
 
@@ -666,7 +765,7 @@ impl Daemon {
         match join {
             Join::App(app) => {
                 self.st.foreign.remove(&c.address);
-                self.capture_new(c, &app, clients, None)
+                self.capture_new(c, &app, clients, None, ws)
             }
             Join::AppPlace(app) => {
                 let w = ws.unwrap_or_default().to_string();
@@ -675,7 +774,7 @@ impl Daemon {
                 self.remember_extra(&w, &app, ExtraApp { rect, ..ExtraApp::default() });
                 self.st.foreign.remove(&c.address);
                 log::info!("окно {} ({}) принято в workspace {w} приложением конфига {app}", c.address, c.class);
-                self.capture_new(c, &app, clients, Some(rect))
+                self.capture_new(c, &app, clients, Some(rect), Some(&w))
             }
             Join::Extra(name) => {
                 let w = ws.unwrap_or_default().to_string();
@@ -683,7 +782,7 @@ impl Daemon {
                 self.remember_extra(&w, &name, ExtraApp { class: Some(c.class.clone()), cmd, cwd, rect });
                 self.st.foreign.remove(&c.address);
                 log::info!("окно {} ({}) принято в workspace {w} дополнительным приложением сессии {name}", c.address, c.class);
-                self.capture_new(c, &name, clients, Some(rect))
+                self.capture_new(c, &name, clients, Some(rect), Some(&w))
             }
             Join::Free(reason) => {
                 self.st.foreign.insert(c.address.clone(), Foreign { rect: c.rect(), cmd, cwd });
@@ -701,33 +800,60 @@ impl Daemon {
     }
 
     /// Убрать активное окно из активного workspace текущего стола
-    /// (спецификация ws-daemon, «Отделение окна»). Общих окон на этом шаге
-    /// нет, поэтому отделённое окно закрывается диспетчером композитора.
+    /// (спецификация ws-daemon, «Отделение окна»; изменение shared-windows,
+    /// решение D9): снять тег состава. Окно, входящее ещё в другие workspace,
+    /// уходит по правилу размещения; окно, для которого этот workspace был
+    /// последним, закрывается диспетчером композитора.
     pub fn detach(&mut self) -> Result<()> {
         let n = self.sync_current();
         let clients = self.hypr.clients()?;
         let active = self.hypr.active_window()?.filter(|c| c.desktop() == Some(n));
         let ws = self.st.desktops.get(&n).and_then(|d| d.active.clone());
         let extra = ws.as_deref().and_then(|w| self.st.extra.get(w)).cloned().unwrap_or_default();
-        match detach_step(&self.cfg, &clients, ws.as_deref(), &extra, active.as_ref()) {
+        let desks = actives(&self.st);
+        let step = detach_step(&self.cfg, &clients, ws.as_deref(), &extra, active.as_ref(), &desks, n);
+        let (Some(c), Some(w)) = (active, ws) else {
+            if let DetachStep::Skip(why) = step {
+                log::info!("отделение окна: {why}");
+            }
+            return Ok(());
+        };
+        let addr = c.address.clone();
+        let (app, drop_extra, last) = match &step {
             DetachStep::Skip(why) => {
                 log::info!("отделение окна: {why}");
-                Ok(())
+                return Ok(());
             }
-            DetachStep::Close { app, drop_extra } => {
-                let addr = active.map(|c| c.address).unwrap_or_default();
-                let w = ws.unwrap_or_default();
-                if drop_extra {
-                    let from = drop_extra_app(&mut self.st, &w, &app);
-                    self.rebuild_cfg();
-                    log::info!("дополнительное приложение сессии {app} снято вместе с последним его окном в workspace: {}", from.join(", "));
+            DetachStep::Leave { app, drop_extra, .. } => (app.clone(), *drop_extra, false),
+            DetachStep::Close { app, drop_extra, last } => (app.clone(), *drop_extra, *last),
+        };
+        if drop_extra {
+            let from = drop_extra_app(&mut self.st, &w, &app, last);
+            self.rebuild_cfg();
+            log::info!("дополнительное приложение сессии {app} снято вместе с последним его окном в workspace: {}", from.join(", "));
+        }
+        if let Some(g) = self.st.geom.get_mut(&w) {
+            g.remove(&addr);
+        }
+        match step {
+            DetachStep::Leave { home, .. } => {
+                let mut ex = vec![hypr::d_untag(&addr, &hypr::ws_tag(&w))];
+                let rest: Vec<String> = c.workspaces().into_iter().filter(|x| *x != w).collect();
+                match home {
+                    Home::Desktop(k) if k != n => self.send_to(&c, k, &desks, &mut ex),
+                    Home::Pool => ex.push(hypr::d_move_to(&addr, "special:pool")),
+                    _ => {}
                 }
+                log::info!("workspace {w}: окно {addr} приложения {app} отделено и остаётся в {}", rest.join(", "));
+                self.hypr.dispatch_all(&ex)?;
+            }
+            _ => {
                 log::info!("workspace {w}: окно {addr} приложения {app} отделено и закрыто");
-                self.hypr.dispatch(&hypr::d_close(&addr))?;
-                self.broadcast();
-                Ok(())
+                self.hypr.dispatch_all(&[hypr::d_untag(&addr, &hypr::ws_tag(&w)), hypr::d_close(&addr)])?;
             }
         }
+        self.broadcast();
+        Ok(())
     }
 
     /// Свободное окно, подходящее ожиданию запуска номер `i`.
@@ -814,22 +940,50 @@ impl Daemon {
 
     /// Захват открытых окон приложений (спецификация ws-daemon, «Захват
     /// открытых окон приложения»): берутся все подходящие окна, в том числе
-    /// у приложения, окна которого уже есть. Теги переставляются
-    /// в композиторе и в локальном списке клиентов.
-    fn adopt_untagged(&mut self, clients: &mut [Client], apps: &[String]) -> Result<()> {
-        for (i, app, num) in adopt_plan(&self.cfg, clients, apps)? {
+    /// у приложения, окна которого уже есть. С `ws` захват идёт для
+    /// workspace: захваченное окно получает и тег его состава, а свободные
+    /// окна приложения с тегом экземпляра входят в workspace, сохраняя номер
+    /// (изменение shared-windows, решения D2, D3). Теги переставляются
+    /// в композиторе и в локальном списке клиентов. Возвращает число
+    /// захваченных окон.
+    fn adopt_untagged(&mut self, clients: &mut [Client], apps: &[String], ws: Option<&str>) -> Result<usize> {
+        let plan = adopt_plan(&self.cfg, clients, apps, ws.is_some())?;
+        for cap in &plan {
+            let i = cap.idx;
             let addr = clients[i].address.clone();
-            let tag = format!("app:{app}#{num}");
-            let mut ex: Vec<String> = clients[i].app_tags().map(|t| hypr::d_untag(&addr, t)).collect();
-            ex.push(hypr::d_tag(&addr, &tag));
+            let mut ex: Vec<String> = Vec::new();
+            if cap.retag {
+                let tag = format!("app:{}#{}", cap.app, cap.num);
+                ex.extend(clients[i].app_tags().map(|t| hypr::d_untag(&addr, t)));
+                ex.push(hypr::d_tag(&addr, &tag));
+                clients[i].tags.retain(|t| !t.starts_with("app:"));
+                clients[i].tags.push(tag);
+            }
+            if let Some(w) = ws {
+                ex.push(hypr::d_tag(&addr, &hypr::ws_tag(w)));
+                clients[i].tags.push(hypr::ws_tag(w));
+            }
             self.hypr.dispatch_all(&ex)?;
-            clients[i].tags.retain(|t| !t.starts_with("app:"));
-            clients[i].tags.push(tag);
             // Захваченное окно больше не постороннее.
             self.st.foreign.remove(&addr);
-            log::info!("захват: окно {addr} ({}, «{}») → приложение {app}, экземпляр {num}", clients[i].class, clients[i].title);
+            log::info!("захват: окно {addr} ({}, «{}») → приложение {}, экземпляр {}, workspace {}", clients[i].class, clients[i].title, cap.app, cap.num, ws.unwrap_or("нет"));
         }
-        Ok(())
+        Ok(plan.len())
+    }
+
+    /// Отдать workspace `ws` в общее пользование окна других workspace
+    /// (решение D3, `share_plan`): окна получают тег состава `ws` и не
+    /// теряют прежних.
+    fn share_windows(&mut self, clients: &mut [Client], ws: &str, apps: &[String]) -> Result<()> {
+        let plan = share_plan(&self.cfg, clients, ws, apps);
+        let mut ex = Vec::new();
+        for (i, app) in &plan {
+            let c = &mut clients[*i];
+            ex.push(hypr::d_tag(&c.address, &hypr::ws_tag(ws)));
+            log::info!("workspace {ws}: окно {} ({}) приложения {app} из {} становится общим", c.address, c.class, c.workspaces().join(", "));
+            c.tags.push(hypr::ws_tag(ws));
+        }
+        self.hypr.dispatch_all(&ex)
     }
 
     /// Поднять workspace на столе (design D5).
@@ -845,6 +999,12 @@ impl Daemon {
     /// Поднятие workspace. `focus` — перейти на стол и отдать фокус главному
     /// окну; без него окна встают на стол, но композитор остаётся на прежнем
     /// столе и фокус не меняется (преемник после переноса workspace).
+    ///
+    /// Сначала собирается состав (решение D3): свободные окна приложений
+    /// захватываются, а приложению без окон в workspace достаются окна других
+    /// workspace. Затем каждое окно workspace и каждое окно других workspace
+    /// на целевом столе встаёт по правилу размещения (`window_home`, решение
+    /// D4) для столов после поднятия.
     fn raise_on(&mut self, ws: &str, desktop: Option<u8>, focus: bool) -> Result<()> {
         if !self.cfg.workspaces.contains_key(ws) {
             bail!("workspace {ws} не найден");
@@ -866,26 +1026,36 @@ impl Daemon {
         let apps: Vec<String> = w.apps.keys().cloned().collect();
         let stack = w.mode() == Mode::Stack;
         let mut clients = self.hypr.clients()?;
-        self.adopt_untagged(&mut clients, &apps)?;
+        self.adopt_untagged(&mut clients, &apps, Some(ws))?;
+        self.share_windows(&mut clients, ws, &apps)?;
+        let before = actives(&self.st);
         // Вытесняемый workspace запоминает, где оставлены его окна: в режиме
         // `stack` следующее поднятие вернёт их именно туда.
-        if let Some(old) = self.st.desktops.get(&n).and_then(|d| d.active.clone()).filter(|a| a != ws) {
-            self.remember_geometry(&old, &clients);
+        if let Some(old) = before.get(&n).filter(|a| *a != ws).cloned() {
+            self.remember_geometry(&old, n, &clients);
         }
+        // Активные workspace столов после поднятия: по ним правило размещения
+        // решает, где стоять окнам.
+        let mut after = before.clone();
+        after.retain(|_, x| x != ws);
+        after.insert(n, ws.to_string());
         let mut ex = Vec::new();
         if focus && n != self.current {
             ex.push(hypr::d_focus_desktop(n));
             self.current = n;
         }
+        let cur = self.current;
+        let cfg = self.cfg.clone();
         let mut main_addr: Option<String> = None;
         // Окна workspace, которым демон задаёт порядок по глубине.
         let mut members: Vec<String> = Vec::new();
-        let main_app = w.main.clone().or_else(|| self.st.main_app(&self.cfg, ws, self.mon));
+        let main_app = w.main.clone().or_else(|| self.st.main_app(&cfg, ws, self.mon));
         for app in &apps {
-            let rect = self.st.rect_for(&self.cfg, ws, app, self.mon);
-            // Переезжают и расставляются окна всех экземпляров приложения, окна
-            // его вариантов в том числе; скрытые пользователем не трогаются.
-            let wins = placed_windows(&self.cfg, &clients, &apps, app);
+            let rect = self.st.rect_for(&cfg, ws, app, self.mon);
+            // Переезжают и расставляются окна всех экземпляров приложения,
+            // входящие в workspace, окна его вариантов в том числе; скрытые
+            // пользователем не трогаются.
+            let wins = placed_windows(&cfg, &clients, ws, &apps, app);
             if wins.is_empty() {
                 let target = rect.map(Target::Place).unwrap_or(Target::Free(None));
                 // Сбой запуска одного приложения поднятие не обрывает: его место
@@ -898,9 +1068,24 @@ impl Daemon {
                 continue;
             }
             for c in wins.iter().filter(|c| !c.on_hidden()) {
+                match window_home(&c.workspaces(), &after, cur, Spot::of(c)) {
+                    Home::Desktop(k) if k == n => {}
+                    Home::Desktop(k) => {
+                        // Поднятие без перехода (преемник) не уводит общее окно
+                        // со стола, где находится пользователь (решение D10).
+                        if c.desktop() != Some(k) {
+                            self.send_to(c, k, &after, &mut ex);
+                        }
+                        continue;
+                    }
+                    _ => continue,
+                }
                 members.push(c.address.clone());
                 let moving = c.desktop() != Some(n);
                 if moving {
+                    if let Some((v, r)) = leave_geom(&cfg, &before, c, Some(ws)) {
+                        self.st.geom.entry(v).or_default().insert(c.address.clone(), r);
+                    }
                     ex.push(hypr::d_move_to(&c.address, &n.to_string()));
                 }
                 // Окно, которое едет вместе с workspace с прежнего стола,
@@ -914,22 +1099,24 @@ impl Daemon {
                 if stack {
                     self.st.geom.entry(ws.to_string()).or_default().insert(c.address.clone(), target.unwrap_or_else(|| c.rect()));
                 }
-            }
-            if main_app.as_deref() == Some(app) {
-                // Фокус получает первый экземпляр; наверх он поднимается
-                // при поднятии workspace, но не при переносе на другой стол.
-                main_addr = wins.iter().find(|c| !c.on_hidden()).map(|c| c.address.clone());
+                if main_app.as_deref() == Some(app) && main_addr.is_none() {
+                    // Фокус получает первый экземпляр; наверх он поднимается
+                    // при поднятии workspace, но не при переносе на другой стол.
+                    main_addr = Some(c.address.clone());
+                }
             }
         }
-        // Паркуются только окна живых приложений других workspace. Посторонние
-        // окна и окна с тегом приложения, которого нет в конфиге, остаются на столе.
+        // Окна других workspace уходят со стола по правилу размещения: на стол,
+        // где активен другой их workspace, либо на `special:pool`. Свободные
+        // окна и окна с тегом приложения, которого нет в конфиге, остаются.
         for c in &clients {
-            if c.desktop() != Some(n) {
+            if c.desktop() != Some(n) || c.in_ws(ws) || !c.has_ws() {
                 continue;
             }
-            let Some(a) = c.app() else { continue };
-            if self.cfg.apps.contains_key(&a) && !apps.iter().any(|x| self.cfg.app_is(&a, x)) {
-                ex.push(hypr::d_move_to(&c.address, "special:pool"));
+            match window_home(&c.workspaces(), &after, cur, Spot::of(c)) {
+                Home::Desktop(k) if k != n => self.send_to(c, k, &after, &mut ex),
+                Home::Pool => ex.push(hypr::d_move_to(&c.address, "special:pool")),
+                _ => {}
             }
         }
         if let Some(a) = main_addr.as_ref().filter(|_| focus) {
@@ -950,6 +1137,23 @@ impl Daemon {
         Ok(())
     }
 
+    /// Увести окно на стол `k`, где активен другой его workspace, и поставить
+    /// в состояние, запомненное для того workspace (решение D6). Диспетчеры
+    /// дописываются в `ex`.
+    fn send_to(&mut self, c: &Client, k: u8, active: &BTreeMap<u8, String>, ex: &mut Vec<String>) {
+        ex.push(hypr::d_move_to(&c.address, &k.to_string()));
+        let Some(v) = active.get(&k).cloned() else { return };
+        let cfg = self.cfg.clone();
+        let r = arrive_rect(&mut self.st, &cfg, &v, c, self.mon);
+        if let Some(r) = r {
+            ex.extend(hypr::d_place(&c.address, r));
+        }
+        if cfg.workspaces.get(&v).map(|w| w.mode()) == Some(Mode::Stack) {
+            self.st.geom.entry(v.clone()).or_default().insert(c.address.clone(), r.unwrap_or_else(|| c.rect()));
+        }
+        log::info!("окно {} ({}) уходит на стол {k} к workspace {v}", c.address, c.class);
+    }
+
     /// Последнее окно workspace, получавшее фокус. Берётся из события
     /// `activewindow`: опроса нет, сведение приходит от композитора. Из него
     /// выводится prev, когда цикл начинается с чужого окна.
@@ -958,7 +1162,7 @@ impl Daemon {
         let Some(n) = c.desktop() else { return Ok(()) };
         let Some(ws) = self.st.desktops.get(&n).and_then(|d| d.active.clone()) else { return Ok(()) };
         let ws_apps = self.ws_apps(&ws);
-        if ws_app_of(&self.cfg, &ws_apps, &c).is_some() {
+        if ws_app_of(&self.cfg, &ws, &ws_apps, &c).is_some() {
             self.st.focus.insert(ws, c.address);
         }
         Ok(())
@@ -983,19 +1187,17 @@ impl Daemon {
         self.cfg.workspaces.get(ws).map(|w| w.apps.keys().cloned().collect()).unwrap_or_default()
     }
 
-    /// Запомнить, где стоят окна workspace, прежде чем увести их со стола:
-    /// в режиме `stack` поднятие вернёт их именно туда. В режиме обмена ячеек
-    /// место задаёт конфиг, и запоминать нечего.
-    fn remember_geometry(&mut self, ws: &str, clients: &[Client]) {
+    /// Запомнить, где стоят окна workspace на его столе `n`, прежде чем
+    /// увести их со стола: в режиме `stack` поднятие вернёт их именно туда.
+    /// Общее окно, ушедшее за пользователем на другой стол, стоит там
+    /// в состоянии другого workspace, поэтому берутся только окна стола `n`.
+    /// В режиме обмена ячеек место задаёт конфиг, и запоминать нечего.
+    fn remember_geometry(&mut self, ws: &str, n: u8, clients: &[Client]) {
         if self.cfg.workspaces.get(ws).map(|w| w.mode()) != Some(Mode::Stack) {
             return;
         }
-        let cfg = self.cfg.clone();
-        let apps = self.ws_apps(ws);
-        for c in clients.iter().filter(|c| c.desktop().is_some()) {
-            if c.app().is_some_and(|a| apps.iter().any(|x| cfg.app_is(&a, x))) {
-                self.st.geom.entry(ws.to_string()).or_default().insert(c.address.clone(), c.rect());
-            }
+        for c in ws_windows(clients, ws).into_iter().filter(|c| c.desktop() == Some(n)) {
+            self.st.geom.entry(ws.to_string()).or_default().insert(c.address.clone(), c.rect());
         }
     }
 
@@ -1017,7 +1219,7 @@ impl Daemon {
         let n = self.current;
         for name in [main_app.as_deref(), Some(app)].into_iter().flatten() {
             let Some(r) = self.st.rect_for(&cfg, ws, name, self.mon) else { continue };
-            for c in placed_windows(&cfg, clients, &ws_apps, name).iter().filter(|c| !c.on_hidden()) {
+            for c in placed_windows(&cfg, clients, ws, &ws_apps, name).iter().filter(|c| !c.on_hidden()) {
                 if c.desktop() != Some(n) {
                     ex.push(hypr::d_move_to(&c.address, &n.to_string()));
                 }
@@ -1028,14 +1230,18 @@ impl Daemon {
 
     /// Выбрать окно (спецификация ws-daemon, «Цепочка приложения»): в режиме
     /// обмена ячеек приложение окна сначала занимает главную ячейку, в режиме
-    /// `stack` окно только поднимается наверх и получает фокус.
-    fn select_window(&mut self, ws: &str, addr: &str, clients: &[Client]) -> Result<()> {
+    /// `stack` окно только поднимается наверх и получает фокус. Без `swap`
+    /// окно только получает фокус и поднимается наверх в любом режиме: так
+    /// выбирается окно, только что открытое или перетащенное в workspace
+    /// (решение D15).
+    fn select_window(&mut self, ws: &str, addr: &str, clients: &[Client], swap: bool) -> Result<()> {
         let cfg = self.cfg.clone();
         let ws_apps = self.ws_apps(ws);
         let mut ex = Vec::new();
-        if cfg.workspaces.get(ws).map(|w| w.mode()) == Some(Mode::Swap)
+        if swap
+            && cfg.workspaces.get(ws).map(|w| w.mode()) == Some(Mode::Swap)
             && let Some(c) = clients.iter().find(|c| c.address == addr)
-            && let Some(app) = ws_app_of(&cfg, &ws_apps, c)
+            && let Some(app) = ws_app_of(&cfg, ws, &ws_apps, c)
         {
             self.swap_to_main(ws, &app, clients, &mut ex);
         }
@@ -1047,14 +1253,16 @@ impl Daemon {
     }
 
     /// Цикл по экземплярам приложения в workspace (спецификация ws-daemon,
-    /// «Цепочка приложения»). `fresh` означает, что workspace подняла эта же
-    /// цепочка: фокус уже отдан главному окну, и цикл начинается заново.
-    fn cycle(&mut self, ws: &str, app: &str, fresh: bool) -> Result<()> {
+    /// «Цепочка приложения»). `start` говорит, начат ли цикл этой же цепочкой:
+    /// workspace поднят (`Raised`) или приложение открыто либо перетащено
+    /// в него (`Joined`), и тогда цикл начинается заново.
+    fn cycle(&mut self, ws: &str, app: &str, start: Start) -> Result<()> {
+        let fresh = start != Start::Continue;
         let mut clients = self.hypr.clients()?;
-        self.adopt_untagged(&mut clients, std::slice::from_ref(&app.to_string()))?;
+        self.adopt_untagged(&mut clients, std::slice::from_ref(&app.to_string()), Some(ws))?;
         let cfg = self.cfg.clone();
         let ws_apps = self.ws_apps(ws);
-        let wins = placed_windows(&cfg, &clients, &ws_apps, app);
+        let wins = placed_windows(&cfg, &clients, ws, &ws_apps, app);
         let order: Vec<String> = wins.iter().filter(|c| !c.on_hidden()).map(|c| c.address.clone()).collect();
         if order.is_empty() && !wins.is_empty() {
             // Все окна приложения спрятаны пользователем на `special:hidden`:
@@ -1070,9 +1278,9 @@ impl Daemon {
                 .then(|| self.st.main_app(&cfg, ws, self.mon))
                 .flatten()
                 .filter(|m| m != app)
-                .and_then(|m| placed_windows(&cfg, &clients, &ws_apps, &m).into_iter().find(|c| !c.on_hidden()).map(|c| c.address.clone()));
+                .and_then(|m| placed_windows(&cfg, &clients, ws, &ws_apps, &m).into_iter().find(|c| !c.on_hidden()).map(|c| c.address.clone()));
             let focus = self.st.focus.get(ws).cloned();
-            let back = anchor_window(&cfg, &clients, &ws_apps, main_window.as_deref(), &order, active.as_deref(), focus.as_deref());
+            let back = anchor_window(&cfg, &clients, ws, main_window.as_deref(), &order, active.as_deref(), focus.as_deref());
             self.st.cycle.insert(ws.to_string(), Cycle { app: app.to_string(), back });
         }
         let prev = self
@@ -1097,22 +1305,24 @@ impl Daemon {
                 let n = self.current;
                 self.spawn(app, Some(ws), n, rect.map(Target::Place).unwrap_or(Target::Free(None)), true)
             }
-            CycleStep::Select(addr) => self.select_window(ws, &addr, &clients),
+            CycleStep::Select(addr) => self.select_window(ws, &addr, &clients, start != Start::Joined),
             CycleStep::Back(addr) => {
                 log::info!("{ws}: цикл {app} закончен, возврат к окну {addr}");
-                self.select_window(ws, &addr, &clients)
+                self.select_window(ws, &addr, &clients, true)
             }
             CycleStep::NextApp(addr) => {
                 log::info!("{ws}: цикл {app} закончен, prev нет — следующее приложение workspace, окно {addr}");
-                self.select_window(ws, &addr, &clients)
+                self.select_window(ws, &addr, &clients, true)
             }
         }
     }
 
     /// Цепочка приложения: цикл по экземплярам в workspace приложения
-    /// (спецификация ws-daemon, «Цепочка приложения»). `apps` — кандидаты
-    /// с одной цепочкой: действует тот из них, чей workspace найдётся раньше.
-    pub fn app(&mut self, apps: &[String], desktop: Option<u8>, workspace: Option<&str>) -> Result<()> {
+    /// (спецификация ws-daemon, «Цепочка приложения»; изменение shared-windows,
+    /// решение D7). `apps` — кандидаты с одной цепочкой: действует тот из них,
+    /// чей workspace найдётся раньше. `pull` — перетащить окна приложения
+    /// в активный workspace текущего стола (решение D8).
+    pub fn app(&mut self, apps: &[String], desktop: Option<u8>, workspace: Option<&str>, pull: bool) -> Result<()> {
         for a in apps {
             if !self.cfg.apps.contains_key(a) {
                 bail!("приложение {a} не описано");
@@ -1131,48 +1341,27 @@ impl Daemon {
             self.raise(ws, None)?;
             raised = true;
         }
-        let in_ws = |cfg: &Config, ws: &str| -> Option<String> { apps.iter().find(|a| cfg.workspaces.get(ws).is_some_and(|w| w.apps.contains_key(*a))).cloned() };
         let n = self.current;
-        // 1. Активный workspace текущего стола.
-        if let Some(ws) = self.st.desktop(n).active.clone()
-            && let Some(a) = in_ws(&self.cfg, &ws)
-        {
-            return self.cycle(&ws, &a, raised);
-        }
-        // 2. Список текущего стола по порядку (workspace, активный на другом
-        // столе, поднимается там же, см. raise).
-        let list = self.st.desktop(n).workspaces.clone();
-        for ws in &list {
-            if let Some(a) = in_ws(&self.cfg, ws) {
-                self.raise(ws, None)?;
-                return self.cycle(ws, &a, true);
+        match app_route(&self.cfg, &self.st.desktops, n, apps, pull) {
+            AppRoute::Cycle { ws, app } => self.cycle(&ws, &app, if raised { Start::Raised } else { Start::Continue }),
+            AppRoute::Raise { ws, app, desktop } => {
+                self.raise(&ws, desktop)?;
+                self.cycle(&ws, &app, Start::Raised)
             }
+            AppRoute::Pull { ws, app } => self.bring(&ws, &app, true),
+            AppRoute::Open { ws, app } => self.bring(&ws, &app, false),
+            AppRoute::Free { app } => self.cycle_free(&app, apps, n),
         }
-        // 3. Другие столы по возрастанию номера.
-        let others: Vec<(u8, Vec<String>)> = self.st.desktops.iter().filter(|(k, _)| **k != n).map(|(k, d)| (*k, d.workspaces.clone())).collect();
-        for (k, list) in others {
-            for ws in &list {
-                if let Some(a) = in_ws(&self.cfg, ws) {
-                    self.raise(ws, Some(k))?;
-                    return self.cycle(ws, &a, true);
-                }
-            }
-        }
-        // 3б. Workspace из конфига, который ещё не поднимали ни на одном столе.
-        for (ws, _) in self.cfg.workspaces.clone() {
-            if let Some(a) = in_ws(&self.cfg, &ws) {
-                self.raise(&ws, Some(n))?;
-                return self.cycle(&ws, &a, true);
-            }
-        }
-        // 4. Приложение без workspace: цикл по его окнам без prev и без
-        // следующего приложения, поэтому за последним экземпляром идёт первый.
-        // Окно, которого ещё нет, открывается на своём месте по умолчанию
-        // (`rect` приложения, а без него — центр экрана).
-        let app = apps[0].clone();
+    }
+
+    /// Приложение вне workspace: цикл по его окнам без prev и без следующего
+    /// приложения, поэтому за последним экземпляром идёт первый. Окно,
+    /// которого ещё нет, открывается на своём месте по умолчанию (`rect`
+    /// приложения, а без него — центр экрана).
+    fn cycle_free(&mut self, app: &str, apps: &[String], n: u8) -> Result<()> {
         let mut clients = self.hypr.clients()?;
-        self.adopt_untagged(&mut clients, apps)?;
-        let wins = app_windows(&self.cfg, &clients, &app);
+        self.adopt_untagged(&mut clients, apps, None)?;
+        let wins = app_windows(&self.cfg, &clients, app);
         let order: Vec<String> = wins.iter().filter(|c| !c.on_hidden()).map(|c| c.address.clone()).collect();
         if order.is_empty()
             && let Some(c) = wins.first()
@@ -1184,13 +1373,70 @@ impl Daemon {
         let active = self.hypr.active_window()?.map(|c| c.address);
         match cycle_step(&order, active.as_deref(), false, None, None) {
             CycleStep::Launch => {
-                let rect = State::app_rect(&self.cfg, &app, self.mon);
-                self.spawn(&app, None, n, Target::Free(rect), true)
+                let rect = State::app_rect(&self.cfg, app, self.mon);
+                self.spawn(app, None, n, Target::Free(rect), true)
             }
             CycleStep::Select(addr) | CycleStep::Back(addr) | CycleStep::NextApp(addr) => {
                 self.hypr.dispatch_all(&[hypr::d_focus_window(&addr), hypr::d_bring_to_top()])
             }
         }
+    }
+
+    /// Открыть приложение в активном workspace `ws` текущего стола (случай
+    /// «а», `pull = false`) или перетащить туда его окна (случай «в»,
+    /// `pull = true`) — решения D7, D8. Свободные окна приложения
+    /// захватываются; при открытии окна других workspace становятся общими,
+    /// только если свободных не нашлось, при перетаскивании — всегда. Окна
+    /// входят в `ws`, `ws` получает запись о месте приложения, окна встают
+    /// на текущий стол на это место, и цикл начинается с первого экземпляра.
+    /// Без окон приложение запускается для `ws`, и запись о месте заводится
+    /// при появлении окна.
+    fn bring(&mut self, ws: &str, app: &str, pull: bool) -> Result<()> {
+        let n = self.current;
+        let cfg = self.cfg.clone();
+        let mut clients = self.hypr.clients()?;
+        self.adopt_untagged(&mut clients, std::slice::from_ref(&app.to_string()), Some(ws))?;
+        let visible = |c: &&Client| !c.on_hidden();
+        let own: Vec<Client> = app_windows(&cfg, &clients, app).into_iter().filter(visible).cloned().collect();
+        let in_ws: Vec<Client> = own.iter().filter(|c| c.in_ws(ws)).cloned().collect();
+        let take: Vec<Client> = if pull || in_ws.is_empty() { own } else { in_ws };
+        let rect = open_rect(&mut self.st, &cfg, Some(ws), app, self.mon);
+        let Some(first) = take.first() else {
+            log::info!("workspace {ws}: окон {app} нет, приложение запускается в нём");
+            return self.spawn(app, Some(ws), n, Target::Free(rect), true);
+        };
+        let rect = rect.unwrap_or_else(|| center_rect(first, self.mon));
+        if !ws_has_app(&cfg, ws, app) {
+            match share_record(&self.cfg_file, &self.st.extra, app, rect) {
+                Some(e) => {
+                    log::info!("workspace {ws}: приложение {app} принято записью {}", if e.cmd.is_empty() { "о месте" } else { "с командой" });
+                    self.remember_extra(ws, app, e);
+                }
+                None => bail!("приложение {app}: нечем описать его в workspace {ws}"),
+            }
+        }
+        let before = actives(&self.st);
+        let stack = cfg.workspaces.get(ws).map(|w| w.mode()) == Some(Mode::Stack);
+        let mut ex = Vec::new();
+        for c in &take {
+            if !c.in_ws(ws) {
+                ex.push(hypr::d_tag(&c.address, &hypr::ws_tag(ws)));
+                log::info!("workspace {ws}: окно {} ({}) приложения {app} входит в него{}", c.address, c.class, if c.has_ws() { format!(", оставаясь в {}", c.workspaces().join(", ")) } else { String::new() });
+            }
+            if c.desktop() != Some(n) {
+                if let Some((v, r)) = leave_geom(&cfg, &before, c, Some(ws)) {
+                    self.st.geom.entry(v).or_default().insert(c.address.clone(), r);
+                }
+                ex.push(hypr::d_move_to(&c.address, &n.to_string()));
+            }
+            ex.extend(hypr::d_place(&c.address, rect));
+            if stack {
+                self.st.geom.entry(ws.to_string()).or_default().insert(c.address.clone(), rect);
+            }
+            self.st.foreign.remove(&c.address);
+        }
+        self.hypr.dispatch_all(&ex)?;
+        self.cycle(ws, app, Start::Joined)
     }
 
     /// Стол, на котором композитор находится сейчас. Поле `current` — только
@@ -1292,7 +1538,7 @@ impl Daemon {
         if let Some(w) = ws.filter(|w| cfg.workspaces.get(w).map(|x| x.mode()) == Some(Mode::Stack)) {
             let ws_apps = self.ws_apps(&w);
             for (addr, r) in &plan {
-                if clients.iter().any(|c| c.address == *addr && ws_app_of(&cfg, &ws_apps, c).is_some()) {
+                if clients.iter().any(|c| c.address == *addr && ws_app_of(&cfg, &w, &ws_apps, c).is_some()) {
                     self.st.geom.entry(w.clone()).or_default().insert(addr.clone(), *r);
                 }
             }
@@ -1310,7 +1556,10 @@ impl Daemon {
         self.raise(&ws, None)
     }
 
-    /// Убрать workspace из списка стола (по умолчанию текущего), окна паркуются.
+    /// Убрать workspace из списка стола (по умолчанию текущего). Окна
+    /// активного workspace уходят со стола по правилу размещения (решение
+    /// D10): общее окно — на стол, где активен другой его workspace, остальные
+    /// на `special:pool`.
     pub fn remove(&mut self, ws: &str, desktop: Option<u8>) -> Result<()> {
         let n = desktop.unwrap_or(self.current);
         let d = self.st.desktop(n);
@@ -1319,15 +1568,15 @@ impl Daemon {
         if was_active {
             d.active = None;
             let clients = self.hypr.clients()?;
-            self.remember_geometry(ws, &clients);
-            let apps: Vec<String> = self.cfg.workspaces.get(ws).map(|w| w.apps.keys().cloned().collect()).unwrap_or_default();
+            self.remember_geometry(ws, n, &clients);
+            let after = actives(&self.st);
+            let cur = self.current;
             let mut ex = Vec::new();
-            for c in &clients {
-                if c.desktop() != Some(n) {
-                    continue;
-                }
-                if c.app().is_some_and(|a| apps.iter().any(|x| self.cfg.app_is(&a, x))) {
-                    ex.push(hypr::d_move_to(&c.address, "special:pool"));
+            for c in ws_windows(&clients, ws).into_iter().filter(|c| c.desktop() == Some(n)) {
+                match window_home(&c.workspaces(), &after, cur, Spot::of(c)) {
+                    Home::Desktop(k) if k != n => self.send_to(c, k, &after, &mut ex),
+                    Home::Pool => ex.push(hypr::d_move_to(&c.address, "special:pool")),
+                    _ => {}
                 }
             }
             self.hypr.dispatch_all(&ex)?;
@@ -1482,7 +1731,8 @@ impl Daemon {
                     Err(anyhow::anyhow!("нет приложений"))
                 } else {
                     let ws = s("workspace");
-                    self.app(&apps, desktop, ws.as_deref()).map(|_| json!({"ok": true}))
+                    let pull = req.get("pull").and_then(|v| v.as_bool()).unwrap_or(false);
+                    self.app(&apps, desktop, ws.as_deref(), pull).map(|_| json!({"ok": true}))
                 }
             }
             "next" => self.next().map(|_| json!({"ok": true})),
@@ -1545,8 +1795,9 @@ impl Daemon {
                 .map(|ws| {
                     let w = self.cfg.workspaces.get(ws);
                     let apps: Vec<String> = w.map(|w| w.apps.keys().cloned().collect()).unwrap_or_default();
-                    // Окно варианта входит в состав как окно своего семейства.
-                    let windows: Vec<String> = clients.iter().filter(|c| c.app().is_some_and(|a| apps.iter().any(|x| self.cfg.app_is(&a, x)))).map(|c| c.address.clone()).collect();
+                    // Состав — по тегам: общее окно стоит в составе каждого
+                    // своего workspace (изменение shared-windows, решение D11).
+                    let windows: Vec<String> = ws_windows(&clients, ws).iter().map(|c| c.address.clone()).collect();
                     json!({ "name": ws, "icon": w.and_then(|w| w.icon.clone()), "active": d.active.as_deref() == Some(ws), "apps": apps, "windows": windows })
                 })
                 .collect();
@@ -1561,7 +1812,7 @@ impl Daemon {
         let windows: Vec<Value> = clients
             .iter()
             .map(|c| {
-                json!({ "address": c.address, "class": c.class, "title": c.title, "app": c.app(), "instance": c.app_instance().map(|(_, n)| n), "workspace": c.workspace.name, "foreign": self.st.foreign.contains_key(&c.address), "rect": c.rect(), "pid": c.pid })
+                json!({ "address": c.address, "class": c.class, "title": c.title, "app": c.app(), "instance": c.app_instance().map(|(_, n)| n), "workspace": c.workspace.name, "workspaces": c.workspaces(), "foreign": self.st.foreign.contains_key(&c.address), "rect": c.rect(), "pid": c.pid })
             })
             .collect();
         let pending: Vec<Value> = self.pending.iter().map(|p| json!({ "app": p.app, "pid": p.pid, "desktop": p.desktop })).collect();
@@ -1764,13 +2015,287 @@ pub fn app_windows<'a>(cfg: &Config, clients: &'a [Client], app: &str) -> Vec<&'
     out
 }
 
-/// Окна, которые расставляет запись приложения `app` в workspace с набором
-/// приложений `apps`. Окно варианта — окно своего семейства, но если вариант
-/// сам описан в этом workspace, место ему задаёт его собственная запись, а не
-/// запись семейства: более точное совпадение побеждает (спецификация ws-daemon,
-/// «Расстановка окон»).
-fn placed_windows<'a>(cfg: &Config, clients: &'a [Client], apps: &[String], app: &str) -> Vec<&'a Client> {
+/// Окна приложения `app` без окон вариантов, которые workspace с набором
+/// приложений `apps` описывает отдельно. Окно варианта — окно своего
+/// семейства, но если вариант сам описан в workspace, место ему задаёт его
+/// собственная запись, а не запись семейства: более точное совпадение
+/// побеждает (спецификация ws-daemon, «Расстановка окон»).
+fn app_windows_in<'a>(cfg: &Config, clients: &'a [Client], apps: &[String], app: &str) -> Vec<&'a Client> {
     app_windows(cfg, clients, app).into_iter().filter(|c| c.app().is_none_or(|own| own == app || !apps.contains(&own))).collect()
+}
+
+/// Окна, которые расставляет запись приложения `app` в workspace `ws`
+/// с набором приложений `apps`: окна приложения, входящие в `ws` по тегу
+/// состава (изменение shared-windows, решение D1).
+fn placed_windows<'a>(cfg: &Config, clients: &'a [Client], ws: &str, apps: &[String], app: &str) -> Vec<&'a Client> {
+    app_windows_in(cfg, clients, apps, app).into_iter().filter(|c| c.in_ws(ws)).collect()
+}
+
+/// Диспетчеры, которыми новое окно становится экземпляром `app` с номером
+/// `num` и, если задан `ws`, входит в этот workspace (изменение
+/// shared-windows, решение D2).
+pub fn entry_tags(addr: &str, app: &str, num: u32, ws: Option<&str>) -> Vec<String> {
+    let mut ex = vec![hypr::d_tag(addr, &format!("app:{app}#{num}"))];
+    if let Some(w) = ws {
+        ex.push(hypr::d_tag(addr, &hypr::ws_tag(w)));
+    }
+    ex
+}
+
+/// Окна, входящие в workspace `ws` по тегам состава (изменение
+/// shared-windows, решение D1).
+pub fn ws_windows<'a>(clients: &'a [Client], ws: &str) -> Vec<&'a Client> {
+    clients.iter().filter(|c| c.in_ws(ws)).collect()
+}
+
+/// Активные workspace столов: стол → workspace.
+pub fn actives(st: &State) -> BTreeMap<u8, String> {
+    st.desktops.iter().filter_map(|(n, d)| Some((*n, d.active.clone()?))).collect()
+}
+
+/// Где стоит окно: на обычном столе, на `special:pool` (и на прочих
+/// специальных столах, кроме скрытого) или на `special:hidden`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Spot {
+    Desktop(u8),
+    Pool,
+    Hidden,
+}
+
+impl Spot {
+    pub fn of(c: &Client) -> Spot {
+        if c.on_hidden() {
+            Spot::Hidden
+        } else if let Some(n) = c.desktop() {
+            Spot::Desktop(n)
+        } else {
+            Spot::Pool
+        }
+    }
+}
+
+/// Где должно стоять окно, входящее в workspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Home {
+    Desktop(u8),
+    Pool,
+    /// Окно скрыто пользователем, правило его не трогает.
+    Keep,
+}
+
+/// Правило размещения окна, входящего в workspace (изменение shared-windows,
+/// решение D4; спецификация ws-daemon, «Следование общего окна за столом»).
+/// `members` — workspace окна по тегам состава, `active` — активные workspace
+/// столов, `current` — стол, где находится композитор, `at` — где окно стоит.
+/// По порядку: стол композитора, если активный там workspace содержит окно;
+/// нынешний стол окна при том же условии; стол с наименьшим номером, где
+/// активен workspace окна; иначе `special:pool`. Скрытое окно остаётся, где есть.
+pub fn window_home(members: &[String], active: &BTreeMap<u8, String>, current: u8, at: Spot) -> Home {
+    if at == Spot::Hidden {
+        return Home::Keep;
+    }
+    let holds = |n: u8| active.get(&n).is_some_and(|w| members.contains(w));
+    if holds(current) {
+        return Home::Desktop(current);
+    }
+    if let Spot::Desktop(d) = at
+        && holds(d)
+    {
+        return Home::Desktop(d);
+    }
+    match active.iter().filter(|(_, w)| members.contains(w)).map(|(n, _)| *n).min() {
+        Some(d) => Home::Desktop(d),
+        None => Home::Pool,
+    }
+}
+
+/// Место окна, пришедшего на стол workspace `ws` (решение D6): в режиме
+/// обмена ячеек — место его приложения в `ws`, в режиме `stack` —
+/// запомненный для `ws` прямоугольник, а без него место из конфига. `None` —
+/// окно остаётся в своём прямоугольнике.
+pub fn arrive_rect(st: &mut State, cfg: &Config, ws: &str, c: &Client, mon: (i32, i32)) -> Option<PxRect> {
+    let ws_apps: Vec<String> = cfg.workspaces.get(ws).map(|w| w.apps.keys().cloned().collect()).unwrap_or_default();
+    let stack = cfg.workspaces.get(ws).map(|w| w.mode()) == Some(Mode::Stack);
+    let cell = ws_app_of(cfg, ws, &ws_apps, c).and_then(|a| st.rect_for(cfg, ws, &a, mon));
+    let kept = st.geom.get(ws).and_then(|g| g.get(&c.address)).copied();
+    raise_target(false, stack, true, kept, cell, c.rect())
+}
+
+/// Прямоугольник, который надо запомнить, прежде чем окно уйдёт со своего
+/// стола (решение D6): окно стоит на столе, где активен другой его workspace
+/// режима `stack`, и пользователь оставил его там в этом прямоугольнике.
+/// `target` — workspace, за которым окно уходит (для него не запоминается).
+pub fn leave_geom(cfg: &Config, active: &BTreeMap<u8, String>, c: &Client, target: Option<&str>) -> Option<(String, PxRect)> {
+    let v = active.get(&c.desktop()?)?;
+    let stack = cfg.workspaces.get(v).map(|w| w.mode()) == Some(Mode::Stack);
+    (Some(v.as_str()) != target && c.in_ws(v) && stack).then(|| (v.clone(), c.rect()))
+}
+
+/// Перенос окна за пользователем на стол при смене стола.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Follow {
+    pub addr: String,
+    /// Место на новом столе; `None` — прямоугольник окна не меняется.
+    pub rect: Option<PxRect>,
+    /// Прямоугольник, запомненный для workspace режима `stack`, со стола
+    /// которого окно уходит.
+    pub leave: Option<(String, PxRect)>,
+    /// Прямоугольник окна у композитора до переноса.
+    pub now: PxRect,
+}
+
+/// План следования за столом (решения D5, D6; спецификация ws-daemon,
+/// «Следование общего окна за столом»): окна активного workspace стола `n`,
+/// стоящие на других столах или на `special:pool`, переезжают на `n`
+/// в состояние, запомненное для этого workspace. Скрытые окна не трогаются;
+/// стол без активного workspace плана не даёт.
+pub fn follow_plan(st: &mut State, cfg: &Config, clients: &[Client], n: u8, mon: (i32, i32)) -> Vec<Follow> {
+    let active = actives(st);
+    let Some(ws) = active.get(&n).cloned() else { return Vec::new() };
+    let mut out = Vec::new();
+    for c in ws_windows(clients, &ws) {
+        if c.on_hidden() || c.desktop() == Some(n) {
+            continue;
+        }
+        let rect = arrive_rect(st, cfg, &ws, c, mon);
+        out.push(Follow { addr: c.address.clone(), rect, leave: leave_geom(cfg, &active, c, Some(&ws)), now: c.rect() });
+    }
+    out
+}
+
+/// Окна других workspace, которые поднятие `ws` забирает в общее
+/// пользование (решение D3): для приложения, у которого после захвата
+/// свободных окон нет ни одного окна в `ws`, — все его нескрытые окна
+/// (по семейству — окна семейства, по варианту — окна варианта). Окна,
+/// уже входящие в `ws`, другими не дополняются. Возвращает номер окна
+/// в списке клиентов и приложение workspace.
+pub fn share_plan(cfg: &Config, clients: &[Client], ws: &str, apps: &[String]) -> Vec<(usize, String)> {
+    let mut out: Vec<(usize, String)> = Vec::new();
+    for app in apps {
+        if !placed_windows(cfg, clients, ws, apps, app).is_empty() {
+            continue;
+        }
+        for c in app_windows_in(cfg, clients, apps, app) {
+            if c.on_hidden() || !c.has_ws() {
+                continue;
+            }
+            if let Some(i) = clients.iter().position(|x| x.address == c.address)
+                && !out.iter().any(|(j, _)| *j == i)
+            {
+                out.push((i, app.clone()));
+            }
+        }
+    }
+    out
+}
+
+/// Запись о месте приложения `app` для workspace, в который окно входит
+/// без описания там (решение D8; спецификация ws-sessions, «Дополнительные
+/// приложения сессии»): для приложения файла конфига — только место, для
+/// приложения, известного лишь записи сессии другого workspace, — полная
+/// запись с классом, командой и каталогом. `None` — приложения нет ни там,
+/// ни там.
+pub fn share_record(file: &Config, extra: &BTreeMap<String, BTreeMap<String, ExtraApp>>, app: &str, rect: PxRect) -> Option<ExtraApp> {
+    if file.apps.contains_key(app) {
+        return Some(ExtraApp { rect, ..ExtraApp::default() });
+    }
+    extra.values().find_map(|m| m.get(app).filter(|e| !e.cmd.is_empty())).map(|e| ExtraApp { rect, ..e.clone() })
+}
+
+/// Куда ведёт клавиша приложения (решение D7; спецификация ws-daemon,
+/// «Цепочка приложения»).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppRoute {
+    /// Приложение описано в активном workspace текущего стола: цикл в нём.
+    Cycle { ws: String, app: String },
+    /// Перетащить окна приложения в активный workspace текущего стола.
+    Pull { ws: String, app: String },
+    /// Поднять запущенный workspace с приложением: `desktop` — стол, где он
+    /// в списке, если это не текущий стол.
+    Raise { ws: String, app: String, desktop: Option<u8> },
+    /// Открыть приложение в активном workspace текущего стола.
+    Open { ws: String, app: String },
+    /// Активного workspace на столе нет: цикл по окнам приложения вне workspace.
+    Free { app: String },
+}
+
+/// Выбор пути клавиши приложения. `apps` — кандидаты с одной цепочкой:
+/// действует тот, чей workspace найдётся раньше. Запущенным считается
+/// workspace из списка какого-либо стола, в том числе ожидающий ленивого
+/// поднятия; workspace вне списков клавиша приложения не поднимает.
+pub fn app_route(cfg: &Config, desktops: &BTreeMap<u8, Desktop>, current: u8, apps: &[String], pull: bool) -> AppRoute {
+    let described = |ws: &str| -> Option<String> { apps.iter().find(|a| cfg.workspaces.get(ws).is_some_and(|w| w.apps.contains_key(*a))).cloned() };
+    let first = apps.first().cloned().unwrap_or_default();
+    let active = desktops.get(&current).and_then(|d| d.active.clone());
+    if let Some(ws) = &active
+        && let Some(app) = described(ws)
+    {
+        return AppRoute::Cycle { ws: ws.clone(), app };
+    }
+    if pull && let Some(ws) = &active {
+        return AppRoute::Pull { ws: ws.clone(), app: first };
+    }
+    let here = desktops.get(&current).map(|d| d.workspaces.clone()).unwrap_or_default();
+    for ws in &here {
+        if let Some(app) = described(ws) {
+            return AppRoute::Raise { ws: ws.clone(), app, desktop: None };
+        }
+    }
+    for (k, d) in desktops.iter().filter(|(k, _)| **k != current) {
+        for ws in &d.workspaces {
+            if let Some(app) = described(ws) {
+                return AppRoute::Raise { ws: ws.clone(), app, desktop: Some(*k) };
+            }
+        }
+    }
+    match active {
+        Some(ws) => AppRoute::Open { ws, app: first },
+        None => AppRoute::Free { app: first },
+    }
+}
+
+/// Теги состава, которые пора снять (решение D2): workspace исчез
+/// из эффективного конфига или не описывает приложение окна (само
+/// приложение либо его семейство). Окно без приложения не входит ни в один
+/// workspace. Возвращает адрес окна и workspace.
+pub fn stale_ws_tags(cfg: &Config, clients: &[Client]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for c in clients {
+        let app = c.app();
+        for w in c.workspaces() {
+            if !app.as_deref().is_some_and(|a| ws_has_app(cfg, &w, a)) {
+                out.push((c.address.clone(), w));
+            }
+        }
+    }
+    out
+}
+
+/// Состав для окон прежней версии демона (решение D2): окну с тегом
+/// экземпляра без тегов состава. Окно на столе, где активен workspace,
+/// описывающий его приложение, входит в этот workspace; окно на
+/// `special:pool` — во все неактивные workspace из списков столов,
+/// описывающие его приложение; иначе окно остаётся свободным. Возвращает
+/// адрес окна и workspace.
+pub fn derive_membership(cfg: &Config, st: &State, clients: &[Client]) -> Vec<(String, String)> {
+    let active = actives(st);
+    let mut listed: Vec<String> = st.desktops.values().flat_map(|d| d.workspaces.iter().cloned()).collect();
+    listed.sort();
+    listed.dedup();
+    let mut out = Vec::new();
+    for c in clients.iter().filter(|c| !c.has_ws()) {
+        let Some(app) = c.app() else { continue };
+        if let Some(n) = c.desktop() {
+            if let Some(w) = active.get(&n).filter(|w| ws_has_app(cfg, w, &app)) {
+                out.push((c.address.clone(), w.clone()));
+            }
+        } else if c.on_pool() {
+            for w in listed.iter().filter(|w| !active.values().any(|a| a == *w) && ws_has_app(cfg, w, &app)) {
+                out.push((c.address.clone(), w.clone()));
+            }
+        }
+    }
+    out
 }
 
 /// Первый экземпляр приложения: окно с наименьшим номером, скрытые последними.
@@ -2010,40 +2535,56 @@ fn same_program(cfg: &Config, app: &str, cmd: &[String]) -> bool {
 /// Что делает команда отделения окна.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DetachStep {
-    /// Закрыть окно; `drop_extra` — снять заодно запись дополнительного
-    /// приложения сессии, потому что закрывается последнее его окно.
-    Close { app: String, drop_extra: bool },
+    /// Окно входит ещё в другие workspace: снять тег состава и увести окно
+    /// по правилу размещения; `drop_extra` — снять запись дополнительного
+    /// приложения сессии в этом workspace, потому что из него ушло последнее
+    /// окно приложения.
+    Leave { app: String, home: Home, drop_extra: bool },
+    /// Workspace был у окна последним: закрыть окно. `drop_extra` — то же,
+    /// что у `Leave`; `last` — других окон у приложения нет нигде, и запись
+    /// с командой снимается во всех workspace.
+    Close { app: String, drop_extra: bool, last: bool },
     /// Ничего не делать, причина для журнала.
     Skip(&'static str),
 }
 
 /// Решение команды `workspaced detach` (спецификация ws-daemon, «Отделение
-/// окна»): активное окно текущего стола убирается из активного workspace
-/// этого стола. Общих окон на этом шаге нет, поэтому окно, вышедшее
-/// из workspace, не входит ни в один другой и закрывается.
-pub fn detach_step(cfg: &Config, clients: &[Client], ws: Option<&str>, extra: &BTreeMap<String, ExtraApp>, active: Option<&Client>) -> DetachStep {
+/// окна»; изменение shared-windows, решение D9): активное окно текущего стола
+/// убирается из активного workspace этого стола `ws`. Окно, входящее ещё
+/// в другие workspace, уходит по правилу размещения (`active` — активные
+/// workspace столов после снятия тега, `current` — стол композитора);
+/// окно, для которого `ws` был последним, закрывается.
+pub fn detach_step(cfg: &Config, clients: &[Client], ws: Option<&str>, extra: &BTreeMap<String, ExtraApp>, active: Option<&Client>, desks: &BTreeMap<u8, String>, current: u8) -> DetachStep {
     let Some(c) = active else { return DetachStep::Skip("на текущем столе нет активного окна") };
     let Some(w) = ws else { return DetachStep::Skip("на столе нет активного workspace") };
     let ws_apps: Vec<String> = cfg.workspaces.get(w).map(|x| x.apps.keys().cloned().collect()).unwrap_or_default();
-    if ws_app_of(cfg, &ws_apps, c).is_none() {
+    if ws_app_of(cfg, w, &ws_apps, c).is_none() {
         return DetachStep::Skip("активное окно не входит в активный workspace стола");
     }
     let Some(app) = c.app() else { return DetachStep::Skip("у активного окна нет приложения") };
-    let others = app_windows(cfg, clients, &app).iter().filter(|x| x.address != c.address && x.app().as_deref() == Some(app.as_str())).count();
-    DetachStep::Close { drop_extra: extra.contains_key(&app) && others == 0, app }
+    let own = |x: &&Client| x.address != c.address && x.app().as_deref() == Some(app.as_str());
+    let in_ws = clients.iter().filter(own).filter(|x| x.in_ws(w)).count();
+    let anywhere = clients.iter().filter(own).count();
+    let drop_extra = extra.contains_key(&app) && in_ws == 0;
+    let rest: Vec<String> = c.workspaces().into_iter().filter(|x| x != w).collect();
+    if rest.is_empty() {
+        return DetachStep::Close { app, drop_extra, last: anywhere == 0 };
+    }
+    let home = window_home(&rest, desks, current, Spot::of(c));
+    DetachStep::Leave { app, home, drop_extra }
 }
 
-/// Снять запись дополнительного приложения сессии `app` после отделения
-/// последнего его окна в workspace `ws` (спецификация ws-daemon, «Отделение
-/// окна»). Запись с командой запуска описывает само приложение, и после
-/// последнего окна приложения в сессии не остаётся: она снимается во всех
-/// workspace, где есть. Запись без команды задаёт лишь место приложения
-/// конфига в одном workspace и снимается только в `ws` (изменение
-/// classless-windows-stay-free, решение D3).
-/// Вместе с записью снимается назначение места. Возвращает workspace,
-/// где запись снята.
-pub fn drop_extra_app(st: &mut State, ws: &str, app: &str) -> Vec<String> {
-    let everywhere = st.extra.get(ws).and_then(|m| m.get(app)).is_some_and(|e| !e.cmd.is_empty());
+/// Снять запись дополнительного приложения сессии `app` после того, как
+/// из workspace `ws` ушло последнее окно приложения (спецификация ws-daemon,
+/// «Отделение окна»; изменение shared-windows, решение D9). Запись снимается
+/// в `ws`; запись с командой запуска снимается и во всех остальных
+/// workspace, если `last` — окно закрыто и других окон у приложения нет
+/// нигде: программа уходит из сессии (изменение classless-windows-stay-free,
+/// решение D3). Пока окна приложения остаются в других workspace, их записи
+/// остаются. Вместе с записью снимается назначение места. Возвращает
+/// workspace, где запись снята.
+pub fn drop_extra_app(st: &mut State, ws: &str, app: &str, last: bool) -> Vec<String> {
+    let everywhere = last && st.extra.get(ws).and_then(|m| m.get(app)).is_some_and(|e| !e.cmd.is_empty());
     let from: Vec<String> = st.extra.iter().filter(|(w, m)| m.contains_key(app) && (everywhere || w.as_str() == ws)).map(|(w, _)| w.clone()).collect();
     for w in &from {
         if let Some(m) = st.extra.get_mut(w) {
@@ -2247,13 +2788,28 @@ pub fn free_instance(clients: &[Client], app: &str) -> u32 {
     free_number(&used)
 }
 
-/// Что захватить: окно (его номер в списке клиентов), приложение и номер
-/// экземпляра. Кандидат — окно не на `special:hidden`, чей класс и заголовок
-/// подходят приложению, без тега или с тегом приложения, которого нет
-/// в конфиге. Сопоставление идёт сначала по вариантам, затем по семействам:
-/// более точное совпадение побеждает. Окна обычных столов разбираются раньше
-/// окон на `special:pool`, поэтому первый экземпляр — окно на столе.
-fn adopt_plan(cfg: &Config, clients: &[Client], apps: &[String]) -> Result<Vec<(usize, String, u32)>> {
+/// Захват окна: номер окна в списке клиентов, приложение и номер экземпляра;
+/// `retag` — окну ставится новый тег экземпляра, иначе у окна уже есть свой
+/// тег экземпляра и оно только входит в workspace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Capture {
+    pub idx: usize,
+    pub app: String,
+    pub num: u32,
+    pub retag: bool,
+}
+
+/// Что захватить (спецификация ws-daemon, «Захват открытых окон
+/// приложения»). Кандидат — окно не на `special:hidden`, чей класс
+/// и заголовок подходят приложению, без тега или с тегом приложения,
+/// которого нет в конфиге. Сопоставление идёт сначала по вариантам, затем
+/// по семействам: более точное совпадение побеждает. Окна обычных столов
+/// разбираются раньше окон на `special:pool`, поэтому первый экземпляр — окно
+/// на столе. С `members` захват идёт для workspace, и кандидатом становится
+/// ещё и свободное окно приложения — с тегом экземпляра одного из `apps`
+/// (или варианта описанного семейства), но без тегов состава (изменение
+/// shared-windows, решение D3): оно сохраняет свой тег экземпляра.
+fn adopt_plan(cfg: &Config, clients: &[Client], apps: &[String], members: bool) -> Result<Vec<Capture>> {
     // Порядок сопоставления: варианты по именам, затем семейства.
     let mut variants: Vec<String> = Vec::new();
     let mut families: Vec<String> = Vec::new();
@@ -2284,7 +2840,16 @@ fn adopt_plan(cfg: &Config, clients: &[Client], apps: &[String]) -> Result<Vec<(
     let mut plan = Vec::new();
     for i in order {
         let c = &clients[i];
-        if c.on_hidden() || c.app().is_some_and(|a| cfg.apps.contains_key(&a)) || cfg.ignored_class(&c.class) {
+        if c.on_hidden() {
+            continue;
+        }
+        if let Some((own, num)) = c.app_instance().filter(|(a, _)| cfg.apps.contains_key(a)) {
+            if members && !c.has_ws() && apps.iter().any(|x| cfg.app_is(&own, x)) {
+                plan.push(Capture { idx: i, app: own, num, retag: false });
+            }
+            continue;
+        }
+        if cfg.ignored_class(&c.class) {
             continue;
         }
         let fitting: Vec<&String> = matchers.iter().filter(|(_, cr, tr)| matcher_fits(Some(cr), tr.as_ref(), c)).map(|(n, _, _)| n).collect();
@@ -2298,19 +2863,36 @@ fn adopt_plan(cfg: &Config, clients: &[Client], apps: &[String]) -> Result<Vec<(
         }
         let num = free_number(&used.iter().filter(|(a, _)| *a == app).map(|(_, n)| *n).collect::<Vec<u32>>());
         used.push((app.clone(), num));
-        plan.push((i, app, num));
+        plan.push(Capture { idx: i, app, num, retag: true });
     }
     Ok(plan)
 }
 
-/// Приложение workspace, которому принадлежит окно: само приложение, если оно
-/// описано в workspace, иначе его семейство. Окно чужого приложения даёт `None`.
-fn ws_app_of(cfg: &Config, ws_apps: &[String], c: &Client) -> Option<String> {
+/// Приложение workspace `ws`, которому принадлежит окно: само приложение,
+/// если оно описано в workspace, иначе его семейство. Окно, не входящее
+/// в `ws` по тегу состава, и окно чужого приложения дают `None`.
+fn ws_app_of(cfg: &Config, ws: &str, ws_apps: &[String], c: &Client) -> Option<String> {
+    if !c.in_ws(ws) {
+        return None;
+    }
     let own = c.app()?;
     if ws_apps.contains(&own) {
         return Some(own);
     }
     ws_apps.iter().find(|x| cfg.app_is(&own, x)).cloned()
+}
+
+/// Чем начат цикл клавиши приложения.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Start {
+    /// Обычное нажатие: шаг цикла выводится из активного окна.
+    Continue,
+    /// Workspace поднят этой же цепочкой: цикл начинается заново.
+    Raised,
+    /// Приложение открыто или перетащено в workspace этой же цепочкой: цикл
+    /// начинается заново, а первый экземпляр выбирается без обмена ячеек
+    /// (решение D15).
+    Joined,
 }
 
 /// Что делает клавиша приложения на этом нажатии.
@@ -2357,12 +2939,13 @@ pub fn cycle_step(order: &[String], active: Option<&str>, fresh: bool, prev: Opt
 /// цикла обязан вернуть расстановку. В режиме `stack` — активное окно
 /// workspace, а если активно чужое окно, то последнее окно workspace,
 /// получавшее фокус. Экземпляры самого вызванного приложения prev не бывают.
-pub fn anchor_window(cfg: &Config, clients: &[Client], ws_apps: &[String], main_window: Option<&str>, order: &[String], active: Option<&str>, focus: Option<&str>) -> Option<String> {
+pub fn anchor_window(cfg: &Config, clients: &[Client], ws: &str, main_window: Option<&str>, order: &[String], active: Option<&str>, focus: Option<&str>) -> Option<String> {
+    let ws_apps: Vec<String> = cfg.workspaces.get(ws).map(|w| w.apps.keys().cloned().collect()).unwrap_or_default();
     if let Some(m) = main_window {
         return Some(m.to_string());
     }
     let fits = |a: &str| {
-        !order.iter().any(|x| x == a) && clients.iter().any(|c| c.address == a && !c.on_hidden() && ws_app_of(cfg, ws_apps, c).is_some())
+        !order.iter().any(|x| x == a) && clients.iter().any(|c| c.address == a && !c.on_hidden() && ws_app_of(cfg, ws, &ws_apps, c).is_some())
     };
     active.filter(|a| fits(a)).or_else(|| focus.filter(|a| fits(a))).map(String::from)
 }
@@ -2375,7 +2958,7 @@ pub fn next_app_window(cfg: &Config, clients: &[Client], ws: &str, app: &str) ->
     let i = names.iter().position(|n| n == app)?;
     (1..names.len())
         .map(|k| &names[(i + k) % names.len()])
-        .find_map(|name| placed_windows(cfg, clients, &names, name).into_iter().find(|c| !c.on_hidden()).map(|c| c.address.clone()))
+        .find_map(|name| placed_windows(cfg, clients, ws, &names, name).into_iter().find(|c| !c.on_hidden()).map(|c| c.address.clone()))
 }
 
 /// Обмен ячеек: приложение идёт в главную ячейку, прежнее главное — на его
@@ -2471,6 +3054,11 @@ mod tests {
     }
 
     use crate::hypr::test_client as client;
+
+    /// План захвата в виде «номер окна, приложение, номер экземпляра».
+    fn triples(plan: Vec<Capture>) -> Vec<(usize, String, u32)> {
+        plan.into_iter().map(|c| (c.idx, c.app, c.num)).collect()
+    }
 
     /// Семейство `wezterm` с вариантом `herdr`, семейство `chromium`
     /// с вариантом `chromium-mail` и обычные приложения.
@@ -2596,7 +3184,7 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
         extra.entry("work".into()).or_default().insert("app".into(), ExtraApp { class: Some(String::new()), cmd: cmd.clone(), cwd: None, rect: PxRect::default() });
         let (merged, _) = merge_extra(&cfg, &extra);
         assert_eq!(app_for_window(&merged, &tm), None);
-        let plan = adopt_plan(&merged, std::slice::from_ref(&tm), &["app".to_string()]).unwrap();
+        let plan = triples(adopt_plan(&merged, std::slice::from_ref(&tm), &["app".to_string()], true).unwrap());
         assert!(plan.is_empty());
     }
 
@@ -2626,11 +3214,11 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
         st.extra.get_mut("surf").unwrap().insert("calc".into(), ExtraApp::default());
         st.extra.entry("work".into()).or_default().insert("calc".into(), ExtraApp::default());
         // Запись с командой снимается везде, где есть, вместе с местом.
-        assert_eq!(drop_extra_app(&mut st, "surf", "wev"), vec!["surf".to_string(), "work".to_string()]);
+        assert_eq!(drop_extra_app(&mut st, "surf", "wev", true), vec!["surf".to_string(), "work".to_string()]);
         assert!(st.extra.values().all(|m| !m.contains_key("wev")));
         assert!(st.cells.values().all(|m| !m.contains_key("wev")));
         // Запись только о месте приложения конфига снимается в одном workspace.
-        assert_eq!(drop_extra_app(&mut st, "surf", "calc"), vec!["surf".to_string()]);
+        assert_eq!(drop_extra_app(&mut st, "surf", "calc", true), vec!["surf".to_string()]);
         assert!(st.extra["work"].contains_key("calc"));
         assert!(!st.extra.contains_key("surf"));
     }
@@ -2686,48 +3274,341 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
         assert_eq!(app_name("!!!", &taken), "app");
     }
 
+    /// Активные workspace столов для тестов: `work` на столе 1, `surf` на столе 2.
+    fn desks(pairs: &[(u8, &str)]) -> BTreeMap<u8, String> {
+        pairs.iter().map(|(n, w)| (*n, w.to_string())).collect()
+    }
+
     #[test]
-    fn detach_closes_window_of_the_active_workspace() {
+    fn detach_closes_last_membership() {
         let cfg = Config::parse(CFG).unwrap();
         let clients = vec![
-            client("0x1", "wezterm-herdr", "herdr · dev-lab", "1", &["app:herdr#1"]),
-            client("0x2", "chromium", "Новости", "1", &["app:chromium#1"]),
+            client("0x1", "wezterm-herdr", "herdr · dev-lab", "1", &["app:herdr#1", "ws:work"]),
+            client("0x2", "chromium", "Новости", "1", &["app:chromium#1", "ws:work"]),
             client("0x3", "Alacritty", "mne@dev-lab", "1", &["app:alacritty#1"]),
             client("0x4", "firefox", "Видео", "1", &[]),
         ];
         let extra: BTreeMap<String, ExtraApp> = BTreeMap::new();
-        let step = |active: Option<&Client>, extra: &BTreeMap<String, ExtraApp>| detach_step(&cfg, &clients, Some("work"), extra, active);
+        let d = desks(&[(1, "work")]);
+        let step = |active: Option<&Client>, extra: &BTreeMap<String, ExtraApp>| detach_step(&cfg, &clients, Some("work"), extra, active, &d, 1);
 
-        // Окно приложения workspace закрывается: общих окон на этом шаге нет.
-        assert_eq!(step(Some(&clients[1]), &extra), DetachStep::Close { app: "chromium".into(), drop_extra: false });
+        // Окно входит только в `work`: оно закрывается, других окон нет нигде.
+        assert_eq!(step(Some(&clients[1]), &extra), DetachStep::Close { app: "chromium".into(), drop_extra: false, last: true });
         // Свободное окно ни в какой workspace не входит, трогать его незачем.
         assert!(matches!(step(Some(&clients[3]), &extra), DetachStep::Skip(_)));
+        // Окно с тегом экземпляра, но без тега состава, — тоже свободное.
+        assert!(matches!(step(Some(&clients[2]), &extra), DetachStep::Skip(_)));
         // Без активного окна и без активного workspace команда ничего не делает.
         assert!(matches!(step(None, &extra), DetachStep::Skip(_)));
-        assert!(matches!(detach_step(&cfg, &clients, None, &extra, Some(&clients[1])), DetachStep::Skip(_)));
+        assert!(matches!(detach_step(&cfg, &clients, None, &extra, Some(&clients[1]), &d, 1), DetachStep::Skip(_)));
 
-        // Окно приложения, которого в workspace нет, командой не задевается.
-        let alien = client("0x5", "neovide", "[Scratch]", "1", &["app:neovide#1"]);
+        // Окно чужого workspace командой не задевается, даже если его
+        // приложение описано в активном.
+        let alien = client("0x5", "neovide", "[Scratch]", "1", &["app:neovide#1", "ws:dev-front"]);
         let others = vec![alien.clone()];
-        assert!(matches!(detach_step(&cfg, &others, Some("surf"), &extra, Some(&alien)), DetachStep::Skip(_)));
+        assert!(matches!(detach_step(&cfg, &others, Some("work"), &extra, Some(&alien), &d, 1), DetachStep::Skip(_)));
+
+        // Второе окно того же приложения в другом workspace: это окно
+        // закрывается, но оно не последнее у приложения.
+        let two = vec![clients[1].clone(), client("0x6", "chromium", "Документы", "3", &["app:chromium#2", "ws:dev-front"])];
+        assert_eq!(detach_step(&cfg, &two, Some("work"), &extra, Some(&two[0]), &d, 1), DetachStep::Close { app: "chromium".into(), drop_extra: false, last: false });
     }
 
     #[test]
-    fn detach_drops_the_last_window_of_a_session_app() {
-        // Дополнительное приложение сессии `alacritty` живёт в `work`.
-        let text = CFG.replace("apps = { herdr = \"center\", chromium = \"left\", neovide = \"right\" }", "apps = { herdr = \"center\", chromium = \"left\", neovide = \"right\", alacritty = { rect = { x = 0, y = 0, w = 10, h = 10 } } }")
-            .replace("[apps.neovide]", "[apps.alacritty]\ncmd = \"alacritty\"\nclass = \"^Alacritty$\"\n\n[apps.neovide]");
-        let cfg = Config::parse(&text).unwrap();
-        let mut extra: BTreeMap<String, ExtraApp> = BTreeMap::new();
-        extra.insert("alacritty".into(), ExtraApp { class: Some("Alacritty".into()), cmd: vec!["alacritty".into()], cwd: None, rect: PxRect::default() });
+    fn detach_leaves_shared_window() {
+        let cfg = Config::parse(CFG).unwrap();
+        let extra: BTreeMap<String, ExtraApp> = [("chromium".to_string(), ExtraApp::default())].into();
+        let shared = client("0x1", "chromium", "Новости", "1", &["app:chromium#1", "ws:work", "ws:surf"]);
+        let clients = vec![shared.clone()];
+        // Другой workspace окна активен на столе 2: окно уходит туда открытым,
+        // а запись о месте снимается — из `work` ушло последнее окно приложения.
+        let d = desks(&[(1, "work"), (2, "surf")]);
+        assert_eq!(detach_step(&cfg, &clients, Some("work"), &extra, Some(&shared), &d, 1), DetachStep::Leave { app: "chromium".into(), home: Home::Desktop(2), drop_extra: true });
+        // Другой workspace не активен нигде: окно уходит на special:pool.
+        let d = desks(&[(1, "work")]);
+        assert_eq!(detach_step(&cfg, &clients, Some("work"), &extra, Some(&shared), &d, 1), DetachStep::Leave { app: "chromium".into(), home: Home::Pool, drop_extra: true });
+        // Второе окно приложения остаётся в `work`: запись о месте не снимается.
+        let two = vec![shared.clone(), client("0x2", "chromium", "Почта", "1", &["app:chromium#2", "ws:work"])];
+        assert!(matches!(detach_step(&cfg, &two, Some("work"), &extra, Some(&shared), &d, 1), DetachStep::Leave { drop_extra: false, .. }));
+    }
 
-        // Последнее окно: запись дополнительного приложения снимается вместе с ним.
-        let one = vec![client("0x1", "Alacritty", "mne@dev-lab", "1", &["app:alacritty#1"])];
-        assert_eq!(detach_step(&cfg, &one, Some("work"), &extra, Some(&one[0])), DetachStep::Close { app: "alacritty".into(), drop_extra: true });
+    #[test]
+    fn drop_extra_keeps_records_of_other_members() {
+        let full = ExtraApp { class: Some("Alacritty".into()), cmd: vec!["/usr/bin/alacritty".into()], cwd: None, rect: PxRect::default() };
+        let fresh = || {
+            let mut st = State::default();
+            for w in ["work", "dev-front"] {
+                st.extra.entry(w.into()).or_default().insert("alacritty".into(), full.clone());
+                st.cells.entry(w.into()).or_default().insert("alacritty".into(), Place::Rect { rect: PxRect::default() });
+            }
+            st
+        };
+        // Окно ушло из `work`, но осталось в `dev-front`: запись снимается только в `work`.
+        let mut st = fresh();
+        assert_eq!(drop_extra_app(&mut st, "work", "alacritty", false), vec!["work".to_string()]);
+        assert!(st.extra["dev-front"].contains_key("alacritty"));
+        assert!(st.cells["dev-front"].contains_key("alacritty") && !st.cells["work"].contains_key("alacritty"));
+        // Окно закрыто, и других окон у приложения нет нигде: запись с командой
+        // снимается во всех workspace.
+        let mut st = fresh();
+        assert_eq!(drop_extra_app(&mut st, "work", "alacritty", true), vec!["dev-front".to_string(), "work".to_string()]);
+        assert!(st.extra.is_empty());
+    }
 
-        // Второе окно того же приложения оставляет запись на месте.
-        let two = vec![one[0].clone(), client("0x2", "Alacritty", "htop", "1", &["app:alacritty#2"])];
-        assert_eq!(detach_step(&cfg, &two, Some("work"), &extra, Some(&two[0])), DetachStep::Close { app: "alacritty".into(), drop_extra: false });
+    /// Конфиг с тремя workspace: `work` (обмен ячеек), `surf` (`stack`)
+    /// и `dev-back`; `chrome-ai` описан в `surf` и `dev-back`.
+    fn shared_cfg() -> Config {
+        let text = format!(
+            "{CFG}\n[apps.chrome-ai]\ncmd = \"google-chrome\"\nclass = \"^google-chrome-ai$\"\n\n[workspaces.surf]\ntemplate = \"thirds\"\nmode = \"stack\"\napps = {{ chrome-ai = \"right\" }}\n\n[workspaces.dev-back]\ntemplate = \"thirds\"\napps = {{ chrome-ai = \"center\", neovide = \"right\" }}\n\n[workspaces.chat]\ntemplate = \"thirds\"\napps = {{ calc = \"center\" }}\n"
+        );
+        Config::parse(&text).unwrap()
+    }
+
+    #[test]
+    fn ws_windows_by_tags() {
+        let cfg = shared_cfg();
+        let clients = vec![
+            client("0x1", "chromium", "Новости", "1", &["app:chromium#1", "ws:work"]),
+            // Окно приложения `work`, убранное из него: в состав не входит.
+            client("0x2", "chromium", "Почта", "3", &["app:chromium#2"]),
+            client("0x3", "google-chrome-ai", "ИИ", "2", &["app:chrome-ai#1", "ws:surf", "ws:work"]),
+        ];
+        let addrs = |ws: &str| ws_windows(&clients, ws).iter().map(|c| c.address.clone()).collect::<Vec<_>>();
+        assert_eq!(addrs("work"), vec!["0x1", "0x3"]);
+        assert_eq!(addrs("surf"), vec!["0x3"]);
+        assert!(addrs("dev-back").is_empty());
+        // Цикл и расстановка берут окна приложения только из своего workspace.
+        let apps: Vec<String> = vec!["herdr".into(), "chromium".into(), "neovide".into()];
+        assert_eq!(placed_windows(&cfg, &clients, "work", &apps, "chromium").len(), 1);
+        // Приложение workspace узнаётся только у окна, которое в него входит.
+        assert_eq!(ws_app_of(&cfg, "work", &apps, &clients[0]).as_deref(), Some("chromium"));
+        assert_eq!(ws_app_of(&cfg, "work", &apps, &clients[1]), None);
+        // Следующее приложение workspace — тоже по составу.
+        assert_eq!(next_app_window(&cfg, &clients, "work", "herdr").as_deref(), Some("0x1"));
+    }
+
+    #[test]
+    fn joined_window_gets_ws_tag() {
+        // Окно, запущенное для workspace или появившееся на столе с активным
+        // workspace, получает тег экземпляра и тег состава.
+        let ex = entry_tags("0x1", "chromium", 2, Some("work"));
+        assert_eq!(ex, vec![hypr::d_tag("0x1", "app:chromium#2"), hypr::d_tag("0x1", "ws:work")]);
+        // На столе без активного workspace окно остаётся свободным окном приложения.
+        assert_eq!(entry_tags("0x1", "calc", 1, None), vec![hypr::d_tag("0x1", "app:calc#1")]);
+        // Захват для workspace: свободное окно с тегом экземпляра сохраняет
+        // номер и только входит в workspace, окно без тега получает номер.
+        let cfg = shared_cfg();
+        let apps: Vec<String> = vec!["herdr".into(), "chromium".into(), "neovide".into()];
+        let clients = vec![
+            client("0x1", "chromium", "Новости", "1", &["app:chromium#1", "ws:work"]),
+            client("0x2", "chromium", "Почта", "4", &["app:chromium#2"]),
+            client("0x3", "chromium", "Документы", "4", &[]),
+            // Окно чужого приложения с тегом экземпляра не захватывается.
+            client("0x4", "google-chrome-ai", "ИИ", "4", &["app:chrome-ai#1"]),
+        ];
+        let plan = adopt_plan(&cfg, &clients, &apps, true).unwrap();
+        assert_eq!(plan, vec![Capture { idx: 1, app: "chromium".into(), num: 2, retag: false }, Capture { idx: 2, app: "chromium".into(), num: 3, retag: true }]);
+        // Вне workspace окна с тегом экземпляра не захватываются.
+        assert_eq!(triples(adopt_plan(&cfg, &clients, &apps, false).unwrap()), vec![(2, "chromium".to_string(), 3)]);
+    }
+
+    #[test]
+    fn stale_ws_tags_follow_effective_config() {
+        let cfg = shared_cfg();
+        let clients = vec![
+            // chrome-ai перетащен в work, а записи о месте в снимке нет.
+            client("0x1", "google-chrome-ai", "ИИ", "2", &["app:chrome-ai#1", "ws:surf", "ws:work"]),
+            // Workspace из конфига исчез.
+            client("0x2", "chromium", "Новости", "1", &["app:chromium#1", "ws:work", "ws:gone"]),
+            // Окно варианта входит туда, где описано семейство.
+            client("0x3", "wezterm-herdr", "herdr · dev-lab", "1", &["app:herdr#1", "ws:work"]),
+            // Окно без приложения не входит никуда.
+            client("0x4", "firefox", "Видео", "4", &["ws:work"]),
+        ];
+        let stale = stale_ws_tags(&cfg, &clients);
+        assert_eq!(stale, vec![("0x1".to_string(), "work".to_string()), ("0x2".to_string(), "gone".to_string()), ("0x4".to_string(), "work".to_string())]);
+        // Запись о месте в эффективном конфиге делает тег законным.
+        let mut extra: BTreeMap<String, BTreeMap<String, ExtraApp>> = BTreeMap::new();
+        extra.entry("work".into()).or_default().insert("chrome-ai".into(), ExtraApp::default());
+        let (merged, _) = merge_extra(&cfg, &extra);
+        assert!(!stale_ws_tags(&merged, &clients).iter().any(|(a, _)| a == "0x1"));
+    }
+
+    #[test]
+    fn membership_is_derived_for_old_windows() {
+        let cfg = shared_cfg();
+        let mut st = State::default();
+        st.desktops.insert(1, Desktop { workspaces: vec!["surf".into(), "work".into()], active: Some("work".into()) });
+        st.desktops.insert(3, Desktop { workspaces: vec!["dev-back".into()], active: None });
+        let clients = vec![
+            client("0x1", "chromium", "Новости", "1", &["app:chromium#1"]),
+            // Окно на pool: во все неактивные workspace списков, описывающие приложение.
+            client("0x2", "google-chrome-ai", "ИИ", "special:pool", &["app:chrome-ai#1"]),
+            // Окно на столе без активного workspace остаётся свободным.
+            client("0x3", "neovide", "[Scratch]", "4", &["app:neovide#1"]),
+            // Окно с тегом состава не трогается.
+            client("0x4", "neovide", "[Scratch]", "1", &["app:neovide#2", "ws:work"]),
+            // Скрытое окно и свободное окно без тега — тоже.
+            client("0x5", "neovide", "[Scratch]", "special:hidden", &["app:neovide#3"]),
+            client("0x6", "firefox", "Видео", "1", &[]),
+            // Приложение активного workspace стола не описано в нём: окно свободно.
+            client("0x7", "google-chrome-ai", "ИИ", "1", &["app:chrome-ai#2"]),
+        ];
+        let got = derive_membership(&cfg, &st, &clients);
+        let p = |a: &str, w: &str| (a.to_string(), w.to_string());
+        assert_eq!(got, vec![p("0x1", "work"), p("0x2", "dev-back"), p("0x2", "surf")]);
+    }
+
+    #[test]
+    fn window_home_rules() {
+        let m = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<String>>();
+        let d = desks(&[(1, "work"), (2, "surf"), (4, "chat")]);
+        // 1. Стол композитора, если активный там workspace содержит окно.
+        assert_eq!(window_home(&m(&["surf", "work"]), &d, 1, Spot::Desktop(2)), Home::Desktop(1));
+        assert_eq!(window_home(&m(&["surf", "work"]), &d, 2, Spot::Desktop(1)), Home::Desktop(2));
+        // 2. Пользователь на столе, где окна нет: окно остаётся на своём столе.
+        assert_eq!(window_home(&m(&["surf", "work"]), &d, 4, Spot::Desktop(2)), Home::Desktop(2));
+        // 3. Своего стола нет: стол с наименьшим номером, где активен его workspace.
+        assert_eq!(window_home(&m(&["surf", "work"]), &d, 4, Spot::Pool), Home::Desktop(1));
+        assert_eq!(window_home(&m(&["surf"]), &d, 5, Spot::Desktop(1)), Home::Desktop(2));
+        // 4. Ни один workspace окна не активен: special:pool.
+        assert_eq!(window_home(&m(&["dev-back"]), &d, 1, Spot::Desktop(1)), Home::Pool);
+        // Скрытое окно правило не трогает никогда.
+        assert_eq!(window_home(&m(&["work"]), &d, 1, Spot::Hidden), Home::Keep);
+    }
+
+    #[test]
+    fn raise_shares_windows_only_when_missing() {
+        let cfg = shared_cfg();
+        let apps: Vec<String> = vec!["chrome-ai".into(), "neovide".into()];
+        let clients = vec![
+            client("0x1", "google-chrome-ai", "ИИ", "2", &["app:chrome-ai#1", "ws:surf"]),
+            client("0x2", "neovide", "[Scratch]", "1", &["app:neovide#1", "ws:work"]),
+            client("0x3", "neovide", "[Scratch]", "5", &["app:neovide#2", "ws:dev-back"]),
+            client("0x4", "google-chrome-ai", "ИИ", "special:hidden", &["app:chrome-ai#2", "ws:surf"]),
+        ];
+        // У chrome-ai окна в dev-back нет: его нескрытое окно из surf становится
+        // общим. У neovide окно в dev-back есть: окно work к нему не добавляется.
+        assert_eq!(share_plan(&cfg, &clients, "dev-back", &apps), vec![(0, "chrome-ai".to_string())]);
+        // Скрытое окно workspace считается его окном: второе не добавляется.
+        let hidden = vec![client("0x4", "google-chrome-ai", "ИИ", "special:hidden", &["app:chrome-ai#2", "ws:dev-back"]), clients[0].clone()];
+        assert!(share_plan(&cfg, &hidden, "dev-back", &["chrome-ai".to_string()]).is_empty());
+        // Свободные окна (без состава) отдаёт не этот план, а захват.
+        let free = vec![client("0x5", "google-chrome-ai", "ИИ", "4", &["app:chrome-ai#1"])];
+        assert!(share_plan(&cfg, &free, "dev-back", &["chrome-ai".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn displaced_shared_window_goes_to_its_other_desktop() {
+        // chrome-ai входит в work (стол 1) и dev-back (стол 3), на столе 1
+        // поднят chat: столы после поднятия — chat на 1, dev-back на 3.
+        let after = desks(&[(1, "chat"), (3, "dev-back")]);
+        let shared = client("0x1", "google-chrome-ai", "ИИ", "1", &["app:chrome-ai#1", "ws:work", "ws:dev-back"]);
+        assert_eq!(window_home(&shared.workspaces(), &after, 1, Spot::of(&shared)), Home::Desktop(3));
+        // Окно только из work уходит на special:pool.
+        let own = client("0x2", "chromium", "Новости", "1", &["app:chromium#1", "ws:work"]);
+        assert_eq!(window_home(&own.workspaces(), &after, 1, Spot::of(&own)), Home::Pool);
+        // При переходе в сам dev-back окно встаёт на месте его приложения там.
+        let cfg = shared_cfg();
+        let mut st = State::default();
+        assert_eq!(arrive_rect(&mut st, &cfg, "dev-back", &shared, (3840, 2160)), Some(PxRect { x: 1125, y: 10, w: 1920, h: 2140 }));
+        // Окно, не входящее в workspace, места там не получает и не двигается.
+        assert_eq!(arrive_rect(&mut st, &cfg, "dev-back", &own, (3840, 2160)), None);
+    }
+
+    #[test]
+    fn follow_plan_moves_shared_windows() {
+        let cfg = shared_cfg();
+        let mon = (3840, 2160);
+        let mut st = State::default();
+        st.desktops.insert(1, Desktop { workspaces: vec!["work".into()], active: Some("work".into()) });
+        st.desktops.insert(2, Desktop { workspaces: vec!["surf".into()], active: Some("surf".into()) });
+        st.extra.entry("work".into()).or_default().insert("chrome-ai".into(), ExtraApp { rect: PxRect { x: 1000, y: 500, w: 1920, h: 1080 }, ..ExtraApp::default() });
+        let (cfg, _) = merge_extra(&cfg, &st.extra);
+        let moved = PxRect { x: 1900, y: 100, w: 1920, h: 2000 };
+        let mut ai = client("0x1", "google-chrome-ai", "ИИ", "2", &["app:chrome-ai#1", "ws:surf", "ws:work"]);
+        ai.at = (moved.x, moved.y);
+        ai.size = (moved.w, moved.h);
+        let clients = vec![
+            ai.clone(),
+            client("0x2", "chromium", "Новости", "1", &["app:chromium#1", "ws:work"]),
+            client("0x3", "neovide", "[Scratch]", "special:hidden", &["app:neovide#1", "ws:work"]),
+        ];
+        // Переход на стол 1: общее окно приходит на место chrome-ai из записи
+        // work, а прямоугольник, где его оставили в surf (режим stack),
+        // запоминается. Окна, уже стоящие на столе, и скрытые не трогаются.
+        let plan = follow_plan(&mut st, &cfg, &clients, 1, mon);
+        assert_eq!(plan, vec![Follow { addr: "0x1".into(), rect: Some(PxRect { x: 1000, y: 500, w: 1920, h: 1080 }), leave: Some(("surf".into(), moved)), now: moved }]);
+        // Обратно на стол 2: окно встаёт в запомненный для surf прямоугольник.
+        st.geom.entry("surf".into()).or_default().insert("0x1".into(), moved);
+        let mut back = ai.clone();
+        back.workspace.name = "1".into();
+        let plan = follow_plan(&mut st, &cfg, std::slice::from_ref(&back), 2, mon);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].rect, Some(moved));
+        // work — режим обмена ячеек, запоминать уходящее окно там незачем.
+        assert_eq!(plan[0].leave, None);
+        // Стол без активного workspace и стол, где окна нет: ничего не переносится.
+        assert!(follow_plan(&mut st, &cfg, &clients, 5, mon).is_empty());
+        st.desktops.insert(4, Desktop { workspaces: vec!["chat".into()], active: Some("chat".into()) });
+        assert!(follow_plan(&mut st, &cfg, &clients, 4, mon).is_empty());
+    }
+
+    #[test]
+    fn app_route_cases() {
+        let cfg = shared_cfg();
+        let mut d: BTreeMap<u8, Desktop> = BTreeMap::new();
+        d.insert(1, Desktop { workspaces: vec!["chat".into(), "work".into()], active: Some("work".into()) });
+        d.insert(2, Desktop { workspaces: vec!["surf".into()], active: Some("surf".into()) });
+        let a = |v: &str| vec![v.to_string()];
+        let s = |v: &str| v.to_string();
+        // 1. Приложение описано в активном workspace: цикл, признак pull ничего не меняет.
+        assert_eq!(app_route(&cfg, &d, 1, &a("chromium"), false), AppRoute::Cycle { ws: s("work"), app: s("chromium") });
+        assert_eq!(app_route(&cfg, &d, 1, &a("chromium"), true), AppRoute::Cycle { ws: s("work"), app: s("chromium") });
+        // 2. Перетаскивание в активный workspace.
+        assert_eq!(app_route(&cfg, &d, 1, &a("chrome-ai"), true), AppRoute::Pull { ws: s("work"), app: s("chrome-ai") });
+        // 3. Приложение в запущенном workspace: в списке текущего стола, затем другого.
+        assert_eq!(app_route(&cfg, &d, 1, &a("calc"), false), AppRoute::Raise { ws: s("chat"), app: s("calc"), desktop: None });
+        assert_eq!(app_route(&cfg, &d, 1, &a("chrome-ai"), false), AppRoute::Raise { ws: s("surf"), app: s("chrome-ai"), desktop: Some(2) });
+        // 4. Workspace приложения не запущен: открыть в активном workspace стола,
+        // а не поднимать чужой workspace (прежняя ветвь «3б» снята).
+        d.remove(&2);
+        assert_eq!(app_route(&cfg, &d, 1, &a("chrome-ai"), false), AppRoute::Open { ws: s("work"), app: s("chrome-ai") });
+        // 5. На столе нет активного workspace: цикл вне workspace.
+        d.insert(4, Desktop::default());
+        assert_eq!(app_route(&cfg, &d, 4, &a("chrome-ai"), false), AppRoute::Free { app: s("chrome-ai") });
+        assert_eq!(app_route(&cfg, &d, 4, &a("chrome-ai"), true), AppRoute::Free { app: s("chrome-ai") });
+    }
+
+    #[test]
+    fn pull_record_kind() {
+        let cfg = shared_cfg();
+        let r = PxRect { x: 960, y: 540, w: 1920, h: 1080 };
+        let mut extra: BTreeMap<String, BTreeMap<String, ExtraApp>> = BTreeMap::new();
+        // Приложение файла конфига: запись только о месте.
+        assert_eq!(share_record(&cfg, &extra, "chrome-ai", r), Some(ExtraApp { rect: r, ..ExtraApp::default() }));
+        // Приложение, известное только записи сессии другого workspace: полная
+        // запись под тем же именем.
+        let full = ExtraApp { class: Some("Alacritty".into()), cmd: vec!["/usr/bin/alacritty".into()], cwd: Some("/home/mne".into()), rect: PxRect::default() };
+        extra.entry("work".into()).or_default().insert("alacritty".into(), full.clone());
+        assert_eq!(share_record(&cfg, &extra, "alacritty", r), Some(ExtraApp { rect: r, ..full }));
+        // Описать нечем.
+        assert_eq!(share_record(&cfg, &extra, "nothing", r), None);
+    }
+
+    #[test]
+    fn successor_keeps_shared_window_with_user() {
+        // В списке стола 1 surf и work, work перенесён на стол 5, композитор
+        // там же; преемник surf поднимается на столе 1 без перехода.
+        let after = desks(&[(1, "surf"), (5, "work")]);
+        let shared = client("0x1", "google-chrome-ai", "ИИ", "5", &["app:chrome-ai#1", "ws:surf", "ws:work"]);
+        // Общее окно остаётся на столе 5 с пользователем.
+        assert_eq!(window_home(&shared.workspaces(), &after, 5, Spot::of(&shared)), Home::Desktop(5));
+        // Окно только из surf возвращается на стол 1.
+        let own = client("0x2", "google-chrome", "Новости", "special:pool", &["app:chrome#1", "ws:surf"]);
+        assert_eq!(window_home(&own.workspaces(), &after, 5, Spot::of(&own)), Home::Desktop(1));
+        // Пользователь перешёл на стол 1: общее окно приходит туда.
+        assert_eq!(window_home(&shared.workspaces(), &after, 1, Spot::of(&shared)), Home::Desktop(1));
     }
 
     #[test]
@@ -2787,10 +3668,12 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
     fn variant_window_is_placed_by_its_own_entry() {
         let cfg = Config::parse(CFG).unwrap();
         let clients = vec![
-            client("0x1", "chromium", "Новости", "1", &["app:chromium#1"]),
-            client("0x2", "chromium", "Gmail — Входящие", "1", &["app:chromium-mail#1"]),
+            client("0x1", "chromium", "Новости", "1", &["app:chromium#1", "ws:work"]),
+            client("0x2", "chromium", "Gmail — Входящие", "1", &["app:chromium-mail#1", "ws:work"]),
+            // Окно семейства, не входящее в workspace, им не расставляется.
+            client("0x3", "chromium", "Документы", "1", &["app:chromium#2", "ws:dev-front"]),
         ];
-        let addrs = |apps: &[String], app: &str| placed_windows(&cfg, &clients, apps, app).iter().map(|c| c.address.clone()).collect::<Vec<_>>();
+        let addrs = |apps: &[String], app: &str| placed_windows(&cfg, &clients, "work", apps, app).iter().map(|c| c.address.clone()).collect::<Vec<_>>();
         // Workspace описывает и семейство, и вариант: окно варианта ставит
         // его собственная запись, семейство его не трогает.
         let both = ["chromium".to_string(), "chromium-mail".to_string()];
@@ -2814,17 +3697,17 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
             client("0x4", "chromium", "Скрытое", "special:hidden", &[]),
             client("0x5", "neovide", "[Scratch]", "1", &["app:neovide#1"]),
         ];
-        let plan = adopt_plan(&cfg, &clients, &apps).unwrap();
+        let plan = triples(adopt_plan(&cfg, &clients, &apps, false).unwrap());
         assert_eq!(plan, vec![(0, "chromium".to_string(), 1), (2, "chromium".to_string(), 2), (1, "chromium".to_string(), 3)]);
 
         // Захват работает и у приложения, окна которого уже есть.
         let with_window = vec![client("0x1", "chromium", "Новости", "1", &["app:chromium#1"]), client("0x2", "chromium", "Документы", "1", &[])];
-        let plan = adopt_plan(&cfg, &with_window, &apps).unwrap();
+        let plan = triples(adopt_plan(&cfg, &with_window, &apps, false).unwrap());
         assert_eq!(plan, vec![(1, "chromium".to_string(), 2)]);
 
         // Окно с тегом приложения, которого нет в конфиге, переходит к приложению.
         let stale = vec![client("0x1", "neovide", "[Scratch]", "1", &["app:editor-dots#1"])];
-        assert_eq!(adopt_plan(&cfg, &stale, &apps).unwrap(), vec![(0, "neovide".to_string(), 1)]);
+        assert_eq!(triples(adopt_plan(&cfg, &stale, &apps, false).unwrap()), vec![(0, "neovide".to_string(), 1)]);
     }
 
     #[test]
@@ -2833,16 +3716,16 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
         let clients = vec![client("0x1", "chromium", "Gmail — Входящие", "1", &[]), client("0x2", "chromium", "Новости", "1", &[])];
         // Workspace описывает и семейство, и вариант.
         let apps: Vec<String> = ["chromium".to_string(), "chromium-mail".to_string()].into();
-        let plan = adopt_plan(&cfg, &clients, &apps).unwrap();
+        let plan = triples(adopt_plan(&cfg, &clients, &apps, false).unwrap());
         assert_eq!(plan, vec![(0, "chromium-mail".to_string(), 1), (1, "chromium".to_string(), 1)]);
         // Workspace описывает только семейство: окно варианта всё равно достаётся
         // варианту и попадает в ячейку семейства как окно своего семейства.
-        let plan = adopt_plan(&cfg, &clients, &["chromium".to_string()]).unwrap();
+        let plan = triples(adopt_plan(&cfg, &clients, &["chromium".to_string()], false).unwrap());
         assert_eq!(plan, vec![(0, "chromium-mail".to_string(), 1), (1, "chromium".to_string(), 1)]);
         // Окно, подходящее двум вариантам одного семейства, достаётся первому по имени.
         let two = format!("{CFG}\n[apps.chromium-docs]\nfamily = \"chromium\"\ncmd = \"chromium\"\nclass = \"(?i)^chromium(-browser)?$\"\ntitle = \"Gmail\"\n");
         let cfg = Config::parse(&two).unwrap();
-        let plan = adopt_plan(&cfg, &clients[..1], &["chromium".to_string()]).unwrap();
+        let plan = triples(adopt_plan(&cfg, &clients[..1], &["chromium".to_string()], false).unwrap());
         assert_eq!(plan, vec![(0, "chromium-docs".to_string(), 1)]);
     }
 
@@ -3049,9 +3932,9 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
     /// Окна `work`: herdr, chromium, neovide и одно свободное.
     fn work_clients() -> Vec<Client> {
         vec![
-            client("0x1", "wezterm-herdr", "herdr · dev-lab", "1", &["app:herdr#1"]),
-            client("0x2", "chromium", "Новости", "1", &["app:chromium#1"]),
-            client("0x3", "neovide", "[Scratch]", "1", &["app:neovide#1"]),
+            client("0x1", "wezterm-herdr", "herdr · dev-lab", "1", &["app:herdr#1", "ws:work"]),
+            client("0x2", "chromium", "Новости", "1", &["app:chromium#1", "ws:work"]),
+            client("0x3", "neovide", "[Scratch]", "1", &["app:neovide#1", "ws:work"]),
             client("0x9", "Galculator", "Калькулятор", "1", &[]),
         ]
     }
@@ -3089,11 +3972,10 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
     #[test]
     fn anchor_is_main_window_in_swap_and_previous_in_stack() {
         let cfg = Config::parse(CFG).unwrap();
-        let ws_apps: Vec<String> = vec!["herdr".into(), "chromium".into(), "neovide".into()];
         let clients = work_clients();
         // Цикл идёт по единственному окну chromium.
         let order = vec!["0x2".to_string()];
-        let anchor = |main: Option<&str>, active: Option<&str>, focus: Option<&str>| anchor_window(&cfg, &clients, &ws_apps, main, &order, active, focus).unwrap_or_default();
+        let anchor = |main: Option<&str>, active: Option<&str>, focus: Option<&str>| anchor_window(&cfg, &clients, "work", main, &order, active, focus).unwrap_or_default();
         // Режим обмена ячеек: возврат к окну прежнего главного приложения,
         // каким бы ни было активное окно.
         assert_eq!(anchor(Some("0x1"), Some("0x3"), None), "0x1");

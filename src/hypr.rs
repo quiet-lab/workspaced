@@ -70,7 +70,35 @@ pub fn parse_app_tag(tag: &str) -> Option<(String, Option<u32>)> {
     }
 }
 
+/// Разбор тега состава `ws:<имя>`: имя workspace, в который входит окно
+/// (изменение shared-windows, решение D1). Звёздочку в конце добавляет
+/// правило композитора, она к имени не относится.
+pub fn parse_ws_tag(tag: &str) -> Option<String> {
+    let rest = tag.strip_prefix("ws:")?.trim_end_matches('*');
+    (!rest.is_empty()).then(|| rest.to_string())
+}
+
+/// Тег состава workspace `ws`.
+pub fn ws_tag(ws: &str) -> String {
+    format!("ws:{ws}")
+}
+
 impl Client {
+    /// Workspace, в которые входит окно, по тегам состава; по имени, без повторов.
+    pub fn workspaces(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.tags.iter().filter_map(|t| parse_ws_tag(t)).collect();
+        v.sort();
+        v.dedup();
+        v
+    }
+    /// Входит ли окно в workspace `ws`.
+    pub fn in_ws(&self, ws: &str) -> bool {
+        self.tags.iter().any(|t| parse_ws_tag(t).as_deref() == Some(ws))
+    }
+    /// Входит ли окно хотя бы в один workspace.
+    pub fn has_ws(&self) -> bool {
+        self.tags.iter().any(|t| parse_ws_tag(t).is_some())
+    }
     /// Имя приложения из тега экземпляра.
     pub fn app(&self) -> Option<String> {
         self.app_instance().map(|(a, _)| a)
@@ -339,5 +367,25 @@ mod tests {
         // Тег без номера — экземпляр 1.
         let old = test_client("0x2", "neovide", "[Scratch]", "1", &["app:neovide"]);
         assert_eq!(old.app_instance(), Some(("neovide".to_string(), 1)));
+    }
+
+    #[test]
+    fn ws_tag_forms() {
+        assert_eq!(parse_ws_tag("ws:work"), Some("work".to_string()));
+        // Звёздочку добавляет правило композитора.
+        assert_eq!(parse_ws_tag("ws:surf*"), Some("surf".to_string()));
+        assert_eq!(parse_ws_tag("ws:"), None);
+        assert_eq!(parse_ws_tag("app:chromium#1"), None);
+        assert_eq!(ws_tag("work"), "ws:work");
+
+        let c = test_client("0x1", "google-chrome-ai", "ИИ", "2", &["app:chrome-ai#1", "ws:work*", "ws:surf"]);
+        // Список по имени: так его показывает `workspaced status --json`.
+        assert_eq!(c.workspaces(), vec!["surf".to_string(), "work".to_string()]);
+        assert!(c.in_ws("work") && c.in_ws("surf") && !c.in_ws("chat"));
+        assert!(c.has_ws());
+        // Тег состава не мешает разбору тега экземпляра.
+        assert_eq!(c.app_instance(), Some(("chrome-ai".to_string(), 1)));
+        let free = test_client("0x2", "chromium", "Новости", "4", &["app:chromium#2"]);
+        assert!(free.workspaces().is_empty() && !free.has_ws());
     }
 }

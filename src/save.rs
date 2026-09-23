@@ -43,6 +43,14 @@ fn app_item(place: &Place, live: Option<PxRect>, expected: Option<PxRect>) -> It
     }
 }
 
+/// Нынешнее место приложения `app` в workspace `ws` для записи в конфиг:
+/// прямоугольник первого нескрытого экземпляра, входящего в `ws` по тегу
+/// состава (изменение shared-windows, решение D12). Окно, убранное
+/// из workspace командой отделения, места не даёт.
+pub fn live_rect(cfg: &Config, clients: &[Client], ws: &str, app: &str) -> Option<PxRect> {
+    daemon::app_windows(cfg, clients, app).into_iter().find(|c| c.in_ws(ws) && !c.on_hidden()).map(|c| c.rect())
+}
+
 /// Описание приложения для раздела `[apps]`: команда, аргументы, каталог
 /// и класс окна как точное совпадение.
 fn app_table(cmd: &[String], cwd: Option<&str>, class: Option<&str>) -> Table {
@@ -133,6 +141,7 @@ fn accept_desktop(d: &mut Daemon, n: u8, ws: &str) -> Result<usize> {
     for a in &plan {
         let num = next_instance(&mut used, &a.app);
         ex.push(hypr::d_tag(&a.addr, &format!("app:{}#{num}", a.app)));
+        ex.push(hypr::d_tag(&a.addr, &hypr::ws_tag(ws)));
         log::info!("сохранение сессии: окно {} → приложение {} (экземпляр {num}) workspace {ws}", a.addr, a.app);
     }
     d.hypr().dispatch_all(&ex)?;
@@ -147,16 +156,35 @@ fn accept_desktop(d: &mut Daemon, n: u8, ws: &str) -> Result<usize> {
     Ok(plan.len())
 }
 
+/// Место записи дополнительного приложения `name` workspace `ws` по его
+/// окнам (спецификация ws-sessions, «Дополнительные приложения сессии»;
+/// изменение shared-windows, решение D12). Берётся первый экземпляр,
+/// входящий в `ws`. Окно на столе своего workspace (`desk` — стол, где `ws`
+/// активен) даёт нынешний прямоугольник; общее окно, ушедшее за
+/// пользователем на другой стол, — прямоугольник, запомненный для `ws`
+/// в режиме `stack` (`kept`), а без него `None`: нынешнее положение окна
+/// описывает место в другом workspace, и запись не меняется.
+pub fn extra_rect(cfg: &Config, clients: &[Client], ws: &str, desk: Option<u8>, kept: &dyn Fn(&str) -> Option<PxRect>, name: &str) -> Option<PxRect> {
+    let c = daemon::app_windows(cfg, clients, name).into_iter().find(|c| c.in_ws(ws) && !c.on_hidden())?;
+    if desk.is_some() && c.desktop() == desk {
+        return Some(c.rect());
+    }
+    kept(&c.address)
+}
+
 /// Обновить места дополнительных приложений сессии по нынешнему положению
-/// их окон: команда сохраняет то, что на экране. Место берётся у первого
-/// экземпляра, как и при записи workspace в конфиг. Возвращает число
-/// изменённых записей.
+/// их окон: команда сохраняет то, что на экране (`extra_rect`). Возвращает
+/// число изменённых записей.
 fn update_extra_rects(d: &mut Daemon, ws: &str, clients: &[Client]) -> usize {
     let cfg = d.cfg().clone();
     let names: Vec<String> = d.state().extra.get(ws).map(|m| m.keys().cloned().collect()).unwrap_or_default();
+    let desk = d.state().desktops.iter().find(|(_, x)| x.active.as_deref() == Some(ws)).map(|(n, _)| *n);
+    let stack = cfg.workspaces.get(ws).map(|w| w.mode()) == Some(Mode::Stack);
+    let geom = d.state().geom.get(ws).cloned().unwrap_or_default();
+    let kept = |a: &str| if stack { geom.get(a).copied() } else { None };
     let mut changed = 0;
     for name in names {
-        let Some(rect) = daemon::app_windows(&cfg, clients, &name).iter().find(|c| c.desktop().is_some()).map(|c| c.rect()) else { continue };
+        let Some(rect) = extra_rect(&cfg, clients, ws, desk, &kept, &name) else { continue };
         let st = d.state_mut();
         let Some(e) = st.extra.get_mut(ws).and_then(|m| m.get_mut(&name)) else { continue };
         if e.rect == rect {
@@ -190,14 +218,7 @@ pub fn save_session(d: &mut Daemon) -> Result<(usize, usize, usize)> {
     for (_, ws) in &desks {
         update_extra_rects(d, ws, &clients);
     }
-    let cfg = d.cfg().clone();
-    let windows: usize = desks
-        .iter()
-        .map(|(_, ws)| {
-            let apps: Vec<String> = cfg.workspaces.get(ws).map(|w| w.apps.keys().cloned().collect()).unwrap_or_default();
-            clients.iter().filter(|c| c.app().is_some_and(|a| apps.iter().any(|x| cfg.app_is(&a, x)))).count()
-        })
-        .sum();
+    let windows: usize = desks.iter().map(|(_, ws)| daemon::ws_windows(&clients, ws).len()).sum();
     d.save_session_file();
     d.broadcast();
     log::info!("снимок сессии записан: workspace — {}, окон в них — {windows}, принято окон — {adopted}", desks.len());
@@ -250,9 +271,11 @@ pub fn save_workspace(d: &mut Daemon) -> Result<String> {
     for (app, place) in &cells {
         let expected = d.state_mut().rect_for(&cfg, &ws, app, mon);
         // У приложения с несколькими окнами записывается место первого
-        // экземпляра: стопка стоит в одном месте, и отдельных записей
-        // для остальных окон в файле не появляется.
-        let live = daemon::app_windows(&cfg, &clients, app).first().map(|c| c.rect());
+        // экземпляра, входящего в workspace: стопка стоит в одном месте,
+        // и отдельных записей для остальных окон в файле не появляется.
+        // Окно, убранное из workspace командой отделения, места не даёт,
+        // а общее окно даёт место, которое занимает здесь (решение D12).
+        let live = live_rect(&cfg, &clients, &ws, app);
         apps_tab.insert(app, app_item(place, live, expected));
     }
     // Посторонние окна на столе workspace становятся его приложениями: окно,
@@ -266,9 +289,10 @@ pub fn save_workspace(d: &mut Daemon) -> Result<String> {
     let mut ex = Vec::new();
     let mut adopted = Vec::new();
     for c in clients.iter().filter(|c| c.desktop() == Some(n)) {
-        // Окно варианта считается окном своего семейства: если workspace
-        // описывает семейство, второй записи о варианте не появляется.
-        if c.app().is_some_and(|a| cells.keys().any(|x| cfg.app_is(&a, x))) {
+        // Окна workspace определяются по тегам состава; окно варианта
+        // считается окном своего семейства, и если workspace описывает
+        // семейство, второй записи о варианте не появляется.
+        if c.in_ws(&ws) {
             continue;
         }
         let Some(f) = d.state().foreign.get(&c.address).cloned() else {
@@ -297,6 +321,7 @@ pub fn save_workspace(d: &mut Daemon) -> Result<String> {
         if tagged.is_none() {
             ex.push(hypr::d_tag(&c.address, &format!("app:{name}#{}", next_instance(&mut used, &name))));
         }
+        ex.push(hypr::d_tag(&c.address, &hypr::ws_tag(&ws)));
         apps_tab.insert(&name, Item::Value(rect_item(c.rect())));
         adopted.push(c.address.clone());
         log::info!("сохранение: окно {} ({}) → приложение {name} workspace {ws}", c.address, c.class);
@@ -335,6 +360,57 @@ mod tests {
     use crate::config::Config;
     use crate::daemon;
     use crate::hypr::test_client;
+
+    fn placed(mut c: Client, r: PxRect) -> Client {
+        c.at = (r.x, r.y);
+        c.size = (r.w, r.h);
+        c
+    }
+
+    #[test]
+    fn save_workspace_writes_shared_window() {
+        let cfg = Config::parse(&format!("{CFG}\n[apps.chrome-ai]\ncmd = \"google-chrome\"\nclass = \"^google-chrome-ai$\"\n")).unwrap();
+        let moved = PxRect { x: 800, y: 300, w: 1920, h: 1080 };
+        let left = PxRect { x: -805, y: 10, w: 1920, h: 2140 };
+        let clients = vec![
+            // Общее окно, перетащенное в work и сдвинутое там.
+            placed(test_client("0x1", "google-chrome-ai", "ИИ", "1", &["app:chrome-ai#1", "ws:surf", "ws:work"]), moved),
+            // Первый экземпляр chromium убран из work и остался в dev-front.
+            placed(test_client("0x2", "chromium", "Новости", "3", &["app:chromium#1", "ws:dev-front"]), PxRect { x: 5, y: 5, w: 100, h: 100 }),
+            placed(test_client("0x3", "chromium", "Почта", "1", &["app:chromium#2", "ws:work"]), left),
+        ];
+        // Приложение общего окна записывается под своим именем с местом окна
+        // в этом workspace.
+        let r = live_rect(&cfg, &clients, "work", "chrome-ai");
+        assert_eq!(r, Some(moved));
+        let item = app_item(&Place::Rect { rect: PxRect::default() }, r, None);
+        assert_eq!(item.to_string(), rect_item(moved).to_string());
+        // Отделённое окно места не даёт: считается второй экземпляр, и ячейка
+        // chromium остаётся left.
+        let r = live_rect(&cfg, &clients, "work", "chromium");
+        assert_eq!(r, Some(left));
+        assert_eq!(app_item(&Place::Cell("left".into()), r, Some(left)).as_str(), Some("left"));
+    }
+
+    #[test]
+    fn extra_rect_of_shared_window_elsewhere() {
+        let cfg = Config::parse(&format!("{CFG}\n[apps.chrome-ai]\ncmd = \"google-chrome\"\nclass = \"^google-chrome-ai$\"\n")).unwrap();
+        let on_two = PxRect { x: 1910, y: 10, w: 1920, h: 2140 };
+        let kept = PxRect { x: 700, y: 200, w: 1920, h: 1080 };
+        // Окно chrome-ai входит в work (стол 1) и surf, пользователь на столе 2,
+        // окно стоит там.
+        let clients = vec![placed(test_client("0x1", "google-chrome-ai", "ИИ", "2", &["app:chrome-ai#1", "ws:surf", "ws:work"]), on_two)];
+        let none = |_: &str| None;
+        // work в режиме обмена ячеек: запись не меняется.
+        assert_eq!(extra_rect(&cfg, &clients, "work", Some(1), &none, "chrome-ai"), None);
+        // Режим stack с запомненным прямоугольником: берётся он.
+        let remembered = |a: &str| (a == "0x1").then_some(kept);
+        assert_eq!(extra_rect(&cfg, &clients, "work", Some(1), &remembered, "chrome-ai"), Some(kept));
+        // Окно на столе своего workspace даёт нынешний прямоугольник.
+        assert_eq!(extra_rect(&cfg, &clients, "surf", Some(2), &remembered, "chrome-ai"), Some(on_two));
+        // Приложение без окон в workspace записи не меняет.
+        assert_eq!(extra_rect(&cfg, &clients, "dev-front", Some(3), &none, "chrome-ai"), None);
+    }
 
     const CFG: &str = r#"
 [templates.thirds]

@@ -318,6 +318,9 @@ pub struct MoveAction {
 }
 
 /// Стол, workspace и приложение: `{ desktop = 3, workspace = "dots" }`.
+/// Ключ `pull` у действия приложения перетаскивает окна приложения
+/// в активный workspace текущего стола (изменение shared-windows, решение D8):
+/// `{ app = "chrome-ai", pull = true }`.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct TargetAction {
@@ -327,6 +330,8 @@ pub struct TargetAction {
     pub workspace: Option<String>,
     #[serde(default)]
     pub app: Option<String>,
+    #[serde(default)]
+    pub pull: Option<bool>,
 }
 
 /// Действие демона в записи `[[binds]]` (поле `action`).
@@ -553,7 +558,13 @@ impl Config {
                 Some(Action::Place(PlaceAction { place })) if !PLACES.contains(&place.as_str()) => {
                     bail!("привязка {:?}: place должен быть одним из {}, получено {place:?}", b.chain, PLACES.join(", "))
                 }
-                Some(Action::Target(TargetAction { desktop, workspace, app })) => {
+                Some(Action::Target(TargetAction { desktop, workspace, app, pull })) => {
+                    // Перетаскивание идёт в активный workspace текущего стола,
+                    // поэтому ключ pull имеет смысл только у действия приложения
+                    // без workspace.
+                    if pull.is_some() && (app.is_none() || workspace.is_some()) {
+                        bail!("привязка {:?}: ключ pull допустим только вместе с app и без workspace", b.chain);
+                    }
                     if workspace.is_none() && app.is_none() {
                         bail!("привязка {:?}: в action нужен workspace или app", b.chain);
                     }
@@ -855,6 +866,28 @@ apps = { terminal = "right" }
         let bad = ok.replace("\"detach\"", "\"detahc\"");
         let err = Config::parse(&bad).unwrap_err().to_string();
         assert!(err.contains("BackSpace") && err.contains("detahc"), "{err}");
+    }
+
+    #[test]
+    fn pull_action_in_binds() {
+        let ok = format!("{MINIMAL}\n[[binds]]\nchain = \"SUPER+TAB v\"\naction = {{ app = \"terminal\", pull = true }}\n");
+        let cfg = Config::parse(&ok).unwrap();
+        assert_eq!(cfg.binds[0].action, Some(Action::Target(TargetAction { desktop: None, workspace: None, app: Some("terminal".into()), pull: Some(true) })));
+        let binds = crate::keys::collect(&cfg).unwrap();
+        let b = binds.iter().find(|b| b.source.contains("SUPER+TAB v")).unwrap();
+        assert!(matches!(&b.act, crate::keys::Act::Daemon(c) if c == "workspaced app terminal --pull"), "{:?}", b.act);
+        // С workspace и без app ключ отклоняется с указанием цепочки.
+        for bad in ["{ workspace = \"work\", pull = true }", "{ app = \"terminal\", workspace = \"work\", pull = true }", "{ desktop = 2, pull = true }"] {
+            let text = ok.replace("{ app = \"terminal\", pull = true }", bad);
+            let err = Config::parse(&text).unwrap_err().to_string();
+            assert!(err.contains("SUPER+TAB v") && err.contains("pull"), "{bad}: {err}");
+        }
+        // pull = false у действия приложения допустим и ничего не добавляет.
+        let off = ok.replace("pull = true", "pull = false");
+        let cfg = Config::parse(&off).unwrap();
+        let binds = crate::keys::collect(&cfg).unwrap();
+        let b = binds.iter().find(|b| b.source.contains("SUPER+TAB v")).unwrap();
+        assert!(matches!(&b.act, crate::keys::Act::Daemon(c) if c == "workspaced app terminal"), "{:?}", b.act);
     }
 
     #[test]

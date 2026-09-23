@@ -61,7 +61,7 @@ enum Command {
         #[arg(long)]
         desktop: Option<u8>,
     },
-    /// Сделать приложение главным (несколько имён — кандидаты с одной цепочкой)
+    /// Цикл по окнам приложения (несколько имён — кандидаты с одной цепочкой; --pull перетаскивает окна в активный workspace стола)
     App {
         #[arg(required = true)]
         app: Vec<String>,
@@ -69,6 +69,9 @@ enum Command {
         desktop: Option<u8>,
         #[arg(long)]
         workspace: Option<String>,
+        /// Перетащить окна приложения в активный workspace текущего стола
+        #[arg(long)]
+        pull: bool,
     },
     /// Поднять следующий workspace из списка текущего стола
     Next,
@@ -81,11 +84,11 @@ enum Command {
     Arrange,
     /// Записать снимок сессии: принять неучтённые окна столов с активным workspace и сохранить состояние
     SaveSession,
-    /// Убрать активное окно из активного workspace текущего стола и закрыть его
+    /// Убрать активное окно из активного workspace текущего стола; окно, не входящее в другие workspace, закрыть
     Detach,
     /// Записать текущее состояние активного workspace в конфиг
     SaveWorkspace,
-    /// Убрать workspace из списка стола (окна паркуются)
+    /// Убрать workspace из списка стола (окна уходят по правилу размещения: к другому своему workspace или на special:pool)
     Remove {
         workspace: String,
         #[arg(long)]
@@ -149,7 +152,7 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::Raise { workspace, desktop } => client::call(json!({ "cmd": "raise", "workspace": workspace, "desktop": desktop })).map(|_| ()),
-        Command::App { app, desktop, workspace } => client::call(json!({ "cmd": "app", "apps": app, "desktop": desktop, "workspace": workspace })).map(|_| ()),
+        Command::App { app, desktop, workspace, pull } => client::call(json!({ "cmd": "app", "apps": app, "desktop": desktop, "workspace": workspace, "pull": pull })).map(|_| ()),
         Command::Next => client::call(json!({ "cmd": "next" })).map(|_| ()),
         Command::MoveDesktop { desktop } => client::call(json!({ "cmd": "move-desktop", "desktop": desktop })).map(|_| ()),
         Command::Arrange => client::call(json!({ "cmd": "arrange" })).map(|_| ()),

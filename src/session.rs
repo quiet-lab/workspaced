@@ -224,6 +224,8 @@ fn same_window(w: &SessionWindow, cmd: &[String], cwd: Option<&str>) -> bool {
 }
 
 /// Живые окна без тега сопоставляются с посторонними окнами снимка по команде и каталогу.
+/// Перед этим теги состава сверяются с эффективным конфигом, собранным
+/// из снимка (`Daemon::sync_membership`).
 /// Сверка начинается с приложений, которых в эффективном конфиге уже нет:
 /// ожидания их окон снимаются, а с их окон снимается тег, и такое окно попадает
 /// в сопоставление наравне с прочими посторонними. Список клиентов читается
@@ -231,6 +233,10 @@ fn same_window(w: &SessionWindow, cmd: &[String], cwd: Option<&str>) -> bool {
 fn adopt_live_foreign(d: &mut Daemon, snapshot: &[SessionWindow]) {
     d.drop_stale_pending();
     d.free_stale_tagged();
+    // Состав workspace сверяется с записями сессии, а окна прежней версии
+    // демона получают его по спискам столов (изменение shared-windows,
+    // решение D2).
+    d.sync_membership(true);
     let Ok(clients) = d.clients() else { return };
     let mut used = vec![false; snapshot.len()];
     let st = d.state_mut();

@@ -260,7 +260,7 @@ pub fn collect(cfg: &Config) -> Result<Vec<Binding>> {
                         };
                         format!("workspaced move-desktop {n}")
                     }
-                    Action::Target(TargetAction { desktop, workspace, app }) => {
+                    Action::Target(TargetAction { desktop, workspace, app, pull }) => {
                         let mut cmd = match (workspace, app) {
                             (_, Some(a)) => format!("workspaced app {a}"),
                             (Some(w), None) => format!("workspaced raise {w}"),
@@ -271,6 +271,9 @@ pub fn collect(cfg: &Config) -> Result<Vec<Binding>> {
                         }
                         if let Some(d) = desktop {
                             write!(cmd, " --desktop {d}").unwrap();
+                        }
+                        if *pull == Some(true) {
+                            cmd.push_str(" --pull");
                         }
                         cmd
                     }
