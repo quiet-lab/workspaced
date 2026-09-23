@@ -56,6 +56,12 @@ struct Pending {
 impl Pending {
     /// Похоже ли окно на результат этого запуска.
     fn matches(&self, c: &Client, ancestors: &[i32]) -> bool {
+        // Окно без класса остаётся свободным всегда (изменение
+        // classless-windows-stay-free, решение D1): его не отличить
+        // от служебного окна приложения вроде диспетчера задач.
+        if classless(c) {
+            return false;
+        }
         if ancestors.contains(&(self.pid as i32)) {
             return true;
         }
@@ -74,7 +80,16 @@ impl Pending {
 /// Окно целиком подходит под `class` и, если задано, `title` приложения;
 /// без `class` сопоставления нет.
 fn matcher_fits(class_re: Option<&regex::Regex>, title_re: Option<&regex::Regex>, c: &Client) -> bool {
-    class_re.is_some_and(|cr| cr.is_match(&c.class)) && title_re.is_none_or(|t| t.is_match(&c.title))
+    !classless(c)
+        && class_re.is_some_and(|cr| cr.is_match(&c.class)) && title_re.is_none_or(|t| t.is_match(&c.title))
+}
+
+/// У окна нет класса (`class` пуст): так композитор показывает, например,
+/// диспетчер задач Chromium и Яндекс.Браузера. Такое окно не принадлежит
+/// ни одному приложению и остаётся свободным всегда (изменение
+/// classless-windows-stay-free, решение D1).
+pub fn classless(c: &Client) -> bool {
+    c.class.trim().is_empty()
 }
 
 /// Класс окна содержит имя команды или наоборот (без учёта регистра).
@@ -532,11 +547,11 @@ impl Daemon {
                 p.exe = Some(e);
             }
         }
-        let hit = self
-            .pending
-            .iter()
-            .position(|p| ancestors.contains(&(p.pid as i32)))
-            .or_else(|| self.pending.iter().position(|p| p.matches(&c, &ancestors)));
+        let hit = if classless(&c) {
+            None
+        } else {
+            self.pending.iter().position(|p| ancestors.contains(&(p.pid as i32))).or_else(|| self.pending.iter().position(|p| p.matches(&c, &ancestors)))
+        };
         if let Some(i) = hit {
             let p = self.pending.remove(i);
             self.adopt(&c, p)?;
@@ -565,7 +580,7 @@ impl Daemon {
                 // остаётся свободным.
                 let ws = c.desktop().and_then(|n| self.st.desktops.get(&n).and_then(|d| d.active.clone()));
                 let taken = taken_names(&self.cfg, &self.st.extra);
-                let join = join_window(&self.cfg, &self.cfg_file, ws.as_deref(), &c, !cmd.is_empty(), &taken);
+                let join = join_window(&self.cfg, &self.cfg_file, ws.as_deref(), &c, &cmd, &taken);
                 self.join(&c, &clients, ws.as_deref(), join, cmd, cwd)?;
             }
         }
@@ -703,15 +718,9 @@ impl Daemon {
                 let addr = active.map(|c| c.address).unwrap_or_default();
                 let w = ws.unwrap_or_default();
                 if drop_extra {
-                    if let Some(apps) = self.st.extra.get_mut(&w) {
-                        apps.remove(&app);
-                    }
-                    self.st.extra.retain(|_, apps| !apps.is_empty());
-                    if let Some(cells) = self.st.cells.get_mut(&w) {
-                        cells.remove(&app);
-                    }
+                    let from = drop_extra_app(&mut self.st, &w, &app);
                     self.rebuild_cfg();
-                    log::info!("workspace {w}: дополнительное приложение сессии {app} снято вместе с последним его окном");
+                    log::info!("дополнительное приложение сессии {app} снято вместе с последним его окном в workspace: {}", from.join(", "));
                 }
                 log::info!("workspace {w}: окно {addr} приложения {app} отделено и закрыто");
                 self.hypr.dispatch(&hypr::d_close(&addr))?;
@@ -790,22 +799,7 @@ impl Daemon {
             log::info!("{app}: поля cmd нет, окно не открывается");
             return Ok(());
         };
-        let mut command = Command::new(&cmd);
-        command.args(&args).envs(&env).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-        if let Some(dir) = &cwd {
-            if Path::new(dir).is_dir() {
-                command.current_dir(dir);
-            } else {
-                log::warn!("{app}: каталога {dir} нет, запуск без cwd");
-            }
-        }
-        // Своя сессия процессов: приложение переживает остановку демона.
-        unsafe {
-            command.pre_exec(|| {
-                nix::unistd::setsid().map(|_| ()).map_err(std::io::Error::other)
-            });
-        }
-        let child = command.spawn().with_context(|| format!("{app}: не удалось запустить {cmd}"))?;
+        let child = start(&cmd, &args, cwd.as_deref(), &env).with_context(|| format!("приложение {app}"))?;
         let pid = child.id();
         watch_child(child, self.tx.clone());
         let exe = which(&cmd).and_then(|p| p.canonicalize().ok());
@@ -894,7 +888,13 @@ impl Daemon {
             let wins = placed_windows(&self.cfg, &clients, &apps, app);
             if wins.is_empty() {
                 let target = rect.map(Target::Place).unwrap_or(Target::Free(None));
-                self.spawn(app, Some(ws), n, target, focus && main_app.as_deref() == Some(app))?;
+                // Сбой запуска одного приложения поднятие не обрывает: его место
+                // остаётся пустым, остальные приложения встают, workspace
+                // становится активным (изменение classless-windows-stay-free,
+                // решение D2).
+                if let Err(e) = self.spawn(app, Some(ws), n, target, focus && main_app.as_deref() == Some(app)) {
+                    log::warn!("workspace {ws}: {e:#}; поднятие продолжается без этого приложения");
+                }
                 continue;
             }
             for c in wins.iter().filter(|c| !c.on_hidden()) {
@@ -1355,17 +1355,7 @@ impl Daemon {
     /// Запуск постороннего окна из снимка сессии по команде и каталогу.
     pub fn spawn_foreign(&mut self, cmd: &[String], cwd: Option<&str>) -> Result<u32> {
         let Some((prog, args)) = cmd.split_first() else { bail!("пустая команда") };
-        let mut command = Command::new(prog);
-        command.args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-        if let Some(dir) = cwd
-            && Path::new(dir).is_dir()
-        {
-            command.current_dir(dir);
-        }
-        unsafe {
-            command.pre_exec(|| nix::unistd::setsid().map(|_| ()).map_err(std::io::Error::other));
-        }
-        let child = command.spawn().with_context(|| format!("не удалось запустить {prog}"))?;
+        let child = start(prog, args, cwd, &BTreeMap::new())?;
         let pid = child.id();
         watch_child(child, self.tx.clone());
         Ok(pid)
@@ -1658,6 +1648,12 @@ pub fn flatpak_app_id(cgroup: &str) -> Option<String> {
 /// сессии не восстановилось бы. Поэтому командной строкой такого окна
 /// считается `flatpak run <идентификатор>` с исходными аргументами процесса,
 /// а каталог не записывается.
+///
+/// Командная строка приводится к виду, по которому процесс можно запустить
+/// снова (`launchable`; изменение classless-windows-stay-free, решение D4);
+/// если исполняемый файл найти не удалось, команда возвращается пустой,
+/// а в журнал идёт предупреждение: такое окно не становится дополнительным
+/// приложением и в снимок сессии не попадает.
 pub fn proc_info(pid: i32) -> (Vec<String>, Option<String>) {
     let cmd: Vec<String> = std::fs::read(format!("/proc/{pid}/cmdline")).map(|b| b.split(|&x| x == 0).filter(|s| !s.is_empty()).map(|s| String::from_utf8_lossy(s).into_owned()).collect()).unwrap_or_default();
     let cwd = std::fs::read_link(format!("/proc/{pid}/cwd")).ok().map(|p| p.to_string_lossy().into_owned());
@@ -1666,7 +1662,73 @@ pub fn proc_info(pid: i32) -> (Vec<String>, Option<String>) {
         out.extend(cmd.into_iter().skip(1));
         return (out, None);
     }
-    (cmd, cwd)
+    if cmd.is_empty() {
+        return (cmd, cwd);
+    }
+    match launchable(&cmd, cwd.as_deref(), proc_exe(pid).as_deref()) {
+        Some(c) => (c, cwd),
+        None => {
+            log::warn!("процесс {pid}: исполняемый файл команды {:?} не найден ни по пути, ни в PATH, ни по /proc/{pid}/exe; запустить окно заново нечем", cmd);
+            (Vec::new(), cwd)
+        }
+    }
+}
+
+/// Командная строка процесса в виде, пригодном для повторного запуска
+/// (изменение classless-windows-stay-free, решение D4) или `None`, если
+/// исполняемый файл не найден.
+///
+/// Chromium и основанные на нём браузеры переписывают свою командную строку
+/// (setproctitle): в `/proc/<pid>/cmdline` лежит одна строка с пробелами
+/// вместо аргументов, разделённых нулевыми байтами. Такая строка, если файла
+/// с таким именем нет, делится по пробелам. Затем исполняемый файл
+/// проверяется: абсолютный путь — как есть, относительный (`./steamwebhelper`)
+/// — от рабочего каталога процесса, имя без каталога — по `PATH`. Не нашёлся
+/// файл — вместо него берётся `exe`, путь из `/proc/<pid>/exe`.
+pub fn launchable(cmd: &[String], cwd: Option<&str>, exe: Option<&Path>) -> Option<Vec<String>> {
+    let mut cmd: Vec<String> = cmd.to_vec();
+    if cmd.len() == 1 && cmd[0].contains(char::is_whitespace) && !Path::new(&cmd[0]).exists() {
+        cmd = cmd[0].split_whitespace().map(String::from).collect();
+    }
+    let prog = cmd.first()?.clone();
+    let path = Path::new(&prog);
+    let found: Option<String> = if path.is_absolute() {
+        path.is_file().then(|| prog.clone())
+    } else if prog.contains('/') {
+        cwd.map(|d| Path::new(d).join(path)).filter(|p| p.is_file()).map(|p| p.components().collect::<PathBuf>().to_string_lossy().into_owned())
+    } else {
+        which(&prog).map(|_| prog.clone())
+    };
+    let found = found.or_else(|| exe.filter(|e| e.is_file()).map(|e| e.to_string_lossy().into_owned()))?;
+    cmd[0] = found;
+    Some(cmd)
+}
+
+/// Рабочий каталог для запуска: заданный, если он существует, иначе
+/// домашний каталог (изменение classless-windows-stay-free, решение D2).
+/// Вторым значением — предупреждение для журнала, когда заданного каталога нет.
+pub fn launch_dir(cwd: Option<&str>, home: &Path) -> (PathBuf, Option<String>) {
+    match cwd {
+        Some(d) if Path::new(d).is_dir() => (PathBuf::from(d), None),
+        Some(d) => (home.to_path_buf(), Some(format!("каталога {d} нет, запуск в {}", home.display()))),
+        None => (home.to_path_buf(), None),
+    }
+}
+
+/// Запустить процесс в собственной сессии (он переживает остановку демона).
+/// Ошибка называет команду, аргументы, каталог и текст ошибки ОС.
+pub fn start(cmd: &str, args: &[String], cwd: Option<&str>, env: &BTreeMap<String, String>) -> Result<Child> {
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+    let (dir, warn) = launch_dir(cwd, &home);
+    if let Some(w) = warn {
+        log::warn!("{cmd}: {w}");
+    }
+    let mut command = Command::new(cmd);
+    command.args(args).envs(env).current_dir(&dir).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    unsafe {
+        command.pre_exec(|| nix::unistd::setsid().map(|_| ()).map_err(std::io::Error::other));
+    }
+    command.spawn().with_context(|| format!("не удалось запустить {cmd:?} с аргументами {args:?} в каталоге {}", dir.display()))
 }
 
 fn proc_exe(pid: i32) -> Option<PathBuf> {
@@ -1830,6 +1892,9 @@ pub enum Free {
     /// Командной строки процесса получить не удалось: запускать окно заново
     /// было бы нечем, и записывать его в состав workspace незачем.
     NoCommand,
+    /// У окна нет класса: чьё оно, не определить (изменение
+    /// classless-windows-stay-free, решение D1).
+    NoClass,
 }
 
 impl Free {
@@ -1840,6 +1905,7 @@ impl Free {
             Free::Dialog(app) => format!("заголовок подходит dialog_title приложения {app}"),
             Free::NoWorkspace => "на столе нет активного workspace".to_string(),
             Free::NoCommand => "у окна нет командной строки".to_string(),
+            Free::NoClass => "у окна нет класса".to_string(),
         }
     }
 }
@@ -1888,14 +1954,19 @@ fn ws_has_app(cfg: &Config, ws: &str, app: &str) -> bool {
 /// Решение о принятии окна без тега (спецификация ws-daemon, «Принятие окон
 /// в workspace»). `cfg` — эффективный конфиг, `file` — конфиг файла (по нему
 /// видно, известно ли приложение помимо записей сессии), `ws` — workspace,
-/// активный на столе окна, `has_cmd` — есть ли у процесса окна командная
-/// строка, `taken` — занятые имена приложений.
+/// активный на столе окна, `cmd` — командная строка процесса окна (пустая,
+/// если её получить не удалось), `taken` — занятые имена приложений.
 ///
-/// Порядок правил: класс из `ignore_classes` не принимается никогда; окно,
+/// Порядок правил: окно без класса и класс из `ignore_classes` не
+/// принимаются никогда; окно,
 /// подходящее приложению конфига, — окно этого приложения, а его диалог
 /// (`dialog_title`) остаётся свободным; на столе без активного workspace
 /// принимать некуда.
-pub fn join_window(cfg: &Config, file: &Config, ws: Option<&str>, c: &Client, has_cmd: bool, taken: &[String]) -> Join {
+pub fn join_window(cfg: &Config, file: &Config, ws: Option<&str>, c: &Client, cmd: &[String], taken: &[String]) -> Join {
+    if classless(c) {
+        return Join::Free(Free::NoClass);
+    }
+    let has_cmd = !cmd.is_empty();
     if cfg.ignored_class(&c.class) {
         return Join::Free(Free::Ignored);
     }
@@ -1912,7 +1983,14 @@ pub fn join_window(cfg: &Config, file: &Config, ws: Option<&str>, c: &Client, ha
         }
         // Приложение известно только сессии другого workspace: запись о месте
         // без команды запуска там не выживет, поэтому заводится полная запись.
-        return if has_cmd { Join::Extra(app) } else { Join::Free(Free::NoCommand) };
+        // Имя прежней записи окно получает, только если это то же приложение —
+        // тот же исполняемый файл; окно другой программы с тем же классом
+        // заводит новое приложение со своим именем (изменение
+        // classless-windows-stay-free, решение D3).
+        if !has_cmd {
+            return Join::Free(Free::NoCommand);
+        }
+        return if same_program(cfg, &app, cmd) { Join::Extra(app) } else { Join::Extra(app_name(&c.class, taken)) };
     }
     if ws.is_none() {
         return Join::Free(Free::NoWorkspace);
@@ -1921,6 +1999,12 @@ pub fn join_window(cfg: &Config, file: &Config, ws: Option<&str>, c: &Client, ha
         return Join::Free(Free::NoCommand);
     }
     Join::Extra(app_name(&c.class, taken))
+}
+
+/// Окно с командной строкой `cmd` принадлежит той же программе, что
+/// приложение `app` эффективного конфига: совпадает исполняемый файл.
+fn same_program(cfg: &Config, app: &str, cmd: &[String]) -> bool {
+    cfg.apps.get(app).and_then(|a| a.cmd.as_deref()).is_some_and(|x| cmd.first().map(String::as_str) == Some(x))
 }
 
 /// Что делает команда отделения окна.
@@ -1947,6 +2031,30 @@ pub fn detach_step(cfg: &Config, clients: &[Client], ws: Option<&str>, extra: &B
     let Some(app) = c.app() else { return DetachStep::Skip("у активного окна нет приложения") };
     let others = app_windows(cfg, clients, &app).iter().filter(|x| x.address != c.address && x.app().as_deref() == Some(app.as_str())).count();
     DetachStep::Close { drop_extra: extra.contains_key(&app) && others == 0, app }
+}
+
+/// Снять запись дополнительного приложения сессии `app` после отделения
+/// последнего его окна в workspace `ws` (спецификация ws-daemon, «Отделение
+/// окна»). Запись с командой запуска описывает само приложение, и после
+/// последнего окна приложения в сессии не остаётся: она снимается во всех
+/// workspace, где есть. Запись без команды задаёт лишь место приложения
+/// конфига в одном workspace и снимается только в `ws` (изменение
+/// classless-windows-stay-free, решение D3).
+/// Вместе с записью снимается назначение места. Возвращает workspace,
+/// где запись снята.
+pub fn drop_extra_app(st: &mut State, ws: &str, app: &str) -> Vec<String> {
+    let everywhere = st.extra.get(ws).and_then(|m| m.get(app)).is_some_and(|e| !e.cmd.is_empty());
+    let from: Vec<String> = st.extra.iter().filter(|(w, m)| m.contains_key(app) && (everywhere || w.as_str() == ws)).map(|(w, _)| w.clone()).collect();
+    for w in &from {
+        if let Some(m) = st.extra.get_mut(w) {
+            m.remove(app);
+        }
+        if let Some(cells) = st.cells.get_mut(w) {
+            cells.remove(app);
+        }
+    }
+    st.extra.retain(|_, m| !m.is_empty());
+    from
 }
 
 /// Стол `n` принимает workspace (спецификация ws-daemon, «Поднятие workspace
@@ -2421,7 +2529,10 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
     fn join_takes_new_window_into_the_active_workspace() {
         let cfg = Config::parse(CFG).unwrap();
         let taken: Vec<String> = cfg.apps.keys().cloned().collect();
-        let join = |ws, c: &Client, has_cmd| join_window(&cfg, &cfg, ws, c, has_cmd, &taken);
+        let join = |ws, c: &Client, has_cmd: bool| {
+            let cmd: Vec<String> = if has_cmd { vec!["/usr/bin/prog".into()] } else { Vec::new() };
+            join_window(&cfg, &cfg, ws, c, &cmd, &taken)
+        };
 
         // Окно приложения, уже входящего в workspace: только тег и место.
         let chromium = client("0x1", "chromium", "Новости", "1", &[]);
@@ -2449,7 +2560,7 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
     fn dialogs_and_ignored_classes_stay_free() {
         let cfg = cfg_with_dialogs();
         let taken: Vec<String> = cfg.apps.keys().cloned().collect();
-        let join = |c: &Client| join_window(&cfg, &cfg, Some("work"), c, true, &taken);
+        let join = |c: &Client| join_window(&cfg, &cfg, Some("work"), c, &["/usr/bin/prog".to_string()], &taken);
 
         // Диалог приложения приходит с классом самого приложения и отличается
         // только заголовком.
@@ -2463,6 +2574,103 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
         assert_eq!(join(&ask), Join::Free(Free::Ignored));
         let pin = client("0x4", "pinentry-gtk", "Пароль", "1", &[]);
         assert_eq!(join(&pin), Join::Free(Free::Ignored));
+    }
+
+    #[test]
+    fn classless_windows_stay_free() {
+        // Диспетчер задач Chromium и Яндекс.Браузера приходит без класса.
+        let cfg = cfg_with_dialogs();
+        let taken: Vec<String> = cfg.apps.keys().cloned().collect();
+        let cmd = vec!["/usr/lib/chromium/chromium".to_string()];
+        let tm = client("0x1", "", "Диспетчер задач – Chromium", "1", &[]);
+        assert_eq!(join_window(&cfg, &cfg, Some("work"), &tm, &cmd, &taken), Join::Free(Free::NoClass));
+        assert_eq!(join_window(&cfg, &cfg, None, &tm, &cmd, &taken), Join::Free(Free::NoClass));
+        let blank = client("0x2", "  ", "", "1", &[]);
+        assert_eq!(join_window(&cfg, &cfg, Some("work"), &blank, &cmd, &taken), Join::Free(Free::NoClass));
+
+        // Выражение, подходящее любому классу, окна без класса не берёт:
+        // ни при сопоставлении, ни при захвате открытых окон.
+        let any = regex::Regex::new("^(?:.*)$").unwrap();
+        assert!(!matcher_fits(Some(&any), None, &tm));
+        let mut extra: BTreeMap<String, BTreeMap<String, ExtraApp>> = BTreeMap::new();
+        extra.entry("work".into()).or_default().insert("app".into(), ExtraApp { class: Some(String::new()), cmd: cmd.clone(), cwd: None, rect: PxRect::default() });
+        let (merged, _) = merge_extra(&cfg, &extra);
+        assert_eq!(app_for_window(&merged, &tm), None);
+        let plan = adopt_plan(&merged, std::slice::from_ref(&tm), &["app".to_string()]).unwrap();
+        assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn same_class_of_another_program_gets_its_own_name() {
+        let text = format!("{CFG}\n[workspaces.surf]\ntemplate = \"thirds\"\napps = {{ chromium = \"center\" }}\n");
+        let file = Config::parse(&text).unwrap();
+        let mut extra: BTreeMap<String, BTreeMap<String, ExtraApp>> = BTreeMap::new();
+        extra.entry("work".into()).or_default().insert("alacritty".into(), ExtraApp { class: Some("Alacritty".into()), cmd: vec!["/usr/bin/alacritty".into()], cwd: None, rect: PxRect::default() });
+        let (cfg, _) = merge_extra(&file, &extra);
+        let taken = taken_names(&cfg, &extra);
+        let term = client("0x1", "Alacritty", "mne@dev-lab", "2", &[]);
+        // Та же программа в другом workspace — то же приложение сессии.
+        assert_eq!(join_window(&cfg, &file, Some("surf"), &term, &["/usr/bin/alacritty".to_string()], &taken), Join::Extra("alacritty".into()));
+        // Другая программа с тем же классом чужой записи не получает.
+        assert_eq!(join_window(&cfg, &file, Some("surf"), &term, &["/opt/other/alacritty".to_string()], &taken), Join::Extra("alacritty-2".into()));
+    }
+
+    #[test]
+    fn detach_drops_session_app_in_every_workspace() {
+        let mut st = State::default();
+        let full = ExtraApp { class: Some("wev".into()), cmd: vec!["/usr/bin/wev".into()], cwd: None, rect: PxRect::default() };
+        for w in ["work", "surf"] {
+            st.extra.entry(w.into()).or_default().insert("wev".into(), full.clone());
+            st.cells.entry(w.into()).or_default().insert("wev".into(), Place::Rect { rect: PxRect::default() });
+        }
+        st.extra.get_mut("surf").unwrap().insert("calc".into(), ExtraApp::default());
+        st.extra.entry("work".into()).or_default().insert("calc".into(), ExtraApp::default());
+        // Запись с командой снимается везде, где есть, вместе с местом.
+        assert_eq!(drop_extra_app(&mut st, "surf", "wev"), vec!["surf".to_string(), "work".to_string()]);
+        assert!(st.extra.values().all(|m| !m.contains_key("wev")));
+        assert!(st.cells.values().all(|m| !m.contains_key("wev")));
+        // Запись только о месте приложения конфига снимается в одном workspace.
+        assert_eq!(drop_extra_app(&mut st, "surf", "calc"), vec!["surf".to_string()]);
+        assert!(st.extra["work"].contains_key("calc"));
+        assert!(!st.extra.contains_key("surf"));
+    }
+
+    #[test]
+    fn launchable_command_from_proc() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<String>>();
+        // Chromium переписывает командную строку: одна строка с пробелами.
+        assert_eq!(launchable(&s(&["/bin/sh -c true"]), None, None), Some(s(&["/bin/sh", "-c", "true"])));
+        // Имя в PATH остаётся как есть.
+        assert_eq!(launchable(&s(&["sh", "-c", "true"]), None, None), Some(s(&["sh", "-c", "true"])));
+        // Относительный путь — от рабочего каталога процесса.
+        let dir = std::env::temp_dir().join(format!("workspaced-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("helper"), "").unwrap();
+        let d = dir.to_string_lossy().into_owned();
+        let abs = dir.join("helper").to_string_lossy().into_owned();
+        assert_eq!(launchable(&s(&["./helper", "-x"]), Some(&d), None), Some(vec![abs, "-x".to_string()]));
+        // Файл не нашёлся — берётся /proc/<pid>/exe, без него команды нет.
+        assert_eq!(launchable(&s(&["./gone", "-x"]), Some(&d), Some(Path::new("/bin/sh"))), Some(s(&["/bin/sh", "-x"])));
+        assert_eq!(launchable(&s(&["./gone"]), Some(&d), None), None);
+        assert_eq!(launchable(&s(&["no-such-program-xyz"]), None, None), None);
+        assert_eq!(launchable(&s(&["/no/such/file"]), None, Some(Path::new("/no/such/exe"))), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn launch_failure_names_command_and_directory() {
+        let home = Path::new("/tmp");
+        assert_eq!(launch_dir(Some("/"), home), (PathBuf::from("/"), None));
+        let (dir, warn) = launch_dir(Some("/no/such/dir"), home);
+        assert_eq!(dir, PathBuf::from("/tmp"));
+        assert!(warn.unwrap().contains("/no/such/dir"));
+        assert_eq!(launch_dir(None, home), (PathBuf::from("/tmp"), None));
+
+        let err = format!("{:#}", start("/no/such/program", &["-a".to_string()], Some("/"), &BTreeMap::new()).unwrap_err());
+        assert!(err.contains("/no/such/program") && err.contains("-a") && err.contains("каталоге /") && err.contains("os error 2"), "{err}");
+        // Исчезнувший рабочий каталог запуск не срывает.
+        let mut child = start("true", &[], Some("/no/such/dir"), &BTreeMap::new()).unwrap();
+        assert!(child.wait().unwrap().success());
     }
 
     #[test]

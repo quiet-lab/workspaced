@@ -89,13 +89,13 @@ pub struct Adopted {
 /// `join_window` — те же правила, что у окна, появившегося по ходу работы.
 /// Место записывается нынешнее: окно, уже поставленное пользователем куда
 /// нужно, команда не двигает. Окно, которое принимать не следует (диалог,
-/// класс из `ignore_classes`, окно без командной строки), остаётся свободным
-/// со строкой в журнале.
+/// окно без класса, класс из `ignore_classes`, окно без командной строки),
+/// остаётся свободным со строкой в журнале.
 fn session_plan(cfg: &Config, file: &Config, ws: &str, taken: &mut Vec<String>, windows: &[(&Client, Option<&Foreign>)]) -> Vec<Adopted> {
     let mut out = Vec::new();
     for (c, f) in windows {
         let cmd: Vec<String> = f.map(|f| f.cmd.clone()).unwrap_or_default();
-        match daemon::join_window(cfg, file, Some(ws), c, !cmd.is_empty(), taken) {
+        match daemon::join_window(cfg, file, Some(ws), c, &cmd, taken) {
             daemon::Join::App(app) => out.push(Adopted { addr: c.address.clone(), app, extra: None }),
             daemon::Join::AppPlace(app) => {
                 out.push(Adopted { addr: c.address.clone(), app, extra: Some(ExtraApp { rect: c.rect(), ..ExtraApp::default() }) });
@@ -274,6 +274,12 @@ pub fn save_workspace(d: &mut Daemon) -> Result<String> {
         let Some(f) = d.state().foreign.get(&c.address).cloned() else {
             continue;
         };
+        // Окно без класса остаётся свободным всегда (изменение
+        // classless-windows-stay-free, решение D1).
+        if daemon::classless(c) {
+            log::info!("сохранение: окно {} («{}») осталось свободным: у окна нет класса", c.address, c.title);
+            continue;
+        }
         let tagged = c.app().filter(|a| cfg.apps.contains_key(a));
         let name = match tagged.clone().or_else(|| daemon::app_for_window(&cfg, c)) {
             Some(a) => a,
@@ -422,6 +428,17 @@ apps = { chromium = "left" }
         let mut taken: Vec<String> = cfg.apps.keys().cloned().collect();
         let plan = session_plan(&cfg, &cfg, "solo", &mut taken, &windows);
         assert_eq!(plan.iter().map(|a| a.app.as_str()).collect::<Vec<_>>(), vec!["galculator", "galculator-2"]);
+    }
+
+    #[test]
+    fn session_plan_leaves_classless_windows_free() {
+        // Диспетчер задач браузера: окно без класса с командной строкой браузера.
+        let cfg = Config::parse(CFG).unwrap();
+        let tm = test_client("0x1", "", "Диспетчер задач – Chromium", "1", &[]);
+        let f = foreign(&["/usr/lib/chromium/chromium", "--ozone-platform=wayland"]);
+        let windows: Vec<(&crate::hypr::Client, Option<&Foreign>)> = vec![(&tm, Some(&f))];
+        let mut taken: Vec<String> = cfg.apps.keys().cloned().collect();
+        assert!(session_plan(&cfg, &cfg, "solo", &mut taken, &windows).is_empty());
     }
 
     #[test]

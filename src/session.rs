@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
-use crate::daemon::{Daemon, ExpectedForeign, proc_info};
+use crate::daemon::{Daemon, ExpectedForeign, launchable, proc_info};
 use crate::hypr;
 use crate::state::{Desktop, Foreign, Session, SessionWindow, SessionWorkspace};
 
@@ -215,6 +215,14 @@ fn dedup_desktops(desktops: &mut BTreeMap<u8, Desktop>) {
     }
 }
 
+/// Постороннее окно снимка `w` запущено командой `cmd` в каталоге `cwd`.
+/// Команда живого окна уже приведена к запускаемому виду (`proc_info`),
+/// а снимок прежней версии демона мог хранить её как есть, поэтому команда
+/// снимка сравнивается и в исходном, и в приведённом виде.
+fn same_window(w: &SessionWindow, cmd: &[String], cwd: Option<&str>) -> bool {
+    w.cwd.as_deref() == cwd && (w.cmd == cmd || launchable(&w.cmd, w.cwd.as_deref(), None).as_deref() == Some(cmd))
+}
+
 /// Живые окна без тега сопоставляются с посторонними окнами снимка по команде и каталогу.
 /// Сверка начинается с приложений, которых в эффективном конфиге уже нет:
 /// ожидания их окон снимаются, а с их окон снимается тег, и такое окно попадает
@@ -229,7 +237,7 @@ fn adopt_live_foreign(d: &mut Daemon, snapshot: &[SessionWindow]) {
     st.foreign.clear();
     for c in clients.iter().filter(|c| c.app().is_none() && c.pid > 0) {
         let (cmd, cwd) = proc_info(c.pid);
-        let hit = snapshot.iter().enumerate().find(|(i, w)| !used[*i] && w.app.is_none() && w.cmd == cmd && w.cwd == cwd);
+        let hit = snapshot.iter().enumerate().find(|(i, w)| !used[*i] && w.app.is_none() && same_window(w, &cmd, cwd.as_deref()));
         match hit {
             Some((i, w)) => {
                 used[i] = true;
@@ -247,7 +255,15 @@ fn spawn_missing_foreign(d: &mut Daemon, snapshot: &[SessionWindow]) -> Result<(
     let live: Vec<(Vec<String>, Option<String>)> = d.state().foreign.values().map(|f| (f.cmd.clone(), f.cwd.clone())).collect();
     let mut seen: Vec<(Vec<String>, Option<String>)> = Vec::new();
     for w in snapshot.iter().filter(|w| w.app.is_none() && w.desktop != "hidden") {
-        let key = (w.cmd.clone(), w.cwd.clone());
+        // Снимок, записанный прежней версией демона, может хранить команду,
+        // которую не запустить (`./steamwebhelper`, строку Chromium целиком):
+        // она приводится к запускаемому виду так же, как при сохранении,
+        // и сверяется с живыми окнами уже в этом виде.
+        let Some(cmd) = launchable(&w.cmd, w.cwd.as_deref(), None) else {
+            log::warn!("восстановление окна {:?}: исполняемый файл не найден, окно пропущено", w.cmd);
+            continue;
+        };
+        let key = (cmd.clone(), w.cwd.clone());
         let live_count = live.iter().filter(|k| **k == key).count();
         let seen_count = seen.iter().filter(|k| **k == key).count();
         seen.push(key.clone());
@@ -257,8 +273,8 @@ fn spawn_missing_foreign(d: &mut Daemon, snapshot: &[SessionWindow]) -> Result<(
         let desktop = w.desktop.parse::<u8>().ok();
         // Ожидание заводится по pid запущенного процесса: оно живёт до окна
         // или до выхода процесса, сроком не ограничено.
-        match d.spawn_foreign(&w.cmd, w.cwd.as_deref()) {
-            Ok(pid) => d.expect_foreign(ExpectedForeign { cmd: w.cmd.clone(), cwd: w.cwd.clone(), desktop, rect: w.rect, pid }),
+        match d.spawn_foreign(&cmd, w.cwd.as_deref()) {
+            Ok(pid) => d.expect_foreign(ExpectedForeign { cmd, cwd: w.cwd.clone(), desktop, rect: w.rect, pid }),
             Err(e) => log::warn!("восстановление окна {:?}: {e:#}", w.cmd),
         }
     }
@@ -303,7 +319,7 @@ pub fn load(d: &mut Daemon, name: &str) -> Result<()> {
                     continue;
                 }
                 let (cmd, cwd) = proc_info(c.pid);
-                match s.windows.iter().enumerate().find(|(i, w)| !foreign_used[*i] && w.app.is_none() && w.cmd == cmd && w.cwd == cwd) {
+                match s.windows.iter().enumerate().find(|(i, w)| !foreign_used[*i] && w.app.is_none() && same_window(w, &cmd, cwd.as_deref())) {
                     Some((i, _)) => foreign_used[i] = true,
                     None => close.push(hypr::d_close(&c.address)),
                 }
@@ -326,7 +342,11 @@ pub fn load(d: &mut Daemon, name: &str) -> Result<()> {
             .and_then(|x| x.active.clone())
             .filter(|ws| d.cfg().workspaces.get(ws).is_some_and(|x| x.apps.contains_key(&app)))
             .or_else(|| d.cfg().workspaces.iter().find(|(_, x)| x.apps.contains_key(&app)).map(|(n, _)| n.clone()));
-        d.spawn_for_session(&app, ws.as_deref(), desktop)?;
+        // Сбой запуска одного приложения загрузку не обрывает (изменение
+        // classless-windows-stay-free, решение D2).
+        if let Err(e) = d.spawn_for_session(&app, ws.as_deref(), desktop) {
+            log::warn!("загрузка сессии {name}: {e:#}; загрузка продолжается без этого приложения");
+        }
     }
     // Активные workspace поднимаются по столам, активный стол последним.
     let mut order: Vec<(u8, String)> = s.desktops.iter().filter_map(|(n, x)| Some((n.parse::<u8>().ok()?, x.active.clone()?))).collect();
@@ -336,7 +356,9 @@ pub fn load(d: &mut Daemon, name: &str) -> Result<()> {
         order.push(it);
     }
     for (n, ws) in order {
-        d.raise(&ws, Some(n))?;
+        if let Err(e) = d.raise(&ws, Some(n)) {
+            log::warn!("загрузка сессии {name}: workspace {ws} на столе {n} не поднят: {e:#}");
+        }
     }
     if s.active_desktop != d.current_desktop() {
         d.hypr().dispatch(&hypr::d_focus_desktop(s.active_desktop))?;
