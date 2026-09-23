@@ -1352,8 +1352,19 @@ impl Daemon {
             raised = true;
         }
         let n = self.current;
-        let route = app_route(&self.cfg, &self.st.desktops, n, apps, pull);
+        let tagged = self.tagged_in_active(n)?;
+        let route = app_route(&self.cfg, &self.st.desktops, n, apps, pull, &tagged);
         self.follow_route(route, raised, apps)
+    }
+
+    /// Приложения окон, входящих в активный workspace стола `n` тегом
+    /// состава: клавиша приложения ведёт к окну там, где оно сейчас есть
+    /// (решение D16). Без активного workspace — пусто.
+    fn tagged_in_active(&self, n: u8) -> Result<Vec<String>> {
+        Ok(match self.st.desktops.get(&n).and_then(|d| d.active.clone()) {
+            Some(w) => self.hypr.clients()?.iter().filter(|c| c.in_ws(&w)).filter_map(Client::app).collect(),
+            None => Vec::new(),
+        })
     }
 
     /// Клавиша приложения по нажатой цепочке (изменение workspace-overrides,
@@ -1365,12 +1376,7 @@ impl Daemon {
         let parsed = crate::keys::parse_chain(chain)?;
         let chain = crate::keys::chain_compact(&parsed);
         let n = self.current;
-        // Приложения окон, входящих в активный workspace стола тегом состава:
-        // клавиша ведёт к окну там, где оно сейчас есть (решение D16).
-        let tagged: Vec<String> = match self.st.desktops.get(&n).and_then(|d| d.active.clone()) {
-            Some(w) => self.hypr.clients()?.iter().filter(|c| c.in_ws(&w)).filter_map(Client::app).collect(),
-            None => Vec::new(),
-        };
+        let tagged = self.tagged_in_active(n)?;
         let Some(route) = key_route(&self.cfg, &self.st.desktops, n, &chain, &tagged) else {
             log::info!("клавиша {chain}: ни одно приложение на неё не отзывается");
             return Ok(());
@@ -2381,11 +2387,13 @@ fn present_candidate(cfg: &Config, ws: &str, candidates: &[String], tagged: &[St
 /// Путь команды `workspaced app <имя>` — собственной клавиши приложения
 /// (решение D5): те же шаги, что у `key_route`, где `Own` — это приложение,
 /// а workspace откликается, если описывает его и не переопределяет его
-/// клавишу. `pull` перетаскивает окна в активный workspace сразу после
-/// шага 2. `apps` — кандидаты (прежняя привязка `workspaced app a b c`):
+/// клавишу. Приложение, окно которого входит в активный workspace тегом
+/// состава (`tagged`), ведёт цикл там же (решение D16). `pull` перетаскивает
+/// окна в активный workspace, если приложение в нём не описано, раньше
+/// цикла по окну с тегом и раньше поднятия. `apps` — кандидаты (прежняя привязка `workspaced app a b c`):
 /// действует тот, чей путь найдётся на более раннем шаге, при равенстве —
 /// первый по порядку.
-pub fn app_route(cfg: &Config, desktops: &BTreeMap<u8, Desktop>, current: u8, apps: &[String], pull: bool) -> AppRoute {
+pub fn app_route(cfg: &Config, desktops: &BTreeMap<u8, Desktop>, current: u8, apps: &[String], pull: bool, tagged: &[String]) -> AppRoute {
     let active = desktops.get(&current).and_then(|d| d.active.clone());
     let run = running(desktops, current);
     let one = |x: &String| -> (u8, AppRoute) {
@@ -2397,6 +2405,11 @@ pub fn app_route(cfg: &Config, desktops: &BTreeMap<u8, Desktop>, current: u8, ap
         }
         if pull && let Some(w) = &active {
             return (2, AppRoute::Pull { ws: w.clone(), app: x.clone() });
+        }
+        if let Some(w) = &active
+            && tagged.iter().any(|t| cfg.app_is(t, x))
+        {
+            return (2, AppRoute::Cycle { ws: w.clone(), app: x.clone() });
         }
         if let Some((v, desktop)) = run.iter().find(|(v, _)| ws_has_app(cfg, v, x) && !cfg.overrides_key(v, x)) {
             return (3, AppRoute::Raise { ws: v.clone(), app: x.clone(), desktop: *desktop });
@@ -3761,21 +3774,21 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
         let a = |v: &str| vec![v.to_string()];
         let s = |v: &str| v.to_string();
         // 1. Приложение описано в активном workspace: цикл, признак pull ничего не меняет.
-        assert_eq!(app_route(&cfg, &d, 1, &a("chromium"), false), AppRoute::Cycle { ws: s("work"), app: s("chromium") });
-        assert_eq!(app_route(&cfg, &d, 1, &a("chromium"), true), AppRoute::Cycle { ws: s("work"), app: s("chromium") });
+        assert_eq!(app_route(&cfg, &d, 1, &a("chromium"), false, &[]), AppRoute::Cycle { ws: s("work"), app: s("chromium") });
+        assert_eq!(app_route(&cfg, &d, 1, &a("chromium"), true, &[]), AppRoute::Cycle { ws: s("work"), app: s("chromium") });
         // 2. Перетаскивание в активный workspace.
-        assert_eq!(app_route(&cfg, &d, 1, &a("chrome-ai"), true), AppRoute::Pull { ws: s("work"), app: s("chrome-ai") });
+        assert_eq!(app_route(&cfg, &d, 1, &a("chrome-ai"), true, &[]), AppRoute::Pull { ws: s("work"), app: s("chrome-ai") });
         // 3. Приложение в запущенном workspace: в списке текущего стола, затем другого.
-        assert_eq!(app_route(&cfg, &d, 1, &a("calc"), false), AppRoute::Raise { ws: s("chat"), app: s("calc"), desktop: None });
-        assert_eq!(app_route(&cfg, &d, 1, &a("chrome-ai"), false), AppRoute::Raise { ws: s("surf"), app: s("chrome-ai"), desktop: Some(2) });
+        assert_eq!(app_route(&cfg, &d, 1, &a("calc"), false, &[]), AppRoute::Raise { ws: s("chat"), app: s("calc"), desktop: None });
+        assert_eq!(app_route(&cfg, &d, 1, &a("chrome-ai"), false, &[]), AppRoute::Raise { ws: s("surf"), app: s("chrome-ai"), desktop: Some(2) });
         // 4. Workspace приложения не запущен: открыть в активном workspace стола,
         // а не поднимать чужой workspace (прежняя ветвь «3б» снята).
         d.remove(&2);
-        assert_eq!(app_route(&cfg, &d, 1, &a("chrome-ai"), false), AppRoute::Open { ws: s("work"), app: s("chrome-ai") });
+        assert_eq!(app_route(&cfg, &d, 1, &a("chrome-ai"), false, &[]), AppRoute::Open { ws: s("work"), app: s("chrome-ai") });
         // 5. На столе нет активного workspace: цикл вне workspace.
         d.insert(4, Desktop::default());
-        assert_eq!(app_route(&cfg, &d, 4, &a("chrome-ai"), false), AppRoute::Free { app: s("chrome-ai") });
-        assert_eq!(app_route(&cfg, &d, 4, &a("chrome-ai"), true), AppRoute::Free { app: s("chrome-ai") });
+        assert_eq!(app_route(&cfg, &d, 4, &a("chrome-ai"), false, &[]), AppRoute::Free { app: s("chrome-ai") });
+        assert_eq!(app_route(&cfg, &d, 4, &a("chrome-ai"), true, &[]), AppRoute::Free { app: s("chrome-ai") });
     }
 
     /// Конфиг сессии в миниатюре (изменение workspace-overrides, решение
@@ -3937,14 +3950,17 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
         d.insert(1, desk(&["work"], Some("work")));
         d.insert(2, desk(&["surf"], Some("surf")));
         // Случай «в» и без --pull: surf переопределил клавишу chrome-ai.
-        assert_eq!(app_route(&cfg, &d, 1, &a("chrome-ai"), false), AppRoute::Pull { ws: s("work"), app: s("chrome-ai") });
-        assert_eq!(app_route(&cfg, &d, 2, &a("chrome-ai"), false), AppRoute::Cycle { ws: s("surf"), app: s("chrome-ai") });
+        assert_eq!(app_route(&cfg, &d, 1, &a("chrome-ai"), false, &[]), AppRoute::Pull { ws: s("work"), app: s("chrome-ai") });
+        assert_eq!(app_route(&cfg, &d, 2, &a("chrome-ai"), false, &[]), AppRoute::Cycle { ws: s("surf"), app: s("chrome-ai") });
+        // Окно chrome-ai входит в work тегом: цикл там же (решение D16).
+        assert_eq!(app_route(&cfg, &d, 1, &a("chrome-ai"), false, &a("chrome-ai")), AppRoute::Cycle { ws: s("work"), app: s("chrome-ai") });
+        assert_eq!(app_route(&cfg, &d, 1, &a("chrome-ai"), true, &a("chrome-ai")), AppRoute::Pull { ws: s("work"), app: s("chrome-ai") });
         // Workspace без переопределения поднимается.
         d.insert(3, desk(&["ai"], Some("ai")));
-        assert_eq!(app_route(&cfg, &d, 1, &a("chrome-ai"), false), AppRoute::Raise { ws: s("ai"), app: s("chrome-ai"), desktop: Some(3) });
+        assert_eq!(app_route(&cfg, &d, 1, &a("chrome-ai"), false, &[]), AppRoute::Raise { ws: s("ai"), app: s("chrome-ai"), desktop: Some(3) });
         // Кандидаты: действует тот, чей путь найден на более раннем шаге.
-        assert_eq!(app_route(&cfg, &d, 1, &[s("yandex"), s("herdr")], false), AppRoute::Cycle { ws: s("work"), app: s("herdr") });
-        assert_eq!(app_route(&cfg, &d, 1, &[s("yandex"), s("chrome-ai")], false), AppRoute::Raise { ws: s("ai"), app: s("chrome-ai"), desktop: Some(3) });
+        assert_eq!(app_route(&cfg, &d, 1, &[s("yandex"), s("herdr")], false, &[]), AppRoute::Cycle { ws: s("work"), app: s("herdr") });
+        assert_eq!(app_route(&cfg, &d, 1, &[s("yandex"), s("chrome-ai")], false, &[]), AppRoute::Raise { ws: s("ai"), app: s("chrome-ai"), desktop: Some(3) });
     }
 
     #[test]
