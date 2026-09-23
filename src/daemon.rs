@@ -1830,8 +1830,13 @@ impl Daemon {
 
     /// Все записи приложения исполнены — ожидание его окон закончено.
     fn restore_progress(&mut self, app: &str) {
-        if !self.st.restore.iter().any(|e| e.app == app && e.open()) && self.st.restore_apps.remove(app) {
-            log::info!("восстановление {app}: все записи снимка исполнены");
+        let left: Vec<String> = self.st.restore.iter().filter(|e| e.app == app && e.open()).map(|e| format!("{}#{}", e.app, e.instance)).collect();
+        if left.is_empty() {
+            if self.st.restore_apps.remove(app) {
+                log::info!("восстановление {app}: все записи снимка исполнены");
+            }
+        } else if self.st.restore_apps.contains(app) {
+            log::info!("восстановление {app}: ждём окон, которые откроет процесс приложения, — {}; ожидание снимают клавиша приложения и сохранение сессии", left.join(", "));
         }
     }
 
