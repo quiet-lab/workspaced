@@ -1082,6 +1082,10 @@ impl Daemon {
                 }
                 members.push(c.address.clone());
                 let moving = c.desktop() != Some(n);
+                // Общее окно, стоявшее на столе в составе вытесняемого
+                // workspace, приходит в поднимаемый так же, как окно с другого
+                // стола: встаёт в состояние, запомненное для него (решение D13).
+                let arriving = arrives(c, n, &before, ws);
                 if moving {
                     if let Some((v, r)) = leave_geom(&cfg, &before, c, Some(ws)) {
                         self.st.geom.entry(v).or_default().insert(c.address.clone(), r);
@@ -1092,7 +1096,7 @@ impl Daemon {
                 // сохраняет прямоугольник, прочитанный у композитора до переноса.
                 let carried = moving_ws && c.desktop() == was_on;
                 let kept = self.st.geom.get(ws).and_then(|g| g.get(&c.address)).copied();
-                let target = raise_target(carried, stack, moving, kept, rect, c.rect());
+                let target = raise_target(carried, stack, arriving, kept, rect, c.rect());
                 if let Some(r) = target {
                     ex.extend(hypr::d_place(&c.address, r));
                 }
@@ -2119,6 +2123,16 @@ pub fn arrive_rect(st: &mut State, cfg: &Config, ws: &str, c: &Client, mon: (i32
     let cell = ws_app_of(cfg, ws, &ws_apps, c).and_then(|a| st.rect_for(cfg, ws, &a, mon));
     let kept = st.geom.get(ws).and_then(|g| g.get(&c.address)).copied();
     raise_target(false, stack, true, kept, cell, c.rect())
+}
+
+/// Приходит ли окно workspace `ws` при его поднятии на столе `n`: окно
+/// стоит на другом столе или на `special:pool` либо стоит на `n`, но
+/// в составе вытесняемого workspace (`before` — активные workspace столов
+/// до поднятия). Такое окно встаёт в состояние, запомненное для `ws`
+/// (решения D6, D13); окно, уже стоящее на столе как окно `ws`, поднятие
+/// в режиме `stack` не двигает.
+pub fn arrives(c: &Client, n: u8, before: &BTreeMap<u8, String>, ws: &str) -> bool {
+    c.desktop() != Some(n) || before.get(&n).is_some_and(|old| old != ws && c.in_ws(old))
 }
 
 /// Прямоугольник, который надо запомнить, прежде чем окно уйдёт со своего
@@ -3514,6 +3528,27 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
         assert_eq!(arrive_rect(&mut st, &cfg, "dev-back", &shared, (3840, 2160)), Some(PxRect { x: 1125, y: 10, w: 1920, h: 2140 }));
         // Окно, не входящее в workspace, места там не получает и не двигается.
         assert_eq!(arrive_rect(&mut st, &cfg, "dev-back", &own, (3840, 2160)), None);
+    }
+
+    #[test]
+    fn shared_window_arrives_into_raised_workspace() {
+        let shared = client("0x1", "google-chrome-ai", "ИИ", "1", &["app:chrome-ai#1", "ws:surf", "ws:work"]);
+        // На столе 1 был активен work, поднимается surf: общее окно приходит
+        // в surf и встаёт в его прямоугольник, хотя стол не меняет.
+        assert!(arrives(&shared, 1, &desks(&[(1, "work")]), "surf"));
+        // Повторное поднятие surf на том же столе окно не двигает.
+        assert!(!arrives(&shared, 1, &desks(&[(1, "surf")]), "surf"));
+        // Окно с другого стола приходит всегда.
+        assert!(arrives(&shared, 2, &desks(&[(2, "surf")]), "surf"));
+        // Окно стола, не входившее в вытесняемый workspace, не приходит.
+        let own = client("0x2", "google-chrome", "Новости", "1", &["app:chrome#1", "ws:surf"]);
+        assert!(!arrives(&own, 1, &desks(&[(1, "work")]), "surf"));
+        // Вместе с raise_target: в режиме stack пришедшее окно встаёт
+        // в запомненный прямоугольник, иначе — на место из конфига.
+        let kept = PxRect { x: 1700, y: 60, w: 1920, h: 2140 };
+        let cell = PxRect { x: 1910, y: 10, w: 1920, h: 2140 };
+        assert_eq!(raise_target(false, true, true, Some(kept), Some(cell), shared.rect()), Some(kept));
+        assert_eq!(raise_target(false, true, false, Some(kept), Some(cell), shared.rect()), None);
     }
 
     #[test]
