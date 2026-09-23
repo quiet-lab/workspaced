@@ -9,10 +9,10 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
-use crate::config::{Config, Mode, PxRect};
+use crate::config::{Config, PxRect};
 use crate::daemon::{self, Daemon, ExpectedForeign, launchable, proc_info};
 use crate::hypr::{self, Client};
-use crate::state::{Desktop, Foreign, RestoreEntry, RestoreState, Session, SessionWindow, SessionWorkspace, State};
+use crate::state::{Desktop, Foreign, Moved, RestoreEntry, RestoreState, Session, SessionWindow, SessionWorkspace, State};
 
 pub fn sessions_dir() -> PathBuf {
     dirs::state_dir().unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".local/state")).join("workspaced").join("sessions")
@@ -55,28 +55,41 @@ pub fn snapshot(d: &Daemon) -> Result<Session> {
         }
     }
     windows.extend(carried_entries(st, &clients));
-    // Назначения ячеек и дополнительные приложения сессии — сведения об одном
-    // и том же workspace, поэтому в снимке они лежат рядом.
-    let mut workspaces: BTreeMap<String, SessionWorkspace> = BTreeMap::new();
-    for (w, cells) in &st.cells {
-        workspaces.entry(w.clone()).or_default().cells = cells.clone();
-    }
-    for (w, apps) in &st.extra {
-        workspaces.entry(w.clone()).or_default().extra_apps = apps.clone();
-    }
     Ok(Session {
         saved: chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         active_desktop: d.current_desktop(),
         desktops: st.desktops.iter().map(|(n, d)| (n.to_string(), d.clone())).collect(),
-        workspaces,
+        workspaces: session_workspaces(st),
         windows,
     })
 }
 
+/// Workspace в снимке. Раскладка — исходные места, главное приложение,
+/// изменённые места — и дополнительные приложения сессии — сведения об одном
+/// и том же workspace, поэтому в снимке они лежат рядом (изменение
+/// live-layout, решение D13).
+pub fn session_workspaces(st: &State) -> BTreeMap<String, SessionWorkspace> {
+    let mut workspaces: BTreeMap<String, SessionWorkspace> = BTreeMap::new();
+    for (w, cells) in &st.cells {
+        workspaces.entry(w.clone()).or_default().cells = cells.clone();
+    }
+    for (w, m) in &st.main {
+        workspaces.entry(w.clone()).or_default().main = Some(m.clone());
+    }
+    for (w, moved) in &st.moved {
+        workspaces.entry(w.clone()).or_default().moved = moved.iter().map(|(a, m)| (a.clone(), m.rect)).collect();
+    }
+    for (w, apps) in &st.extra {
+        workspaces.entry(w.clone()).or_default().extra_apps = apps.clone();
+    }
+    workspaces
+}
+
 /// Запись окна приложения в снимке — экземпляром (изменение session-instances,
 /// решения D1, D2): номер из тега, workspace по тегам состава, прямоугольники
-/// для workspace режима `stack` — нынешний, если окно стоит на столе, где
-/// этот workspace активен, иначе запомненный для него. Командная строка
+/// для всех его workspace в обоих режимах (изменение live-layout, решение
+/// D13) — нынешний, если окно стоит на столе, где этот workspace активен,
+/// иначе запомненный для него. Командная строка
 /// и каталог (`proc` — `proc_info` или замена в тесте) пишутся только у
 /// экземпляра с собственным процессом, который не первый у своего приложения:
 /// первый запускается командой приложения, остальные окна процесса
@@ -86,10 +99,7 @@ pub fn instance_record(c: &Client, clients: &[Client], st: &State, cfg: &Config,
     let workspaces = c.workspaces();
     let act = daemon::actives(st);
     let mut rects = BTreeMap::new();
-    for w in &workspaces {
-        if cfg.workspaces.get(w).map(|x| x.mode()) != Some(Mode::Stack) {
-            continue;
-        }
+    for w in workspaces.iter().filter(|w| cfg.workspaces.contains_key(*w)) {
         let here = c.desktop().is_some_and(|n| act.get(&n) == Some(w));
         let r = if here { Some(c.rect()) } else { st.geom.get(w).and_then(|g| g.get(&c.address)).copied() };
         if let Some(r) = r {
@@ -232,7 +242,7 @@ pub fn restore_default(d: &mut Daemon) -> Result<()> {
 #[derive(Debug, Default)]
 pub struct RestorePlan {
     pub entries: Vec<RestoreEntry>,
-    /// workspace, адрес окна, прямоугольник: запомнить для режима `stack`.
+    /// workspace, адрес окна, прямоугольник: запомнить для окна в этом workspace.
     pub geom: Vec<(String, String, PxRect)>,
     /// Снятые записи — строки для журнала.
     pub dropped: Vec<String>,
@@ -241,8 +251,9 @@ pub struct RestorePlan {
 /// План восстановления экземпляров по окнам снимка. Снимок прежнего формата
 /// (без номеров экземпляров) плана не даёт (решение D12). Запись, для которой
 /// живое окно с тем же тегом уже есть (перезапуск демона без перезагрузки),
-/// исполнена: её прямоугольники переходят в память режима `stack` для тех
-/// workspace, в которые окно входит сейчас, а состав окна не трогается
+/// исполнена: её прямоугольники становятся запомненными для тех workspace,
+/// в которые окно входит сейчас, в обоих режимах (изменение live-layout,
+/// решение D13), а состав окна не трогается
 /// (решение D8). Запись без командной строки, окна которой нет, при живых
 /// окнах приложения снимается: процесс приложения уже работает и своих окон
 /// заново не откроет. Записи приложений, которых в эффективном конфиге нет,
@@ -273,7 +284,9 @@ pub fn restore_plan(windows: &[SessionWindow], clients: &[Client], cfg: &Config)
     plan
 }
 
-/// Списки столов, назначения ячеек и дополнительные приложения из снимка.
+/// Списки столов, раскладки workspace (назначение мест, главное приложение,
+/// изменённые места без владельца — решение D13) и дополнительные
+/// приложения из снимка.
 /// Workspace сверяются с файлом конфига, а не с эффективным: дополнительные
 /// приложения прежнего состояния здесь как раз заменяются.
 fn apply_lists(d: &mut Daemon, s: &Session) {
@@ -290,10 +303,19 @@ fn apply_lists(d: &mut Daemon, s: &Session) {
     let st = d.state_mut();
     st.desktops = desktops;
     st.cells.clear();
+    st.moved.clear();
+    st.main.clear();
+    st.geom.clear();
     st.extra.clear();
     for (w, sw) in &s.workspaces {
         if !cfg_ws.contains(w) {
             continue;
+        }
+        if let Some(m) = &sw.main {
+            st.main.insert(w.clone(), m.clone());
+        }
+        if !sw.moved.is_empty() {
+            st.moved.insert(w.clone(), sw.moved.iter().map(|(a, r)| (a.clone(), Moved { rect: *r, owner: None })).collect());
         }
         // Пустая таблица ячеек в снимке ничего не значит: назначения тогда
         // собираются из конфига при первом обращении.
@@ -747,13 +769,48 @@ apps = { chrome-ai = "right" }
         assert!(rec[2].cmd.is_empty() && rec[2].cwd.is_none());
         assert_eq!(rec[3].cmd, vec!["neovide".to_string(), "notes.md".to_string()]);
         assert_eq!(rec[3].cwd.as_deref(), Some("/home/mne/notes"));
-        // rects только у workspace режима stack: surf — запомненный, work нет.
-        assert_eq!(rec[4].rects, BTreeMap::from([("surf".to_string(), RS)]));
+        // rects по всем workspace окна в обоих режимах (изменение live-layout,
+        // решение D13): surf — запомненный, work — нынешний, окно стоит
+        // на столе, где work активен.
+        assert_eq!(rec[4].rects, BTreeMap::from([("surf".to_string(), RS), ("work".to_string(), R2)]));
         assert_eq!(rec[4].rect, R2);
-        assert!(rec[0].rects.is_empty() && rec[1].rects.is_empty());
+        assert_eq!(rec[0].rects, BTreeMap::from([("work".to_string(), R1)]));
+        // Для surf у второго окна chromium прямоугольника не запомнено.
+        assert_eq!(rec[1].rects, BTreeMap::from([("work".to_string(), R1)]));
         // Окно на столе, где surf активен, — нынешний прямоугольник.
         assert_eq!(rec[5].rects, BTreeMap::from([("surf".to_string(), RS)]));
         assert_eq!(rec[5].cmd, vec!["x".to_string()]);
+    }
+
+    #[test]
+    fn snapshot_writes_layout() {
+        // Пример пользователя: chrome-ai (запись сессии в центре экрана)
+        // сдвинут в 400,300 1400×1000 и поменялся местами с herdr.
+        let cfg = Config::parse(&CFG.replace("apps = { chromium = \"left\", neovide = \"right\", chrome-ai = \"center\" }", "main = \"herdr\"\napps = { chromium = \"left\", neovide = \"right\", herdr = \"center\" }").replace("[apps.chrome-ai]", "[apps.herdr]\ncmd = \"wezterm-gui\"\n\n[apps.chrome-ai]")).unwrap();
+        let mon = (3840, 2160);
+        let mut st = State::default();
+        let record = PxRect { x: 960, y: 540, w: 1920, h: 1080 };
+        st.extra.entry("work".into()).or_default().insert("chrome-ai".into(), crate::state::ExtraApp { rect: record, ..Default::default() });
+        let (cfg, _) = daemon::merge_extra(&cfg, &st.extra);
+        let r = PxRect { x: 400, y: 300, w: 1400, h: 1000 };
+        st.cells_of(&cfg, "work", mon);
+        st.moved.entry("work".into()).or_default().insert("chrome-ai".into(), Moved { rect: r, owner: Some("0xai".into()) });
+        let main = st.main_app(&cfg, "work", mon);
+        daemon::swap_places(&mut st, "work", main.as_deref(), "chrome-ai", "center", &|_| true);
+        let ws = session_workspaces(&st);
+        let work = &ws["work"];
+        assert_eq!(work.main.as_deref(), Some("chrome-ai"));
+        assert_eq!(work.cells["chrome-ai"], crate::state::Place::Cell("center".into()));
+        assert_eq!(work.cells["herdr"], crate::state::Place::Rect { rect: record });
+        assert_eq!(work.moved, BTreeMap::from([("herdr".to_string(), r)]));
+        // Запись дополнительного приложения хранит прямоугольник приёма.
+        assert_eq!(work.extra_apps["chrome-ai"].rect, record);
+        // Снимок записывается и читается обратно; раскладка восстанавливается.
+        let s = Session { saved: "t".into(), active_desktop: 1, workspaces: ws, ..Session::default() };
+        let text = toml::to_string_pretty(&s).unwrap();
+        let back: Session = toml::from_str(&text).unwrap();
+        assert_eq!(back.workspaces["work"].main.as_deref(), Some("chrome-ai"));
+        assert_eq!(back.workspaces["work"].moved["herdr"], r);
     }
 
     #[test]
@@ -771,7 +828,12 @@ apps = { chrome-ai = "right" }
         let mut ai = w("chrome-ai", 1, &["surf", "work"], &[]);
         ai.rects.insert("surf".into(), RS);
         ai.rects.insert("gone".into(), RS);
-        let windows = vec![w("chromium", 1, &["work"], &[]), w("chromium", 2, &["work"], &[]), w("neovide", 1, &["work"], &[]), w("neovide", 2, &["work"], &["neovide", "notes.md"]), ai, w("nosuch", 1, &["work"], &[])];
+        // У первого окна chromium прямоугольник для work — workspace режима
+        // обмена мест (изменение live-layout, решение D13).
+        let mut c1 = w("chromium", 1, &["work"], &[]);
+        let moved = PxRect { x: 100, y: 200, w: 800, h: 600 };
+        c1.rects.insert("work".into(), moved);
+        let windows = vec![c1, w("chromium", 2, &["work"], &[]), w("neovide", 1, &["work"], &[]), w("neovide", 2, &["work"], &["neovide", "notes.md"]), ai, w("nosuch", 1, &["work"], &[])];
         // Перезапуск демона: chromium#1, neovide#1 и chrome-ai живы, второго
         // окна chromium и второго neovide нет.
         let clients = vec![
@@ -793,8 +855,9 @@ apps = { chrome-ai = "right" }
                 ("chrome-ai".into(), 1, RestoreState::Done),
             ]
         );
-        // Прямоугольник surf переходит в память stack: окно входит в surf.
-        assert_eq!(plan.geom, vec![("surf".to_string(), "0xai".to_string(), RS)]);
+        // Прямоугольники становятся запомненными в обоих режимах: work для
+        // chromium#1, surf для chrome-ai; gone — окно в нём не состоит.
+        assert_eq!(plan.geom, vec![("work".to_string(), "0xc1".to_string(), moved), ("surf".to_string(), "0xai".to_string(), RS)]);
         assert_eq!(plan.dropped.len(), 2, "{:?}", plan.dropped);
         // После перезагрузки живых окон нет: все записи ждут.
         let plan = restore_plan(&windows, &[], &cfg);

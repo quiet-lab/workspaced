@@ -222,11 +222,6 @@ impl WsApp {
     pub fn at(place: Placement) -> WsApp {
         WsApp { place, chain: None, mode: None, place_error: None }
     }
-
-    /// Место задано ячейкой шаблона.
-    pub fn has_cell(&self) -> bool {
-        matches!(self.place, Placement::Cell(_))
-    }
 }
 
 impl<'de> Deserialize<'de> for WsApp {
@@ -269,10 +264,12 @@ impl<'de> Deserialize<'de> for WsApp {
 }
 
 /// Поведение клавиши приложения в workspace (спецификация ws-daemon,
-/// «Цепочка приложения»): обмен ячеек с главной или подъём окна на месте.
+/// «Цепочка приложения»): обмен мест с главным приложением или подъём окна
+/// на месте. Раскладку и память окон режим не задаёт (изменение live-layout,
+/// решение D8).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
-    /// Окна приложения занимают главную ячейку, прежнее главное уходит в их.
+    /// Окна приложения занимают главное место, прежнее главное — их место.
     Swap,
     /// Окна стоят на своих местах, меняется только порядок по глубине и фокус.
     Stack,
@@ -287,7 +284,7 @@ fn default_mode() -> String {
 
 /// Workspace: шаблон, приложения по ячейкам, главное, иконка, цепочка.
 /// Сравнение на равенство нужно перечитыванию конфига: у workspace, чей раздел
-/// изменился, назначения ячеек собираются заново (спецификация ws-config,
+/// изменился, раскладка собирается заново (спецификация ws-config,
 /// «Слежение за конфигом»).
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Workspace {
@@ -771,18 +768,15 @@ impl Config {
         }
     }
 
-    /// Режим клавиши приложения в workspace (решение D7): поле `mode` записи,
-    /// описывающей приложение; без него — режим workspace, кроме приложения
-    /// без ячейки в workspace режима `swap`, которое выбирается в режиме
-    /// `stack`. Приложение без записи в workspace берёт режим workspace.
+    /// Режим клавиши приложения в workspace: поле `mode` записи, описывающей
+    /// приложение; без него — режим workspace, в том числе у записи с `rect`
+    /// вместо ячейки (изменение live-layout, решение D6: исключение D7
+    /// изменения workspace-overrides снято). Приложение без записи
+    /// в workspace берёт режим workspace.
     pub fn app_mode(&self, ws: &str, app: &str) -> Mode {
         let ws_mode = self.workspaces.get(ws).map(Workspace::mode).unwrap_or(Mode::Swap);
-        match self.ws_entry(ws, app) {
-            Some((_, e)) => match &e.mode {
-                Some(m) => Mode::of(m),
-                None if ws_mode == Mode::Swap && !e.has_cell() => Mode::Stack,
-                None => ws_mode,
-            },
+        match self.ws_entry(ws, app).and_then(|(_, e)| e.mode.as_deref()) {
+            Some(m) => Mode::of(m),
             None => ws_mode,
         }
     }
@@ -936,7 +930,7 @@ apps = { terminal = "right" }
 
     #[test]
     fn workspace_mode_and_app_order() {
-        // Без поля mode workspace работает обменом ячеек.
+        // Без поля mode workspace работает обменом мест.
         let cfg = Config::parse(MINIMAL).unwrap();
         assert_eq!(cfg.workspaces["work"].mode(), Mode::Swap);
 
@@ -1010,7 +1004,7 @@ calc = { rect = { x = 2600, y = 1500, w = 600, h = 400 } }
         let ai = &surf.apps["chrome-ai"];
         assert_eq!((ai.place.clone(), ai.chain.as_deref(), ai.mode.as_deref()), (Placement::Cell("right".into()), Some("SUPER+V"), None));
         let calc = &cfg.workspaces["work"].apps["calc"];
-        assert!(!calc.has_cell() && calc.chain.is_none() && calc.mode.is_none());
+        assert!(!matches!(calc.place, Placement::Cell(_)) && calc.chain.is_none() && calc.mode.is_none());
         // Таблица с rect, chain и mode.
         let text = OVERRIDES.replace(
             "calc = { rect = { x = 2600, y = 1500, w = 600, h = 400 } }",
@@ -1057,13 +1051,14 @@ calc = { rect = { x = 2600, y = 1500, w = 600, h = 400 } }
         assert_eq!(cfg.responds("surf", "SUPER+SHIFT+Y"), Some("yandex".into()));
         assert_eq!(cfg.responds("surf", "SUPER+SHIFT+V"), None);
         assert_eq!(cfg.responds("work", "SUPER+V"), None);
-        // Режим: поле записи, иначе режим workspace; без ячейки в swap — stack.
+        // Режим: поле записи, иначе режим workspace, в том числе у записи
+        // без ячейки (изменение live-layout, решение D6).
         assert_eq!(cfg.app_mode("surf", "chrome"), Mode::Stack);
-        assert_eq!(cfg.app_mode("work", "calc"), Mode::Stack);
+        assert_eq!(cfg.app_mode("work", "calc"), Mode::Swap);
         assert_eq!(cfg.app_mode("work", "chromium"), Mode::Stack);
         assert_eq!(cfg.app_mode("work", "yandex"), Mode::Swap);
-        let swap = text.replace("calc = { rect = { x = 2600, y = 1500, w = 600, h = 400 } }", "calc = { rect = { x = 2600, y = 1500, w = 600, h = 400 }, mode = \"swap\" }");
-        assert_eq!(Config::parse(&swap).unwrap().app_mode("work", "calc"), Mode::Swap);
+        let stack = text.replace("calc = { rect = { x = 2600, y = 1500, w = 600, h = 400 } }", "calc = { rect = { x = 2600, y = 1500, w = 600, h = 400 }, mode = \"stack\" }");
+        assert_eq!(Config::parse(&stack).unwrap().app_mode("work", "calc"), Mode::Stack);
         // Переопределение, совпадающее с собственной клавишей, ничего не меняет.
         let same = text.replace("yandex = \"center\"", "yandex = { cell = \"center\", chain = \"shift+super+Y\" }");
         assert!(!Config::parse(&same).unwrap().overrides_key("surf", "yandex"));

@@ -1,4 +1,4 @@
-//! Модель демона: столы, назначение ячеек, посторонние окна — и формат сессии.
+//! Модель демона: столы, раскладки workspace, посторонние окна — и формат сессии.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -63,6 +63,17 @@ impl ExtraApp {
     }
 }
 
+/// Изменённое место приложения в раскладке workspace (изменение live-layout,
+/// решения D1, D9): прямоугольник, снятый с экрана, и адрес окна, с которого
+/// он снят. По владельцу закрытие окна находит места, которые пора вернуть
+/// к описанию; у места из снимка сессии владельца нет, пока окно не встанет
+/// на это место или раскладку не снимут с экрана.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Moved {
+    pub rect: PxRect,
+    pub owner: Option<String>,
+}
+
 /// Незаконченный цикл клавиши приложения в workspace (спецификация ws-daemon,
 /// «Цепочка приложения»): чьи экземпляры перебираются и к какому окну вернёт
 /// конец цикла (prev). Запись живёт в памяти демона: это след незаконченного
@@ -76,15 +87,26 @@ pub struct Cycle {
 #[derive(Debug, Default)]
 pub struct State {
     pub desktops: BTreeMap<u8, Desktop>,
-    /// workspace → приложение → место (текущее назначение, по умолчанию из конфига).
+    /// workspace → приложение → исходное место в раскладке (ячейка или
+    /// прямоугольник; при первом обращении — из конфига, после обмена мест —
+    /// исходное место другого приложения).
     pub cells: BTreeMap<String, BTreeMap<String, Place>>,
+    /// workspace → приложение → изменённое место: прямоугольник, который
+    /// пользователь задал окну приложения (изменение live-layout, решение D1).
+    /// Прямоугольник места — изменённый, а без него — исходный.
+    pub moved: BTreeMap<String, BTreeMap<String, Moved>>,
+    /// workspace → главное приложение (решение D5): обмен мест делает главным
+    /// вызванное приложение, при первом обращении — поле `main` раздела или
+    /// приложение, записанное в ячейку `main` шаблона.
+    pub main: BTreeMap<String, String>,
     /// workspace → незаконченный цикл клавиши приложения.
     pub cycle: BTreeMap<String, Cycle>,
     /// workspace → последнее его окно, получавшее фокус (событие `activewindow`).
     pub focus: BTreeMap<String, String>,
-    /// workspace → адрес окна → прямоугольник, в котором окно оставили.
-    /// Нужен режиму `stack`: вернувшееся на стол окно встаёт именно туда.
-    /// Живёт до остановки демона, как геометрия окна до развёртывания.
+    /// workspace → адрес окна → прямоугольник, в котором окно оставили на столе
+    /// этого workspace, в обоих режимах (решение D8): вернувшееся на стол окно
+    /// встаёт именно туда. Живёт до остановки демона, в снимок сессии попадает
+    /// по команде сохранения.
     pub geom: BTreeMap<String, HashMap<String, PxRect>>,
     /// workspace → имя → дополнительное приложение сессии.
     pub extra: BTreeMap<String, BTreeMap<String, ExtraApp>>,
@@ -135,20 +157,29 @@ impl State {
     }
 
     /// Место окна приложения по правилу из спецификации ws-daemon
-    /// («Расстановка окон»): ячейка или `rect`, записанные для приложения
-    /// в workspace; то же, записанное для его семейства; `rect` самого
-    /// приложения; иначе места нет и окно встаёт в центр экрана.
-    /// Прямоугольник передаётся композитору как записан, без отступов от демона.
+    /// («Расстановка окон»): место приложения в раскладке workspace —
+    /// изменённый прямоугольник, а без него исходное место; то же у его
+    /// семейства; `rect` самого приложения; иначе места нет и окно встаёт
+    /// в центр экрана. Прямоугольник передаётся композитору как записан,
+    /// без отступов от демона.
     pub fn rect_for(&mut self, cfg: &Config, ws: &str, app: &str, mon: (i32, i32)) -> Option<PxRect> {
-        let cells = self.cells_of(cfg, ws, mon);
-        let place = cells.get(app).cloned().or_else(|| cfg.family_of(app).and_then(|f| cells.get(f).cloned()));
-        match place {
-            Some(Place::Cell(c)) => {
+        let owner = if self.cells_of(cfg, ws, mon).contains_key(app) { Some(app) } else { cfg.family_of(app).filter(|f| self.cells.get(ws).is_some_and(|c| c.contains_key(*f))) };
+        let Some(entry) = owner else { return Self::app_rect(cfg, app, mon) };
+        if let Some(m) = self.moved.get(ws).and_then(|m| m.get(entry)) {
+            return Some(m.rect);
+        }
+        self.base_rect(cfg, ws, entry, mon)
+    }
+
+    /// Исходное место записи `entry` workspace без изменённого прямоугольника:
+    /// ячейка шаблона или прямоугольник записи. `None` — записи нет.
+    pub fn base_rect(&mut self, cfg: &Config, ws: &str, entry: &str, mon: (i32, i32)) -> Option<PxRect> {
+        match self.cells_of(cfg, ws, mon).get(entry).cloned()? {
+            Place::Cell(c) => {
                 let t = cfg.templates.get(&cfg.workspaces.get(ws)?.template)?;
                 Some(t.cells.get(&c)?.resolve(mon.0, mon.1))
             }
-            Some(Place::Rect { rect }) => Some(rect),
-            None => Self::app_rect(cfg, app, mon),
+            Place::Rect { rect } => Some(rect),
         }
     }
 
@@ -157,13 +188,36 @@ impl State {
         cfg.apps.get(app)?.rect.as_ref().map(|r| r.resolve(mon.0, mon.1))
     }
 
-    /// Приложение, стоящее сейчас в главной ячейке workspace.
+    /// Главное приложение workspace (изменение live-layout, решение D5):
+    /// `State::main`, а при первом обращении — приложение из поля `main`
+    /// раздела, без него — приложение, записанное в ячейку `main` шаблона;
+    /// найденное запоминается в `State::main`. Приложение, которого
+    /// в раскладке больше нет (снята запись сессии), главным не считается,
+    /// и главное ищется заново.
     pub fn main_app(&mut self, cfg: &Config, ws: &str, mon: (i32, i32)) -> Option<String> {
-        let main_cell = cfg.templates.get(&cfg.workspaces.get(ws)?.template)?.main.clone();
-        self.cells_of(cfg, ws, mon)
-            .iter()
-            .find(|(_, p)| matches!(p, Place::Cell(c) if *c == main_cell))
-            .map(|(a, _)| a.clone())
+        let cells = self.cells_of(cfg, ws, mon).clone();
+        if let Some(m) = self.main.get(ws).filter(|m| cells.contains_key(*m)) {
+            return Some(m.clone());
+        }
+        let w = cfg.workspaces.get(ws)?;
+        let main_cell = cfg.templates.get(&w.template).map(|t| t.main.clone());
+        let found = w
+            .main
+            .clone()
+            .filter(|m| cells.contains_key(m))
+            .or_else(|| cells.iter().find(|(_, p)| matches!((p, &main_cell), (Place::Cell(c), Some(mc)) if c == mc)).map(|(a, _)| a.clone()))?;
+        self.main.insert(ws.to_string(), found.clone());
+        Some(found)
+    }
+
+    /// Снять раскладку workspace в памяти (назначение мест, главное
+    /// приложение, изменённые места) и запомненные прямоугольники его окон:
+    /// раскладка соберётся заново из конфига при следующем обращении.
+    pub fn reset_layout(&mut self, ws: &str) {
+        self.cells.remove(ws);
+        self.moved.remove(ws);
+        self.main.remove(ws);
+        self.geom.remove(ws);
     }
 }
 
@@ -222,10 +276,23 @@ impl RestoreEntry {
 
 // ---- Сессия ------------------------------------------------------------------
 
+/// Раскладка workspace в снимке (изменение live-layout, решения D13, D14):
+/// исходные места приложений, главное приложение, изменённые места
+/// и дополнительные приложения сессии. Поля `main` и `moved` необязательные:
+/// снимок прежнего формата читается без них, а прежняя версия демона их
+/// пропускает.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionWorkspace {
+    /// Главное приложение workspace. Простое поле идёт первым: TOML требует,
+    /// чтобы вложенные таблицы шли после простых полей.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub main: Option<String>,
     #[serde(default)]
     pub cells: BTreeMap<String, Place>,
+    /// Изменённые места: приложение → прямоугольник. Владелец места (адрес
+    /// окна) в снимок не пишется: адрес не переживает перезагрузку.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub moved: BTreeMap<String, PxRect>,
     /// Дополнительные приложения сессии этого workspace. Поле необязательное:
     /// снимок прежнего формата читается без ошибки.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -234,8 +301,9 @@ pub struct SessionWorkspace {
 
 /// Окно в снимке: окно приложения либо постороннее (с командой и каталогом).
 /// Окно приложения записывается экземпляром (изменение session-instances,
-/// решение D1): номер, workspace по тегам состава и прямоугольники режима
-/// `stack`; командная строка у него есть только по решению D2. Поля
+/// решение D1): номер, workspace по тегам состава и прямоугольники по всем
+/// его workspace (изменение live-layout, решение D13); командная строка
+/// у него есть только по решению D2. Поля
 /// необязательные: снимок прежнего формата читается, а прежняя версия демона
 /// пропускает новые поля.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -259,7 +327,8 @@ pub struct SessionWindow {
     pub cmd: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
-    /// workspace режима `stack` → прямоугольник, запомненный для него.
+    /// workspace окна → прямоугольник, в котором окно оставлено на столе
+    /// этого workspace, в обоих режимах.
     /// Таблица пишется последней: TOML требует, чтобы вложенные таблицы
     /// шли после простых полей.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -373,6 +442,78 @@ chromium = "left"
         let mut st = State::default();
         st.cells_of(&cfg, "work", mon).insert("herdr".into(), Place::Cell("left".into()));
         assert_eq!(st.rect_for(&cfg, "work", "herdr", mon), Some(PxRect { x: -805, y: 10, w: 1920, h: 2140 }));
+    }
+
+    #[test]
+    fn rect_for_prefers_moved_place() {
+        let cfg = Config::parse(CFG).unwrap();
+        let mon = (3840, 2160);
+        let mut st = State::default();
+        let moved = PxRect { x: 400, y: 300, w: 1400, h: 1000 };
+        st.moved.entry("work".into()).or_default().insert("wezterm".into(), Moved { rect: moved, owner: None });
+        // Изменённое место побеждает ячейку.
+        assert_eq!(st.rect_for(&cfg, "work", "wezterm", mon), Some(moved));
+        // Вариант без своей записи берёт изменённое место семейства.
+        assert_eq!(st.rect_for(&cfg, "work", "herdr", mon), Some(moved));
+        // Исходное место без изменённого.
+        assert_eq!(st.base_rect(&cfg, "work", "wezterm", mon), Some(PxRect { x: 1125, y: 10, w: 1920, h: 2140 }));
+        // Изменённое место у варианта со своей записью — его собственное.
+        st.cells_of(&cfg, "work", mon).insert("herdr".into(), Place::Cell("left".into()));
+        assert_eq!(st.rect_for(&cfg, "work", "herdr", mon), Some(PxRect { x: -805, y: 10, w: 1920, h: 2140 }));
+        // Приложение вне workspace — свой rect, изменённые места не при чём.
+        assert_eq!(st.rect_for(&cfg, "work", "neovide", mon), Some(PxRect { x: 2600, y: 1500, w: 600, h: 400 }));
+    }
+
+    #[test]
+    fn main_app_is_explicit() {
+        let cfg = Config::parse(&CFG.replace("apps = { wezterm = \"center\" }", "apps = { wezterm = \"center\", neovide = \"right\" }")).unwrap();
+        let mon = (3840, 2160);
+        let mut st = State::default();
+        // Поле main раздела при первом обращении.
+        assert_eq!(st.main_app(&cfg, "work", mon).as_deref(), Some("wezterm"));
+        assert_eq!(st.main.get("work").map(String::as_str), Some("wezterm"));
+        // После записи workspace место главного — rect, ячейки main нет
+        // ни у кого, а главное приложение — по полю main.
+        let text = CFG.replace("apps = { wezterm = \"center\" }", "apps = { wezterm = { rect = { x = 1125, y = 10, w = 2400, h = 2140 } }, neovide = \"right\" }");
+        let cfg = Config::parse(&text).unwrap();
+        let mut st = State::default();
+        assert_eq!(st.main_app(&cfg, "work", mon).as_deref(), Some("wezterm"));
+        // State::main главнее поля раздела.
+        st.main.insert("work".into(), "neovide".into());
+        assert_eq!(st.main_app(&cfg, "work", mon).as_deref(), Some("neovide"));
+        // Приложения нет в раскладке — главное ищется заново.
+        st.cells_of(&cfg, "work", mon).remove("neovide");
+        assert_eq!(st.main_app(&cfg, "work", mon).as_deref(), Some("wezterm"));
+        // Без поля main — приложение, записанное в ячейку main шаблона.
+        let cfg = Config::parse(&CFG.replace("main = \"wezterm\"\n", "")).unwrap();
+        let mut st = State::default();
+        assert_eq!(st.main_app(&cfg, "work", mon).as_deref(), Some("wezterm"));
+        // Снятие раскладки забывает и главное приложение.
+        st.reset_layout("work");
+        assert!(st.main.is_empty() && st.cells.is_empty());
+    }
+
+    #[test]
+    fn session_workspace_layout_roundtrip() {
+        let r = PxRect { x: 400, y: 300, w: 1400, h: 1000 };
+        let mut s = Session { saved: "t".into(), active_desktop: 1, ..Session::default() };
+        let w = s.workspaces.entry("work".into()).or_default();
+        w.main = Some("chrome-ai".into());
+        w.cells.insert("chrome-ai".into(), Place::Cell("center".into()));
+        w.moved.insert("herdr".into(), r);
+        let text = toml::to_string_pretty(&s).unwrap();
+        let back: Session = toml::from_str(&text).unwrap();
+        assert_eq!(back.workspaces["work"].main.as_deref(), Some("chrome-ai"));
+        assert_eq!(back.workspaces["work"].moved["herdr"], r);
+        assert_eq!(back.workspaces["work"].cells["chrome-ai"], Place::Cell("center".into()));
+        // Пустые поля не пишутся.
+        let bare = Session { workspaces: BTreeMap::from([("surf".to_string(), SessionWorkspace::default())]), ..Session::default() };
+        let text = toml::to_string_pretty(&bare).unwrap();
+        assert!(!text.contains("main") && !text.contains("moved"), "{text}");
+        // Снимок прежнего формата читается без них.
+        let old = "saved = \"t\"\nactive_desktop = 1\n[workspaces.work.cells]\nchromium = \"left\"\n";
+        let s: Session = toml::from_str(old).unwrap();
+        assert!(s.workspaces["work"].main.is_none() && s.workspaces["work"].moved.is_empty());
     }
 
     #[test]

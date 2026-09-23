@@ -16,7 +16,7 @@ use crate::config::{Config, Mode, Placement, PxRect, WsApp, config_path};
 use crate::keys::same_chain;
 use crate::hypr::{self, Client, Event, Hypr};
 use crate::session;
-use crate::state::{Cycle, Desktop, ExtraApp, Foreign, Place, RestoreEntry, RestoreState, State};
+use crate::state::{Cycle, Desktop, ExtraApp, Foreign, Moved, Place, RestoreEntry, RestoreState, State};
 
 /// Куда поставить окно после появления.
 #[derive(Debug, Clone)]
@@ -357,15 +357,25 @@ impl Daemon {
             Ok(cfg) => {
                 let old = std::mem::replace(&mut self.cfg_file, cfg);
                 self.cfg_text = std::fs::read_to_string(&self.cfg_path).unwrap_or_default();
-                // Назначения ячеек снимаются у workspace, чей раздел изменился
-                // или исчез: правка файла возвращает расстановку, а обмен ячеек
-                // в нетронутых workspace сохраняется.
-                keep_cells(&old, &self.cfg_file, &mut self.st.cells);
+                // Раскладка снимается у workspace, чей раздел изменился или
+                // исчез: правка файла возвращает расстановку, а обмен мест
+                // и сдвинутые окна в нетронутых workspace сохраняются.
+                let changed = keep_layout(&old, &self.cfg_file, &mut self.st);
                 self.rebuild_cfg();
                 self.drop_stale_pending();
                 self.free_stale_tagged();
                 self.sync_membership(false);
                 log::info!("конфиг перечитан: {} workspace, {} приложений", self.cfg.workspaces.len(), self.cfg.apps.len());
+                // Поднятие окна на столе больше не двигает (решение D8),
+                // поэтому новая раскладка изменённого раздела применяется
+                // сразу там, где workspace активен (решение D12).
+                for ws in changed {
+                    if let Some(n) = self.active_desktop_of(&ws)
+                        && let Err(e) = self.apply_layout(&ws, n)
+                    {
+                        log::warn!("раскладка {ws} после перечитывания конфига: {e:#}");
+                    }
+                }
                 reload_hypr_binds();
                 self.broadcast();
             }
@@ -388,7 +398,11 @@ impl Daemon {
             if let Some(cells) = self.st.cells.get_mut(&ws) {
                 cells.remove(&name);
             }
+            if let Some(m) = self.st.moved.get_mut(&ws) {
+                m.remove(&name);
+            }
         }
+        self.st.moved.retain(|_, m| !m.is_empty());
         self.st.extra.retain(|_, apps| !apps.is_empty());
         // У workspace, назначения которого уже собраны, дополнительное
         // приложение иначе осталось бы без места. Места приложений, уже
@@ -503,6 +517,15 @@ impl Daemon {
             Event::CloseWindow { addr } => {
                 self.st.foreign.remove(&addr);
                 self.forget_window(&addr);
+                // Закрытое окно уже не прочитать у композитора: изменённые
+                // места, снятые с него, ищутся по владельцу (решение D9).
+                match self.hypr.clients() {
+                    Ok(mut clients) => {
+                        clients.retain(|c| c.address != addr);
+                        self.drop_moved_of(&addr, &clients, "окно закрыто");
+                    }
+                    Err(e) => log::warn!("закрытие окна {addr}: {e:#}"),
+                }
                 self.broadcast();
             }
             Event::MoveWindow { .. } => self.broadcast(),
@@ -554,19 +577,13 @@ impl Daemon {
         if plan.is_empty() {
             return Ok(());
         }
-        let stack = cfg.workspaces.get(&ws).map(|w| w.mode()) == Some(Mode::Stack);
         let mut ex = Vec::new();
         for f in &plan {
-            if let Some((v, r)) = &f.leave {
-                self.st.geom.entry(v.clone()).or_default().insert(f.addr.clone(), *r);
-            }
             ex.push(hypr::d_move_to(&f.addr, &n.to_string()));
             if let Some(r) = f.rect {
                 ex.extend(hypr::d_place(&f.addr, r));
             }
-            if stack {
-                self.st.geom.entry(ws.clone()).or_default().insert(f.addr.clone(), f.rect.unwrap_or(f.now));
-            }
+            self.st.geom.entry(ws.clone()).or_default().insert(f.addr.clone(), f.rect.unwrap_or(f.now));
         }
         if let Some(a) = self.hypr.active_window()?.filter(|c| c.desktop() == Some(n)) {
             ex.push(hypr::d_raise(&a.address));
@@ -593,10 +610,22 @@ impl Daemon {
             }
         };
         let mut ex = Vec::new();
-        for (addr, w) in stale_ws_tags(&self.cfg, &clients) {
-            let c = clients.iter().find(|c| c.address == addr);
+        let stale = stale_ws_tags(&self.cfg, &clients);
+        for (addr, w) in &stale {
+            let c = clients.iter().find(|c| c.address == *addr);
             log::info!("окно {addr} ({}): тег ws:{w} снят — workspace {w} не описывает его приложение {}", c.map(|c| c.class.as_str()).unwrap_or(""), c.and_then(|c| c.app()).unwrap_or_else(|| "(нет)".into()));
-            ex.push(hypr::d_untag(&addr, &hypr::ws_tag(&w)));
+            ex.push(hypr::d_untag(addr, &hypr::ws_tag(w)));
+        }
+        // Окно, снятое сверкой состава, больше не держит изменённое место
+        // своего приложения в этом workspace (решение D9).
+        let mut after = clients.clone();
+        for (addr, w) in &stale {
+            if let Some(c) = after.iter_mut().find(|c| c.address == *addr) {
+                c.tags.retain(|t| hypr::parse_ws_tag(t).as_deref() != Some(w.as_str()));
+            }
+        }
+        for (addr, _) in &stale {
+            self.drop_moved_of(addr, &after, "окно снято сверкой состава");
         }
         if derive {
             let given = derive_membership(&self.cfg, &self.st, &clients);
@@ -712,6 +741,12 @@ impl Daemon {
                     ex.push(hypr::d_move_to(&c.address, &p.desktop.to_string()));
                 }
                 ex.extend(hypr::d_place(&c.address, *r));
+                // Окно встало на место своего приложения: запомнить его
+                // прямоугольник и отдать окну место без владельца (решения D8, D9).
+                if let Some(w) = &p.workspace {
+                    self.st.geom.entry(w.clone()).or_default().insert(c.address.clone(), *r);
+                    claim_owner(&mut self.st, &self.cfg, w, &p.app, &c.address);
+                }
             }
             Target::Free(rect) => {
                 if c.desktop() != Some(p.desktop) {
@@ -741,7 +776,7 @@ impl Daemon {
             && p.desktop == self.current
         {
             // Новое окно забирает фокус у композитора; возвращаем его главному окну workspace.
-            let main = self.cfg.workspaces.get(ws).and_then(|w| w.main.clone()).or_else(|| self.st.main_app(&self.cfg, ws, self.mon));
+            let main = self.st.main_app(&self.cfg, ws, self.mon);
             if let Some(m) = main
                 && m != p.app
                 && let Some(mw) = first_window(&self.cfg, &clients, &m)
@@ -777,10 +812,13 @@ impl Daemon {
         if let Some(r) = rect {
             ex.extend(hypr::d_place(&c.address, r));
         }
-        // В режиме `stack` прямоугольник окна запоминается сразу (design D9):
-        // ушедшее на `special:pool` и вернувшееся окно встанет туда же.
-        if let Some(w) = ws.clone().filter(|w| cfg.workspaces.get(w).map(|x| x.mode()) == Some(Mode::Stack)) {
-            self.st.geom.entry(w).or_default().insert(c.address.clone(), rect.unwrap_or_else(|| c.rect()));
+        // Прямоугольник окна запоминается сразу в обоих режимах (изменение
+        // live-layout, решение D8): ушедшее на `special:pool` и вернувшееся
+        // окно встанет туда же. Изменённое место без владельца (раскладка
+        // из снимка) достаётся этому окну (решение D9).
+        if let Some(w) = ws.clone().filter(|_| c.desktop().is_some()) {
+            self.st.geom.entry(w.clone()).or_default().insert(c.address.clone(), rect.unwrap_or_else(|| c.rect()));
+            claim_owner(&mut self.st, &cfg, &w, app, &c.address);
         }
         log::info!("новое окно {} ({}, «{}») → приложение {app}, экземпляр {num}, workspace {}", c.address, c.class, c.title, ws.as_deref().unwrap_or("нет"));
         self.hypr.dispatch_all(&ex)
@@ -845,6 +883,10 @@ impl Daemon {
             return Ok(());
         };
         let addr = c.address.clone();
+        // Окно уходит со стола своего workspace: раскладка снимается до этого,
+        // и место, которое окно оставляет, остаётся у остальных окон
+        // приложения (решения D4, D9).
+        self.absorb(&w, n, &clients);
         let (app, drop_extra, last) = match &step {
             DetachStep::Skip(why) => {
                 log::info!("отделение окна: {why}");
@@ -861,6 +903,11 @@ impl Daemon {
         if let Some(g) = self.st.geom.get_mut(&w) {
             g.remove(&addr);
         }
+        let mut after = clients.clone();
+        if let Some(x) = after.iter_mut().find(|x| x.address == addr) {
+            x.tags.retain(|t| hypr::parse_ws_tag(t).as_deref() != Some(w.as_str()));
+        }
+        self.drop_moved_of(&addr, &after, "окно отделено");
         match step {
             DetachStep::Leave { home, .. } => {
                 let mut ex = vec![hypr::d_untag(&addr, &hypr::ws_tag(&w))];
@@ -1059,7 +1106,6 @@ impl Daemon {
         self.st.lazy.remove(&n);
         let w = self.cfg.workspaces[ws].clone();
         let apps: Vec<String> = w.apps.keys().cloned().collect();
-        let stack = w.mode() == Mode::Stack;
         // Экземпляры снимка с командной строкой, входящие в `ws`, запускаются
         // раньше захвата и запуска приложений (решения D4, D11).
         let launch: Vec<usize> = self.st.restore.iter().enumerate().filter(|(_, e)| e.state == RestoreState::Waiting && !e.cmd.is_empty() && e.workspaces.iter().any(|x| x == ws)).map(|(i, _)| i).collect();
@@ -1075,10 +1121,16 @@ impl Daemon {
         let held: Vec<String> = steps.iter().filter(|(_, s)| **s != RaiseStep::Normal).map(|(a, _)| a.clone()).collect();
         self.share_windows(&mut clients, ws, &apps, &held)?;
         let before = actives(&self.st);
-        // Вытесняемый workspace запоминает, где оставлены его окна: в режиме
-        // `stack` следующее поднятие вернёт их именно туда.
-        if let Some(old) = before.get(&n).filter(|a| *a != ws).cloned() {
-            self.remember_geometry(&old, n, &clients);
+        // Раскладка снимается с экрана до того, как окна уйдут со столов
+        // (изменение live-layout, решение D4): у workspace, активного
+        // на целевом столе (вытесняемого или того же), и у переносимого
+        // с прежнего стола. Следующее поднятие вернёт окна туда, где их
+        // оставили, в обоих режимах.
+        if let Some(old) = before.get(&n).cloned() {
+            self.absorb(&old, n, &clients);
+        }
+        if let Some(k) = was_on.filter(|k| *k != n) {
+            self.absorb(ws, k, &clients);
         }
         // Активные workspace столов после поднятия: по ним правило размещения
         // решает, где стоять окнам.
@@ -1095,7 +1147,7 @@ impl Daemon {
         let mut main_addr: Option<String> = None;
         // Окна workspace, которым демон задаёт порядок по глубине.
         let mut members: Vec<String> = Vec::new();
-        let main_app = w.main.clone().or_else(|| self.st.main_app(&cfg, ws, self.mon));
+        let main_app = self.st.main_app(&cfg, ws, self.mon);
         for app in &apps {
             let rect = self.st.rect_for(&cfg, ws, app, self.mon);
             // Переезжают и расставляются окна всех экземпляров приложения,
@@ -1144,8 +1196,13 @@ impl Daemon {
                 // стола: встаёт в состояние, запомненное для него (решение D13).
                 let arriving = arrives(c, n, &before, ws);
                 if moving {
-                    if let Some((v, r)) = leave_geom(&cfg, &before, c, Some(ws)) {
-                        self.st.geom.entry(v).or_default().insert(c.address.clone(), r);
+                    // Окно уходит со стола другого своего workspace: его
+                    // раскладку снимает `absorb` до ухода.
+                    if let Some(k) = c.desktop()
+                        && let Some(v) = before.get(&k).filter(|v| *v != ws && c.in_ws(v))
+                    {
+                        let v = v.clone();
+                        self.absorb(&v, k, &clients);
                     }
                     ex.push(hypr::d_move_to(&c.address, &n.to_string()));
                 }
@@ -1153,12 +1210,13 @@ impl Daemon {
                 // сохраняет прямоугольник, прочитанный у композитора до переноса.
                 let carried = moving_ws && c.desktop() == was_on;
                 let kept = self.st.geom.get(ws).and_then(|g| g.get(&c.address)).copied();
-                let target = raise_target(carried, stack, arriving, kept, rect, c.rect());
+                let target = raise_target(carried, arriving, kept, rect, c.rect());
                 if let Some(r) = target {
                     ex.extend(hypr::d_place(&c.address, r));
                 }
-                if stack {
-                    self.st.geom.entry(ws.to_string()).or_default().insert(c.address.clone(), target.unwrap_or_else(|| c.rect()));
+                self.st.geom.entry(ws.to_string()).or_default().insert(c.address.clone(), target.unwrap_or_else(|| c.rect()));
+                if target.is_some() && target == rect {
+                    claim_owner(&mut self.st, &cfg, ws, app, &c.address);
                 }
                 if main_app.as_deref() == Some(app) && main_addr.is_none() {
                     // Фокус получает первый экземпляр; наверх он поднимается
@@ -1199,8 +1257,9 @@ impl Daemon {
     }
 
     /// Увести окно на стол `k`, где активен другой его workspace, и поставить
-    /// в состояние, запомненное для того workspace (решение D6). Диспетчеры
-    /// дописываются в `ex`.
+    /// в состояние, запомненное для того workspace (решение D6). Раскладку
+    /// workspace, со стола которого окно уходит, вызывающий снимает заранее
+    /// (изменение live-layout, решение D4). Диспетчеры дописываются в `ex`.
     fn send_to(&mut self, c: &Client, k: u8, active: &BTreeMap<u8, String>, ex: &mut Vec<String>) {
         ex.push(hypr::d_move_to(&c.address, &k.to_string()));
         let Some(v) = active.get(&k).cloned() else { return };
@@ -1209,9 +1268,7 @@ impl Daemon {
         if let Some(r) = r {
             ex.extend(hypr::d_place(&c.address, r));
         }
-        if cfg.workspaces.get(&v).map(|w| w.mode()) == Some(Mode::Stack) {
-            self.st.geom.entry(v.clone()).or_default().insert(c.address.clone(), r.unwrap_or_else(|| c.rect()));
-        }
+        self.st.geom.entry(v.clone()).or_default().insert(c.address.clone(), r.unwrap_or_else(|| c.rect()));
         log::info!("окно {} ({}) уходит на стол {k} к workspace {v}", c.address, c.class);
     }
 
@@ -1248,23 +1305,54 @@ impl Daemon {
         self.cfg.workspaces.get(ws).map(|w| w.apps.keys().cloned().collect()).unwrap_or_default()
     }
 
-    /// Запомнить, где стоят окна workspace на его столе `n`, прежде чем
-    /// увести их со стола: в режиме `stack` поднятие вернёт их именно туда.
-    /// Общее окно, ушедшее за пользователем на другой стол, стоит там
-    /// в состоянии другого workspace, поэтому берутся только окна стола `n`.
-    /// В режиме обмена ячеек место задаёт конфиг, и запоминать нечего.
-    fn remember_geometry(&mut self, ws: &str, n: u8, clients: &[Client]) {
-        if self.cfg.workspaces.get(ws).map(|w| w.mode()) != Some(Mode::Stack) {
-            return;
-        }
-        for c in ws_windows(clients, ws).into_iter().filter(|c| c.desktop() == Some(n)) {
-            self.st.geom.entry(ws.to_string()).or_default().insert(c.address.clone(), c.rect());
+    /// Снять раскладку workspace `ws` со стола `n` (изменение live-layout,
+    /// решения D2–D4, `absorb_into`): изменённые места приложений и
+    /// прямоугольники окон читаются из списка окон, который действие и так
+    /// получило у композитора. На столе, где `ws` не активен, ничего не делает.
+    pub fn absorb(&mut self, ws: &str, n: u8, clients: &[Client]) {
+        let cfg = self.cfg.clone();
+        absorb_into(&cfg, &mut self.st, ws, n, clients, self.mon);
+    }
+
+    /// Вернуть к описанию изменённые места, снятые с окна `addr`
+    /// (`drop_moved`), со строкой в журнале о каждом снятом месте.
+    fn drop_moved_of(&mut self, addr: &str, clients: &[Client], why: &str) {
+        let cfg = self.cfg.clone();
+        for (ws, entry) in drop_moved(&mut self.st, &cfg, addr, clients) {
+            log::info!("{ws}: {why} ({addr}), окон {entry} в workspace не осталось — место {entry} возвращается к описанию");
         }
     }
 
-    /// Обмен ячеек: приложение занимает главную ячейку, прежнее главное — его.
-    /// Стопки меняются целиком, остальные окна не двигаются. Диспетчеры
-    /// дописываются в `ex`, чтобы обмен и фокус ушли одной последовательностью.
+    /// Применить раскладку `ws`, собранную заново после правки конфига,
+    /// на столе `n`, где он активен (изменение live-layout, решение D12):
+    /// окна `ws` на этом столе встают на места из новой раскладки, фокус
+    /// и порядок по глубине не меняются, прямоугольники запоминаются.
+    fn apply_layout(&mut self, ws: &str, n: u8) -> Result<()> {
+        let clients = self.hypr.clients()?;
+        let cfg = self.cfg.clone();
+        let ws_apps = self.ws_apps(ws);
+        let mut ex = Vec::new();
+        let mut count = 0;
+        for c in ws_windows(&clients, ws).into_iter().filter(|c| c.desktop() == Some(n) && c.fullscreen == 0) {
+            let Some(app) = ws_app_of(&cfg, ws, &ws_apps, c) else { continue };
+            let Some(r) = self.st.rect_for(&cfg, ws, &app, self.mon) else { continue };
+            self.st.geom.entry(ws.to_string()).or_default().insert(c.address.clone(), r);
+            if c.rect() != r {
+                ex.extend(hypr::d_place(&c.address, r));
+                count += 1;
+            }
+        }
+        self.hypr.dispatch_all(&ex)?;
+        log::info!("{ws}: раскладка собрана заново из конфига и применена на столе {n}, сдвинуто окон {count}");
+        Ok(())
+    }
+
+    /// Обмен мест (изменение live-layout, решение D5): вызванное приложение
+    /// и главное меняются местами целиком — исходным местом и изменённым
+    /// прямоугольником, — вызванное становится главным, окна обоих встают
+    /// в прямоугольники новых мест стопкой. Остальные окна не двигаются.
+    /// Раскладку перед обменом снимает цикл. Диспетчеры дописываются в `ex`,
+    /// чтобы обмен и фокус ушли одной последовательностью.
     fn swap_to_main(&mut self, ws: &str, app: &str, clients: &[Client], ex: &mut Vec<String>) {
         let cfg = self.cfg.clone();
         let ws_apps = self.ws_apps(ws);
@@ -1276,22 +1364,31 @@ impl Daemon {
         // Обмен виден потом в снимке сессии и в записи workspace, поэтому
         // след в журнале нужен: иначе причину перестановки не восстановить.
         log::info!("{ws}: {app} становится главным, прежнее главное — {}", main_app.as_deref().unwrap_or("нет"));
-        swap_cells(self.st.cells_of(&cfg, ws, self.mon), main_app.as_deref(), app, &main_cell);
+        self.st.cells_of(&cfg, ws, self.mon);
+        let has_windows = |name: &str| !placed_windows(&cfg, clients, ws, &ws_apps, name).is_empty();
+        swap_places(&mut self.st, ws, main_app.as_deref(), app, &main_cell, &has_windows);
         let n = self.current;
         for name in [main_app.as_deref(), Some(app)].into_iter().flatten() {
             let Some(r) = self.st.rect_for(&cfg, ws, name, self.mon) else { continue };
-            for c in placed_windows(&cfg, clients, ws, &ws_apps, name).iter().filter(|c| !c.on_hidden()) {
+            let wins: Vec<&Client> = placed_windows(&cfg, clients, ws, &ws_apps, name).into_iter().filter(|c| !c.on_hidden()).collect();
+            for c in &wins {
                 if c.desktop() != Some(n) {
                     ex.push(hypr::d_move_to(&c.address, &n.to_string()));
                 }
                 ex.extend(hypr::d_place(&c.address, r));
+                self.st.geom.entry(ws.to_string()).or_default().insert(c.address.clone(), r);
+            }
+            // Изменённое место теперь занимает окно этого приложения: его
+            // закрытие и вернёт место к описанию (решение D9).
+            if let (Some(m), Some(c)) = (self.st.moved.get_mut(ws).and_then(|m| m.get_mut(name)), wins.first()) {
+                m.owner = Some(c.address.clone());
             }
         }
     }
 
     /// Выбрать окно (спецификация ws-daemon, «Цепочка приложения»): при
-    /// `swap` — режим обмена ячеек вызванного приложения — приложение окна
-    /// сначала занимает главную ячейку; без него окно только поднимается
+    /// `swap` — режим обмена мест вызванного приложения — приложение окна
+    /// сначала занимает главное место; без него окно только поднимается
     /// наверх и получает фокус. Режим задаёт вызванное приложение, а не
     /// workspace (изменение workspace-overrides, решение D7); без обмена
     /// выбирается и окно, только что открытое или перетащенное в workspace
@@ -1321,10 +1418,15 @@ impl Daemon {
         let fresh = start != Start::Continue;
         let mut clients = self.hypr.clients()?;
         self.adopt_untagged(&mut clients, std::slice::from_ref(&app.to_string()), Some(ws))?;
+        // Раскладка снимается с экрана перед выбором шага (изменение
+        // live-layout, решение D4): сдвинутое окно отдаёт свой прямоугольник
+        // месту своего приложения, и обмен мест идёт уже по нему.
+        let n = self.current;
+        self.absorb(ws, n, &clients);
         let cfg = self.cfg.clone();
         let ws_apps = self.ws_apps(ws);
         // Весь цикл идёт в режиме вызванного приложения (решение D7), а обмен
-        // ячеек переносит запись, которая его описывает: у варианта без своей
+        // мест переносит запись, которая его описывает: у варианта без своей
         // записи это запись семейства (решение D6).
         let (mode, entry) = cycle_mode(&cfg, ws, app);
         let swap = mode == Mode::Swap;
@@ -1338,7 +1440,13 @@ impl Daemon {
         }
         let active = self.hypr.active_window()?.map(|c| c.address);
         let on_instance = active.as_deref().is_some_and(|a| order.iter().any(|x| x == a));
-        if fresh || !on_instance {
+        // В режиме обмена мест нажатие клавиши неглавного приложения начинает
+        // цикл заново (изменение live-layout, решение D7): выбрать экземпляр —
+        // значит поставить приложение на главное место. Нажатия, которое
+        // открыло или перетащило приложение, правило не касается.
+        let is_main = self.st.main_app(&cfg, ws, self.mon).as_deref() == Some(entry.as_str());
+        let restart = if swap && start != Start::Joined { swap_start(&order, active.as_deref(), is_main) } else { None };
+        if fresh || !on_instance || restart.is_some() {
             // Начало цикла: запомнить окно, к которому вернёт его конец.
             let main_window = swap
                 .then(|| self.st.main_app(&cfg, ws, self.mon))
@@ -1357,18 +1465,21 @@ impl Daemon {
             .and_then(|c| c.back.clone())
             .filter(|a| clients.iter().any(|c| c.address == *a && !c.on_hidden()));
         let next = next_app_window(&cfg, &clients, ws, &entry);
-        match cycle_step(&order, active.as_deref(), fresh, prev.as_deref(), next.as_deref()) {
+        let step = match restart {
+            Some(addr) => CycleStep::Select(addr),
+            None => cycle_step(&order, active.as_deref(), fresh, prev.as_deref(), next.as_deref()),
+        };
+        match step {
             CycleStep::Launch => {
-                // Запуск — это тоже выбор экземпляра: в режиме обмена ячеек
-                // приложение сначала занимает главную ячейку, и окно появляется
-                // уже в ней, а прежнее главное уходит в ячейку приложения.
+                // Запуск — это тоже выбор экземпляра: в режиме обмена мест
+                // приложение сначала занимает главное место, и окно появляется
+                // уже на нём, а прежнее главное уходит на место приложения.
                 let mut ex = Vec::new();
                 if swap {
                     self.swap_to_main(ws, &entry, &clients, &mut ex);
                 }
                 self.hypr.dispatch_all(&ex)?;
                 let rect = self.st.rect_for(&cfg, ws, app, self.mon);
-                let n = self.current;
                 self.spawn(app, Some(ws), n, rect.map(Target::Place).unwrap_or(Target::Free(None)), true)
             }
             CycleStep::Select(addr) => self.select_window(ws, &addr, &clients, swap && start != Start::Joined),
@@ -1529,7 +1640,6 @@ impl Daemon {
             }
         }
         let before = actives(&self.st);
-        let stack = cfg.workspaces.get(ws).map(|w| w.mode()) == Some(Mode::Stack);
         let mut ex = Vec::new();
         for c in &take {
             if !c.in_ws(ws) {
@@ -1537,16 +1647,22 @@ impl Daemon {
                 log::info!("workspace {ws}: окно {} ({}) приложения {app} входит в него{}", c.address, c.class, if c.has_ws() { format!(", оставаясь в {}", c.workspaces().join(", ")) } else { String::new() });
             }
             if c.desktop() != Some(n) {
-                if let Some((v, r)) = leave_geom(&cfg, &before, c, Some(ws)) {
-                    self.st.geom.entry(v).or_default().insert(c.address.clone(), r);
+                // Окно уходит со стола другого своего workspace: раскладка
+                // того workspace снимается до ухода (решение D4).
+                if let Some(k) = c.desktop()
+                    && let Some(v) = before.get(&k).filter(|v| *v != ws && c.in_ws(v))
+                {
+                    let v = v.clone();
+                    self.absorb(&v, k, &clients);
                 }
                 ex.push(hypr::d_move_to(&c.address, &n.to_string()));
             }
             ex.extend(hypr::d_place(&c.address, rect));
-            if stack {
-                self.st.geom.entry(ws.to_string()).or_default().insert(c.address.clone(), rect);
-            }
+            self.st.geom.entry(ws.to_string()).or_default().insert(c.address.clone(), rect);
             self.st.foreign.remove(&c.address);
+        }
+        if let Some(c) = take.first() {
+            claim_owner(&mut self.st, &cfg, ws, app, &c.address);
         }
         self.hypr.dispatch_all(&ex)?;
         self.cycle(ws, app, Start::Joined)
@@ -1620,8 +1736,9 @@ impl Daemon {
     }
 
     /// Расставить окна текущего стола по описанию активного workspace
-    /// (спецификация ws-daemon, «Расстановка по команде»). Назначения ячеек
-    /// команда не меняет: окна встают по тем местам, которые назначены сейчас.
+    /// (спецификация ws-daemon, «Расстановка по команде»). Назначение мест
+    /// и главное приложение команда не меняет: окна встают на исходные места,
+    /// которые назначены сейчас.
     fn arrange(&mut self) -> Result<()> {
         // Расстановка тоже действует на стол, где пользователь сейчас,
         // поэтому стол берётся у композитора, а не из кэша.
@@ -1637,7 +1754,10 @@ impl Daemon {
             log::info!("расстановка на столе {n}: окон нет");
             return Ok(());
         }
-        let plan = arrange_plan(&mut self.st, &cfg, ws.as_deref(), &windows, self.mon);
+        // Расстановка возвращает раскладку к описанию (изменение live-layout,
+        // решение D10): изменённые места снимаются, запомненные прямоугольники
+        // окон заменяются местами плана; обмен мест сохраняется.
+        let plan = arrange_layout(&mut self.st, &cfg, ws.as_deref(), &windows, self.mon);
         let mut ex: Vec<String> = plan.iter().flat_map(|(addr, r)| hypr::d_place(addr, *r)).collect();
         // Фокус остаётся у активного окна, а само окно поднимается наверх своей стопки.
         if let Some(a) = self.hypr.active_window()?.filter(|c| c.desktop() == Some(n)).map(|c| c.address) {
@@ -1646,16 +1766,6 @@ impl Daemon {
         }
         self.hypr.dispatch_all(&ex)?;
         log::info!("расстановка на столе {n}: окон {}, workspace {}", plan.len(), ws.as_deref().unwrap_or("нет"));
-        // В режиме `stack` запомненные прямоугольники сменяются местами
-        // из конфига: вернуть окна к описанию — и есть смысл команды.
-        if let Some(w) = ws.filter(|w| cfg.workspaces.get(w).map(|x| x.mode()) == Some(Mode::Stack)) {
-            let ws_apps = self.ws_apps(&w);
-            for (addr, r) in &plan {
-                if clients.iter().any(|c| c.address == *addr && ws_app_of(&cfg, &w, &ws_apps, c).is_some()) {
-                    self.st.geom.entry(w.clone()).or_default().insert(addr.clone(), *r);
-                }
-            }
-        }
         self.broadcast();
         Ok(())
     }
@@ -1675,13 +1785,17 @@ impl Daemon {
     /// на `special:pool`.
     pub fn remove(&mut self, ws: &str, desktop: Option<u8>) -> Result<()> {
         let n = desktop.unwrap_or(self.current);
+        let was_active = self.st.desktops.get(&n).and_then(|d| d.active.as_deref()) == Some(ws);
+        // Окна уходят со стола: раскладка снимается, пока workspace ещё
+        // активен (решение D4).
+        let clients = if was_active { Some(self.hypr.clients()?) } else { None };
+        if let Some(clients) = &clients {
+            self.absorb(ws, n, clients);
+        }
         let d = self.st.desktop(n);
         d.workspaces.retain(|w| w != ws);
-        let was_active = d.active.as_deref() == Some(ws);
-        if was_active {
-            d.active = None;
-            let clients = self.hypr.clients()?;
-            self.remember_geometry(ws, n, &clients);
+        if let Some(clients) = clients {
+            self.st.desktop(n).active = None;
             let after = actives(&self.st);
             let cur = self.current;
             let mut ex = Vec::new();
@@ -1730,7 +1844,8 @@ impl Daemon {
     /// свободен (`retag`; без него номер окна сохраняется — загрузка сессии),
     /// теги состава ровно тех workspace записи, которые описывают приложение
     /// (лишние снимаются), место по `restore_place`, прямоугольники записи —
-    /// в память режима `stack`. Возвращает диспетчеры, куда окно ушло и номер.
+    /// в память окна по всем его workspace (изменение live-layout, решение
+    /// D13). Возвращает диспетчеры, куда окно ушло и номер.
     fn instance_ex(&mut self, c: &Client, clients: &[Client], e: &RestoreEntry, retag: bool) -> (Vec<String>, Home, u32) {
         let cfg = self.cfg.clone();
         let addr = c.address.clone();
@@ -1765,10 +1880,10 @@ impl Daemon {
             self.st.geom.entry(w.clone()).or_default().insert(addr.clone(), *r);
         }
         if let Home::Desktop(k) = home
-            && let Some(w) = act.get(&k)
-            && cfg.workspaces.get(w).map(|x| x.mode()) == Some(Mode::Stack)
+            && let Some(w) = act.get(&k).filter(|w| members.contains(*w))
         {
             self.st.geom.entry(w.clone()).or_default().insert(addr.clone(), rect.unwrap_or_else(|| c.rect()));
+            claim_owner(&mut self.st, &cfg, w, &e.app, &addr);
         }
         self.st.foreign.remove(&addr);
         (ex, home, num)
@@ -1783,7 +1898,7 @@ impl Daemon {
             return Vec::new();
         }
         let Some(ws) = self.st.desktops.get(&k).and_then(|d| d.active.clone()) else { return Vec::new() };
-        let main = self.cfg.workspaces.get(&ws).and_then(|w| w.main.clone()).or_else(|| self.st.main_app(&self.cfg, &ws, self.mon));
+        let main = self.st.main_app(&self.cfg, &ws, self.mon);
         match main.filter(|m| m != app).and_then(|m| first_window(&self.cfg, clients, &m).filter(|w| w.desktop() == Some(k)).map(|w| w.address.clone())) {
             Some(a) => vec![hypr::d_focus_window(&a), hypr::d_bring_to_top()],
             None => Vec::new(),
@@ -2139,6 +2254,11 @@ impl Daemon {
         obj.insert("restore".into(), json!(restore));
         obj.insert("restore_apps".into(), json!(self.st.restore_apps));
         obj.insert("cells".into(), serde_json::to_value(&self.st.cells).unwrap_or_default());
+        // Раскладка в памяти для проверок (изменение live-layout, решение
+        // D15): главное приложение и изменённые места рядом с назначением.
+        obj.insert("main".into(), serde_json::to_value(&self.st.main).unwrap_or_default());
+        let moved: BTreeMap<&String, BTreeMap<&String, Value>> = self.st.moved.iter().map(|(w, m)| (w, m.iter().map(|(a, x)| (a, json!({ "rect": x.rect, "owner": x.owner }))).collect())).collect();
+        obj.insert("moved".into(), serde_json::to_value(moved).unwrap_or_default());
         obj.insert("lazy".into(), serde_json::to_value(&self.st.lazy).unwrap_or_default());
         obj.remove("event");
         v
@@ -2427,16 +2547,15 @@ pub fn window_home(members: &[String], active: &BTreeMap<u8, String>, current: u
     }
 }
 
-/// Место окна, пришедшего на стол workspace `ws` (решение D6): в режиме
-/// обмена ячеек — место его приложения в `ws`, в режиме `stack` —
-/// запомненный для `ws` прямоугольник, а без него место из конфига. `None` —
-/// окно остаётся в своём прямоугольнике.
+/// Место окна, пришедшего на стол workspace `ws` (изменение live-layout,
+/// решение D8): прямоугольник, запомненный для окна в `ws`, а без него — место
+/// его приложения в раскладке `ws`; одинаково в обоих режимах. `None` — окно
+/// остаётся в своём прямоугольнике.
 pub fn arrive_rect(st: &mut State, cfg: &Config, ws: &str, c: &Client, mon: (i32, i32)) -> Option<PxRect> {
     let ws_apps: Vec<String> = cfg.workspaces.get(ws).map(|w| w.apps.keys().cloned().collect()).unwrap_or_default();
-    let stack = cfg.workspaces.get(ws).map(|w| w.mode()) == Some(Mode::Stack);
-    let cell = ws_app_of(cfg, ws, &ws_apps, c).and_then(|a| st.rect_for(cfg, ws, &a, mon));
+    let place = ws_app_of(cfg, ws, &ws_apps, c).and_then(|a| st.rect_for(cfg, ws, &a, mon));
     let kept = st.geom.get(ws).and_then(|g| g.get(&c.address)).copied();
-    raise_target(false, stack, true, kept, cell, c.rect())
+    raise_target(false, true, kept, place, c.rect())
 }
 
 /// Приходит ли окно workspace `ws` при его поднятии на столе `n`: окно
@@ -2444,19 +2563,77 @@ pub fn arrive_rect(st: &mut State, cfg: &Config, ws: &str, c: &Client, mon: (i32
 /// в составе вытесняемого workspace (`before` — активные workspace столов
 /// до поднятия). Такое окно встаёт в состояние, запомненное для `ws`
 /// (решения D6, D16); окно, уже стоящее на столе как окно `ws`, поднятие
-/// в режиме `stack` не двигает.
+/// не двигает.
 pub fn arrives(c: &Client, n: u8, before: &BTreeMap<u8, String>, ws: &str) -> bool {
     c.desktop() != Some(n) || before.get(&n).is_some_and(|old| old != ws && c.in_ws(old))
 }
 
-/// Прямоугольник, который надо запомнить, прежде чем окно уйдёт со своего
-/// стола (решение D6): окно стоит на столе, где активен другой его workspace
-/// режима `stack`, и пользователь оставил его там в этом прямоугольнике.
-/// `target` — workspace, за которым окно уходит (для него не запоминается).
-pub fn leave_geom(cfg: &Config, active: &BTreeMap<u8, String>, c: &Client, target: Option<&str>) -> Option<(String, PxRect)> {
-    let v = active.get(&c.desktop()?)?;
-    let stack = cfg.workspaces.get(v).map(|w| w.mode()) == Some(Mode::Stack);
-    (Some(v.as_str()) != target && c.in_ws(v) && stack).then(|| (v.clone(), c.rect()))
+/// Раскладка workspace, снятая с экрана (изменение live-layout, решение D3).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Absorb {
+    /// Запись приложения и её изменённое место; `None` — окно стоит ровно
+    /// на исходном месте, и изменённого места у записи не остаётся.
+    pub moved: Vec<(String, Option<Moved>)>,
+    /// Окно и прямоугольник, который запоминается для него в `State::geom`.
+    pub geom: Vec<(String, PxRect)>,
+}
+
+/// Снять раскладку workspace `ws` со стола `n` (решения D2, D3): для каждой
+/// записи приложения берётся первое окно записи на этом столе в порядке
+/// экземпляров (`placed_windows`, как у цикла), не скрытое и не в полноэкранном
+/// режиме композитора (у такого окна композитор отдаёт размер экрана, а не
+/// окна). Его прямоугольник становится изменённым местом записи, а равный
+/// исходному месту изменённого места не даёт. Записи без таких окон не
+/// меняются. Для каждого такого окна `ws` на столе запоминается его
+/// прямоугольник. Окна на других столах и на `special:pool` стоят там
+/// в состоянии другого workspace и не учитываются. Состояние читается
+/// только ради исходных мест: раскладка собирается при первом обращении.
+pub fn absorb_plan(cfg: &Config, st: &mut State, ws: &str, n: u8, clients: &[Client], mon: (i32, i32)) -> Absorb {
+    let mut out = Absorb::default();
+    let apps: Vec<String> = cfg.workspaces.get(ws).map(|w| w.apps.keys().cloned().collect()).unwrap_or_default();
+    let shown = |c: &&Client| c.desktop() == Some(n) && !c.on_hidden() && c.fullscreen == 0;
+    for app in &apps {
+        let Some(first) = placed_windows(cfg, clients, ws, &apps, app).into_iter().find(shown) else { continue };
+        let rect = first.rect();
+        let base = st.base_rect(cfg, ws, app, mon);
+        out.moved.push((app.clone(), (base != Some(rect)).then(|| Moved { rect, owner: Some(first.address.clone()) })));
+    }
+    for c in ws_windows(clients, ws).into_iter().filter(shown) {
+        out.geom.push((c.address.clone(), c.rect()));
+    }
+    out
+}
+
+/// Снять раскладку `ws` со стола `n` и записать её в состояние (решение D4).
+/// Снятие идёт только на столе, где `ws` активен: на другом столе окно
+/// стоит в состоянии другого workspace. Изменения мест пишутся в журнал:
+/// по ним видно, откуда взялось место, которое потом займёт окно.
+pub fn absorb_into(cfg: &Config, st: &mut State, ws: &str, n: u8, clients: &[Client], mon: (i32, i32)) {
+    if st.desktops.get(&n).and_then(|d| d.active.as_deref()) != Some(ws) {
+        return;
+    }
+    let a = absorb_plan(cfg, st, ws, n, clients, mon);
+    let slot = st.moved.entry(ws.to_string()).or_default();
+    for (app, m) in a.moved {
+        match m {
+            Some(m) => {
+                if slot.get(&app).map(|x| x.rect) != Some(m.rect) {
+                    log::info!("{ws}: место {app} — {},{} {}×{} (окно {})", m.rect.x, m.rect.y, m.rect.w, m.rect.h, m.owner.as_deref().unwrap_or(""));
+                }
+                slot.insert(app, m);
+            }
+            None => {
+                if slot.remove(&app).is_some() {
+                    log::info!("{ws}: окно {app} стоит на исходном месте, изменённого места нет");
+                }
+            }
+        }
+    }
+    st.moved.retain(|_, m| !m.is_empty());
+    let g = st.geom.entry(ws.to_string()).or_default();
+    for (addr, r) in a.geom {
+        g.insert(addr, r);
+    }
 }
 
 /// Перенос окна за пользователем на стол при смене стола.
@@ -2465,9 +2642,6 @@ pub struct Follow {
     pub addr: String,
     /// Место на новом столе; `None` — прямоугольник окна не меняется.
     pub rect: Option<PxRect>,
-    /// Прямоугольник, запомненный для workspace режима `stack`, со стола
-    /// которого окно уходит.
-    pub leave: Option<(String, PxRect)>,
     /// Прямоугольник окна у композитора до переноса.
     pub now: PxRect,
 }
@@ -2475,20 +2649,27 @@ pub struct Follow {
 /// План следования за столом (решения D5, D6; спецификация ws-daemon,
 /// «Следование общего окна за столом»): окна активного workspace стола `n`,
 /// стоящие на других столах или на `special:pool`, переезжают на `n`
-/// в состояние, запомненное для этого workspace. Скрытые окна не трогаются;
-/// стол без активного workspace плана не даёт.
+/// в состояние, запомненное для этого workspace. Прежде чем окно уйдёт
+/// со стола другого своего workspace, раскладка того workspace снимается
+/// с экрана (изменение live-layout, решение D4): место, которое пользователь
+/// задал окну там, остаётся за ним. Скрытые окна не трогаются; стол без
+/// активного workspace плана не даёт.
 pub fn follow_plan(st: &mut State, cfg: &Config, clients: &[Client], n: u8, mon: (i32, i32)) -> Vec<Follow> {
     let active = actives(st);
     let Some(ws) = active.get(&n).cloned() else { return Vec::new() };
-    let mut out = Vec::new();
-    for c in ws_windows(clients, &ws) {
-        if c.on_hidden() || c.desktop() == Some(n) {
-            continue;
+    let arriving: Vec<&Client> = ws_windows(clients, &ws).into_iter().filter(|c| !c.on_hidden() && c.desktop() != Some(n)).collect();
+    let mut leaving: BTreeSet<(u8, String)> = BTreeSet::new();
+    for c in &arriving {
+        if let Some(k) = c.desktop()
+            && let Some(v) = active.get(&k).filter(|v| **v != ws && c.in_ws(v))
+        {
+            leaving.insert((k, v.clone()));
         }
-        let rect = arrive_rect(st, cfg, &ws, c, mon);
-        out.push(Follow { addr: c.address.clone(), rect, leave: leave_geom(cfg, &active, c, Some(&ws)), now: c.rect() });
     }
-    out
+    for (k, v) in &leaving {
+        absorb_into(cfg, st, v, *k, clients, mon);
+    }
+    arriving.into_iter().map(|c| Follow { addr: c.address.clone(), rect: arrive_rect(st, cfg, &ws, c, mon), now: c.rect() }).collect()
 }
 
 /// Окна других workspace, которые поднятие `ws` забирает в общее
@@ -2813,15 +2994,76 @@ pub fn pending_step(exited: bool, window: bool, key: bool) -> PendingStep {
     }
 }
 
-/// Назначения ячеек, переживающие перечитывание конфига: остаются только
-/// workspace, чей раздел в файле не менялся (спецификация ws-config, «Слежение
-/// за конфигом»). Назначения остальных собираются заново при следующем
-/// обращении, поэтому откат правки возвращает расстановку.
-pub fn keep_cells(old: &Config, new: &Config, cells: &mut BTreeMap<String, BTreeMap<String, Place>>) {
-    cells.retain(|ws, _| match (old.workspaces.get(ws), new.workspaces.get(ws)) {
-        (Some(o), Some(n)) => o == n,
-        _ => false,
-    });
+/// Раскладки, переживающие перечитывание конфига (спецификация ws-config,
+/// «Слежение за конфигом»; изменение live-layout, решение D12): у workspace,
+/// чей раздел в файле изменился или исчез, снимаются назначение мест, главное
+/// приложение, изменённые места и запомненные прямоугольники окон — раскладка
+/// соберётся из нового файла. Раскладки остальных workspace остаются, поэтому
+/// правка одного workspace не сбрасывает обмен мест и сдвинутые окна в другом.
+/// Возвращает изменённые workspace, которые есть в новом файле: их окна
+/// на столе, где workspace активен, встают на новые места сразу.
+pub fn keep_layout(old: &Config, new: &Config, st: &mut State) -> Vec<String> {
+    let mut names: BTreeSet<String> = old.workspaces.keys().chain(new.workspaces.keys()).cloned().collect();
+    names.extend(st.cells.keys().chain(st.moved.keys()).chain(st.main.keys()).chain(st.geom.keys()).cloned());
+    let mut out = Vec::new();
+    for ws in names {
+        let (o, n) = (old.workspaces.get(&ws), new.workspaces.get(&ws));
+        if o == n && n.is_some() {
+            continue;
+        }
+        st.reset_layout(&ws);
+        if n.is_some() {
+            out.push(ws);
+        }
+    }
+    out
+}
+
+/// Вернуть к описанию изменённые места, снятые с окна `addr` (изменение
+/// live-layout, решение D9): окно закрыто, отделено командой отделения или
+/// снято сверкой состава. Если в workspace остались окна записи, владельцем
+/// места становится первое из них (нескрытое, если такое есть), иначе
+/// изменённое место снимается, и следующее окно приложения встанет
+/// на исходное. Места без владельца (раскладка из снимка) не трогаются.
+/// `clients` — окна после ухода `addr`: закрытого окна в них нет, у окна,
+/// ушедшего из workspace, нет его тега состава, а в остальных своих
+/// workspace оно остаётся владельцем. Возвращает снятые места как
+/// «workspace, запись».
+pub fn drop_moved(st: &mut State, cfg: &Config, addr: &str, clients: &[Client]) -> Vec<(String, String)> {
+    let mut dropped = Vec::new();
+    for (ws, entries) in st.moved.iter_mut() {
+        let apps: Vec<String> = cfg.workspaces.get(ws).map(|w| w.apps.keys().cloned().collect()).unwrap_or_default();
+        entries.retain(|entry, m| {
+            if m.owner.as_deref() != Some(addr) {
+                return true;
+            }
+            let rest = placed_windows(cfg, clients, ws, &apps, entry);
+            match rest.iter().find(|c| !c.on_hidden()).or(rest.first()) {
+                Some(c) => {
+                    m.owner = Some(c.address.clone());
+                    true
+                }
+                None => {
+                    dropped.push((ws.clone(), entry.clone()));
+                    false
+                }
+            }
+        });
+    }
+    st.moved.retain(|_, m| !m.is_empty());
+    dropped
+}
+
+/// Окно `addr` встало на место приложения `app` в `ws`: изменённое место
+/// без владельца (раскладка из снимка сессии) получает его владельцем
+/// (решение D9), чтобы закрытие окна вернуло место к описанию.
+pub fn claim_owner(st: &mut State, cfg: &Config, ws: &str, app: &str, addr: &str) {
+    let Some((entry, _)) = cfg.ws_entry(ws, app) else { return };
+    if let Some(m) = st.moved.get_mut(ws).and_then(|m| m.get_mut(entry))
+        && m.owner.is_none()
+    {
+        m.owner = Some(addr.to_string());
+    }
 }
 
 /// Приложение конфига, которому подходит окно по `class` и, если он задан,
@@ -2838,8 +3080,9 @@ pub fn app_for_window(cfg: &Config, c: &Client) -> Option<String> {
 
 /// Место окна, которое приложение конфига открыло само (design D16). Правило
 /// то же, что у расстановки (спецификация ws-daemon, «Расстановка окон»), но
-/// без последнего шага: ячейка или `rect` приложения в активном workspace
-/// стола, то же у его семейства, `rect` самого приложения. `None` означает,
+/// без последнего шага: место приложения в раскладке активного workspace
+/// стола (изменённый прямоугольник, а без него ячейка или `rect` записи),
+/// то же у его семейства, `rect` самого приложения. `None` означает,
 /// что места нет ни там, ни там: окно остаётся, где его открыл композитор,
 /// и демон его не центрирует.
 pub fn open_rect(st: &mut State, cfg: &Config, ws: Option<&str>, app: &str, mon: (i32, i32)) -> Option<PxRect> {
@@ -3025,7 +3268,7 @@ pub fn detach_step(cfg: &Config, clients: &[Client], ws: Option<&str>, extra: &B
 /// workspace, если `last` — окно закрыто и других окон у приложения нет
 /// нигде: программа уходит из сессии (изменение classless-windows-stay-free,
 /// решение D3). Пока окна приложения остаются в других workspace, их записи
-/// остаются. Вместе с записью снимается назначение места. Возвращает
+/// остаются. Вместе с записью снимается место в раскладке. Возвращает
 /// workspace, где запись снята.
 pub fn drop_extra_app(st: &mut State, ws: &str, app: &str, last: bool) -> Vec<String> {
     let everywhere = last && st.extra.get(ws).and_then(|m| m.get(app)).is_some_and(|e| !e.cmd.is_empty());
@@ -3037,7 +3280,11 @@ pub fn drop_extra_app(st: &mut State, ws: &str, app: &str, last: bool) -> Vec<St
         if let Some(cells) = st.cells.get_mut(w) {
             cells.remove(app);
         }
+        if let Some(m) = st.moved.get_mut(w) {
+            m.remove(app);
+        }
     }
+    st.moved.retain(|_, m| !m.is_empty());
     st.extra.retain(|_, m| !m.is_empty());
     from
 }
@@ -3130,24 +3377,21 @@ pub fn move_step(current: u8, target: u8, active: Option<&str>) -> MoveStep {
 
 /// Куда поднятие workspace ставит окно его приложения (спецификация ws-daemon,
 /// «Поднятие workspace на столе», «Перенос workspace на стол», «Расстановка
-/// окон»). `carried` — окно едет вместе с workspace с прежнего стола при
-/// переносе; `moving` — окно приходит на стол (с `special:pool` или с другого
-/// стола); `kept` — прямоугольник, запомненный в режиме `stack`; `cell` —
-/// место приложения по правилу мест; `current` — прямоугольник окна у
-/// композитора до поднятия. `None` — окно не двигается.
+/// окон»; изменение live-layout, решение D8). `carried` — окно едет вместе
+/// с workspace с прежнего стола при переносе; `moving` — окно приходит
+/// на стол (с `special:pool`, с другого стола или из вытесняемого
+/// workspace); `kept` — прямоугольник, запомненный для окна в этом
+/// workspace; `place` — место приложения в раскладке; `current` —
+/// прямоугольник окна у композитора до поднятия. `None` — окно не двигается.
 ///
-/// При переносе окно в обоих режимах встаёт ровно туда, где стояло: перенос
-/// на другой стол расстановкой не является, назначения ячеек не меняются.
-/// При поднятии в режиме обмена ячеек окно встаёт в свою ячейку; в режиме
-/// `stack` окно, уже стоящее на столе, не двигается, а вернувшееся встаёт
-/// в запомненный прямоугольник или, без него, на место из конфига.
-pub fn raise_target(carried: bool, stack: bool, moving: bool, kept: Option<PxRect>, cell: Option<PxRect>, current: PxRect) -> Option<PxRect> {
+/// Режим workspace роли не играет: переносимое окно встаёт ровно туда, где
+/// стояло; приходящее — в запомненный прямоугольник, а без него на место
+/// приложения; окно, уже стоящее на столе, поднятие не двигает.
+pub fn raise_target(carried: bool, moving: bool, kept: Option<PxRect>, place: Option<PxRect>, current: PxRect) -> Option<PxRect> {
     if carried {
         Some(current)
-    } else if !stack {
-        cell
     } else if moving {
-        kept.or(cell)
+        kept.or(place)
     } else {
         None
     }
@@ -3189,6 +3433,30 @@ pub fn arrange_plan(st: &mut State, cfg: &Config, ws: Option<&str>, windows: &[&
     plan
 }
 
+/// Расстановка по команде с возвратом раскладки к описанию (изменение
+/// live-layout, решение D10): изменённые места `ws` снимаются, окна стола
+/// встают на исходные места нынешнего назначения (`arrange_plan`),
+/// а запомненные прямоугольники окон `ws` заменяются местами плана у окон
+/// этого стола и забываются у остальных. Назначение мест и главное
+/// приложение не меняются.
+pub fn arrange_layout(st: &mut State, cfg: &Config, ws: Option<&str>, windows: &[&Client], mon: (i32, i32)) -> Vec<(String, PxRect)> {
+    if let Some(w) = ws {
+        st.moved.remove(w);
+    }
+    let plan = arrange_plan(st, cfg, ws, windows, mon);
+    if let Some(w) = ws {
+        let ws_apps: Vec<String> = cfg.workspaces.get(w).map(|x| x.apps.keys().cloned().collect()).unwrap_or_default();
+        let g = st.geom.entry(w.to_string()).or_default();
+        g.clear();
+        for (addr, r) in &plan {
+            if windows.iter().any(|c| c.address == *addr && ws_app_of(cfg, w, &ws_apps, c).is_some()) {
+                g.insert(addr.clone(), *r);
+            }
+        }
+    }
+    plan
+}
+
 /// Положение по умолчанию: центр экрана с нынешним размером окна — так ставит
 /// новое окно и композитор по правилам `float-by-default` и `center` сессии.
 fn center_rect(c: &Client, mon: (i32, i32)) -> PxRect {
@@ -3222,10 +3490,10 @@ pub fn entry_members(cfg: &Config, e: &RestoreEntry) -> Vec<String> {
 /// Место окна, восстановленного по записи снимка (изменение session-instances,
 /// решения D7, D13): по правилу размещения (`window_home`) для нынешних
 /// активных workspace столов (`actives`, `current` — стол композитора).
-/// На столе, где активен его workspace, окно встаёт в режиме обмена ячеек
-/// в ячейку своего приложения, в режиме `stack` — в прямоугольник записи для
-/// этого workspace, а без него — на место из конфига; без активного
-/// workspace — на `special:pool`. Скрытое при снимке окно восстанавливается
+/// На столе, где активен его workspace, окно встаёт в прямоугольник записи
+/// для этого workspace, а без него — на место своего приложения в раскладке,
+/// одинаково в обоих режимах (изменение live-layout, решение D13); без
+/// активного workspace — на `special:pool`. Скрытое при снимке окно восстанавливается
 /// видимым: стол снимка для окна с workspace не учитывается. Запись без
 /// workspace (свободное окно приложения) встаёт на свой стол в свой
 /// прямоугольник; с `pool` — на `special:pool`; с `hidden` — на текущий стол.
@@ -3241,9 +3509,7 @@ pub fn restore_place(st: &mut State, cfg: &Config, e: &RestoreEntry, actives: &B
     match window_home(&members, actives, current, Spot::Pool) {
         Home::Desktop(k) => {
             let Some(w) = actives.get(&k) else { return (Home::Desktop(k), None) };
-            let stack = cfg.workspaces.get(w).map(|x| x.mode()) == Some(Mode::Stack);
-            let kept = if stack { e.rects.get(w).copied() } else { None };
-            (Home::Desktop(k), kept.or_else(|| st.rect_for(cfg, w, &e.app, mon)))
+            (Home::Desktop(k), e.rects.get(w).copied().or_else(|| st.rect_for(cfg, w, &e.app, mon)))
         }
         h => (h, None),
     }
@@ -3445,7 +3711,7 @@ fn ws_app_of(cfg: &Config, ws: &str, ws_apps: &[String], c: &Client) -> Option<S
 }
 
 /// Режим цикла клавиши приложения `app` в workspace `ws` и имя записи,
-/// которую переносит обмен ячеек (изменение workspace-overrides, решения D6
+/// которую переносит обмен мест (изменение workspace-overrides, решения D6
 /// и D7): режим — `Config::app_mode`, запись — собственная запись приложения,
 /// а у варианта без неё — запись семейства.
 pub fn cycle_mode(cfg: &Config, ws: &str, app: &str) -> (Mode, String) {
@@ -3461,7 +3727,7 @@ enum Start {
     /// Workspace поднят этой же цепочкой: цикл начинается заново.
     Raised,
     /// Приложение открыто или перетащено в workspace этой же цепочкой: цикл
-    /// начинается заново, а первый экземпляр выбирается без обмена ячеек
+    /// начинается заново, а первый экземпляр выбирается без обмена мест
     /// (решение D15).
     Joined,
 }
@@ -3505,8 +3771,8 @@ pub fn cycle_step(order: &[String], active: Option<&str>, fresh: bool, prev: Opt
     }
 }
 
-/// Окно, к которому вернёт конец цикла (prev). В режиме обмена ячеек это
-/// первое окно приложения, стоявшего в главной ячейке (`main_window`): конец
+/// Окно, к которому вернёт конец цикла (prev). В режиме обмена мест это
+/// первое окно главного приложения на начало цикла (`main_window`): конец
 /// цикла обязан вернуть расстановку. В режиме `stack` — активное окно
 /// workspace, а если активно чужое окно, то последнее окно workspace,
 /// получавшее фокус. Экземпляры самого вызванного приложения prev не бывают.
@@ -3532,20 +3798,59 @@ pub fn next_app_window(cfg: &Config, clients: &[Client], ws: &str, app: &str) ->
         .find_map(|name| placed_windows(cfg, clients, ws, &names, name).into_iter().find(|c| !c.on_hidden()).map(|c| c.address.clone()))
 }
 
-/// Обмен ячеек: приложение идёт в главную ячейку, прежнее главное — на его
-/// место. Стопка меняется ячейкой целиком, остальные окна не двигаются.
-fn swap_cells(cells: &mut BTreeMap<String, Place>, main_app: Option<&str>, app: &str, main_cell: &str) {
+/// Обмен мест в раскладке workspace (изменение live-layout, решения D5, D9):
+/// вызванное приложение `app` и главное `main` меняются местами целиком —
+/// исходным местом вместе с изменённым прямоугольником, — и главным
+/// становится `app`. Без главного приложения `app` получает ячейку `main`
+/// шаблона (`main_cell`). Изменённый прямоугольник, доставшийся приложению без
+/// окон в workspace (`has_windows`), снимается: он принадлежал окну, а не
+/// месту, и окно, которое появится, встанет на исходное место.
+pub fn swap_places(st: &mut State, ws: &str, main: Option<&str>, app: &str, main_cell: &str, has_windows: &dyn Fn(&str) -> bool) {
+    let cells = st.cells.entry(ws.to_string()).or_default();
     let app_place = cells.get(app).cloned();
-    match (main_app, app_place) {
-        (Some(m), Some(p)) => {
-            cells.insert(m.to_string(), p);
+    let main_place = main.and_then(|m| cells.get(m).cloned());
+    if let Some(m) = main {
+        match app_place {
+            Some(p) => {
+                cells.insert(m.to_string(), p);
+            }
+            None => {
+                cells.remove(m);
+            }
         }
-        (Some(m), None) => {
-            cells.remove(m);
-        }
-        (None, _) => {}
     }
-    cells.insert(app.to_string(), Place::Cell(main_cell.to_string()));
+    cells.insert(app.to_string(), main_place.unwrap_or_else(|| Place::Cell(main_cell.to_string())));
+    let moved = st.moved.entry(ws.to_string()).or_default();
+    let app_moved = moved.remove(app);
+    let main_moved = main.and_then(|m| moved.remove(m));
+    if let (Some(m), Some(x)) = (main, app_moved) {
+        moved.insert(m.to_string(), x);
+    }
+    if let Some(x) = main_moved {
+        moved.insert(app.to_string(), x);
+    }
+    for name in [main, Some(app)].into_iter().flatten() {
+        if !has_windows(name) {
+            moved.remove(name);
+        }
+    }
+    st.moved.retain(|_, m| !m.is_empty());
+    st.main.insert(ws.to_string(), app.to_string());
+}
+
+/// Нажатие клавиши неглавного приложения в режиме обмена мест (изменение
+/// live-layout, решение D7): цикл начинается заново, и выбирается активное
+/// окно, если оно экземпляр вызванного приложения, иначе первый экземпляр.
+/// Окно, которое пользователь только что двигал мышью, активно, и клавиша
+/// ставит его на главное место, а не заканчивает цикл. `None` — приложение
+/// уже главное (или окон нет), и шаг выводится по общему правилу
+/// (`cycle_step`).
+pub fn swap_start(order: &[String], active: Option<&str>, is_main: bool) -> Option<String> {
+    if is_main {
+        return None;
+    }
+    let first = order.first()?;
+    Some(active.filter(|a| order.iter().any(|x| x == a)).unwrap_or(first).to_string())
 }
 
 /// Позиция окна по правилу одинаковых расстояний: рабочая область сужается на
@@ -3926,7 +4231,7 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
         assert!(st.extra.is_empty());
     }
 
-    /// Конфиг с тремя workspace: `work` (обмен ячеек), `surf` (`stack`)
+    /// Конфиг с тремя workspace: `work` (обмен мест), `surf` (`stack`)
     /// и `dev-back`; `chrome-ai` описан в `surf` и `dev-back`.
     fn shared_cfg() -> Config {
         let text = format!(
@@ -4100,12 +4405,12 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
         // Окно стола, не входившее в вытесняемый workspace, не приходит.
         let own = client("0x2", "google-chrome", "Новости", "1", &["app:chrome#1", "ws:surf"]);
         assert!(!arrives(&own, 1, &desks(&[(1, "work")]), "surf"));
-        // Вместе с raise_target: в режиме stack пришедшее окно встаёт
-        // в запомненный прямоугольник, иначе — на место из конфига.
+        // Вместе с raise_target: пришедшее окно встаёт в запомненный
+        // прямоугольник, иначе — на место из раскладки.
         let kept = PxRect { x: 1700, y: 60, w: 1920, h: 2140 };
         let cell = PxRect { x: 1910, y: 10, w: 1920, h: 2140 };
-        assert_eq!(raise_target(false, true, true, Some(kept), Some(cell), shared.rect()), Some(kept));
-        assert_eq!(raise_target(false, true, false, Some(kept), Some(cell), shared.rect()), None);
+        assert_eq!(raise_target(false, true, Some(kept), Some(cell), shared.rect()), Some(kept));
+        assert_eq!(raise_target(false, false, Some(kept), Some(cell), shared.rect()), None);
     }
 
     #[test]
@@ -4127,23 +4432,120 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
             client("0x3", "neovide", "[Scratch]", "special:hidden", &["app:neovide#1", "ws:work"]),
         ];
         // Переход на стол 1: общее окно приходит на место chrome-ai из записи
-        // work, а прямоугольник, где его оставили в surf (режим stack),
-        // запоминается. Окна, уже стоящие на столе, и скрытые не трогаются.
+        // work, а раскладка surf, со стола которого окно уходит, снимается:
+        // прямоугольник, где окно оставили, запоминается. Окна, уже стоящие
+        // на столе, и скрытые не трогаются.
         let plan = follow_plan(&mut st, &cfg, &clients, 1, mon);
-        assert_eq!(plan, vec![Follow { addr: "0x1".into(), rect: Some(PxRect { x: 1000, y: 500, w: 1920, h: 1080 }), leave: Some(("surf".into(), moved)), now: moved }]);
+        assert_eq!(plan, vec![Follow { addr: "0x1".into(), rect: Some(PxRect { x: 1000, y: 500, w: 1920, h: 1080 }), now: moved }]);
+        assert_eq!(st.geom["surf"]["0x1"], moved);
+        // Окно, пришедшее в workspace режима обмена мест, встаёт
+        // в запомненный для него прямоугольник, а не на место записи.
+        let kept = PxRect { x: 300, y: 200, w: 1500, h: 1200 };
+        let mut st2 = State { desktops: st.desktops.clone(), ..State::default() };
+        st2.geom.entry("work".into()).or_default().insert("0x1".into(), kept);
+        assert_eq!(follow_plan(&mut st2, &cfg, &clients, 1, mon)[0].rect, Some(kept));
         // Обратно на стол 2: окно встаёт в запомненный для surf прямоугольник.
-        st.geom.entry("surf".into()).or_default().insert("0x1".into(), moved);
         let mut back = ai.clone();
         back.workspace.name = "1".into();
         let plan = follow_plan(&mut st, &cfg, std::slice::from_ref(&back), 2, mon);
         assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].rect, Some(moved));
-        // work — режим обмена ячеек, запоминать уходящее окно там незачем.
-        assert_eq!(plan[0].leave, None);
         // Стол без активного workspace и стол, где окна нет: ничего не переносится.
         assert!(follow_plan(&mut st, &cfg, &clients, 5, mon).is_empty());
         st.desktops.insert(4, Desktop { workspaces: vec!["chat".into()], active: Some("chat".into()) });
         assert!(follow_plan(&mut st, &cfg, &clients, 4, mon).is_empty());
+    }
+
+    #[test]
+    fn follow_plan_absorbs_leaving_workspace() {
+        // Окно chrome-ai входит в work (режим обмена мест, стол 1, запись
+        // о месте в центре экрана) и в surf (стол 2). На столе 1 пользователь
+        // сдвинул его в 400,300 1400×1000 и перешёл на стол 2.
+        let cfg = shared_cfg();
+        let mon = (3840, 2160);
+        let mut st = State::default();
+        st.desktops.insert(1, Desktop { workspaces: vec!["work".into()], active: Some("work".into()) });
+        st.desktops.insert(2, Desktop { workspaces: vec!["surf".into()], active: Some("surf".into()) });
+        let record = PxRect { x: 960, y: 540, w: 1920, h: 1080 };
+        st.extra.entry("work".into()).or_default().insert("chrome-ai".into(), ExtraApp { rect: record, ..ExtraApp::default() });
+        let (cfg, _) = merge_extra(&cfg, &st.extra);
+        let r = PxRect { x: 400, y: 300, w: 1400, h: 1000 };
+        let mut ai = client("0x1", "google-chrome-ai", "ИИ", "1", &["app:chrome-ai#1", "ws:surf", "ws:work"]);
+        ai.at = (r.x, r.y);
+        ai.size = (r.w, r.h);
+        let plan = follow_plan(&mut st, &cfg, std::slice::from_ref(&ai), 2, mon);
+        assert_eq!(plan.len(), 1);
+        // work сохранил изменённое место chrome-ai с владельцем и прямоугольник окна.
+        assert_eq!(st.moved["work"]["chrome-ai"], Moved { rect: r, owner: Some("0x1".into()) });
+        assert_eq!(st.geom["work"]["0x1"], r);
+        // Возврат на стол 1: окно встаёт в сдвинутый прямоугольник, а не в запись.
+        let mut on_two = ai.clone();
+        on_two.workspace.name = "2".into();
+        on_two.at = (1910, 10);
+        let plan = follow_plan(&mut st, &cfg, std::slice::from_ref(&on_two), 1, mon);
+        assert_eq!(plan[0].rect, Some(r));
+        // Место chrome-ai в раскладке work от положения на столе 2 не меняется.
+        assert_eq!(st.moved["work"]["chrome-ai"].rect, r);
+    }
+
+    #[test]
+    fn absorb_takes_first_instance_on_its_desktop() {
+        let cfg = Config::parse(CFG).unwrap();
+        let mon = (3840, 2160);
+        let mut st = State::default();
+        let at = |mut c: Client, r: PxRect| {
+            c.at = (r.x, r.y);
+            c.size = (r.w, r.h);
+            c
+        };
+        let center = PxRect { x: 1125, y: 10, w: 1920, h: 2140 };
+        let moved = PxRect { x: 100, y: 200, w: 800, h: 600 };
+        let other = PxRect { x: 500, y: 500, w: 700, h: 700 };
+        let mut full = at(client("0x5", "neovide", "[Scratch]", "1", &["app:neovide#1", "ws:work"]), PxRect { x: 0, y: 0, w: 3840, h: 2160 });
+        full.fullscreen = 2;
+        let clients = vec![
+            // Второй экземпляр chromium стоит раньше в списке композитора,
+            // но место даёт первый.
+            at(client("0x2", "chromium", "Почта", "1", &["app:chromium#2", "ws:work"]), other),
+            at(client("0x1", "chromium", "Новости", "1", &["app:chromium#1", "ws:work"]), moved),
+            // herdr описан в work сам и стоит ровно в своей ячейке.
+            at(client("0x3", "wezterm-herdr", "herdr · dev-lab", "1", &["app:herdr#1", "ws:work"]), center),
+            // Полноэкранное окно место не даёт.
+            full,
+        ];
+        let a = absorb_plan(&cfg, &mut st, "work", 1, &clients, mon);
+        let moved_of = |app: &str| a.moved.iter().find(|(x, _)| x == app).map(|(_, m)| m.clone());
+        assert_eq!(moved_of("chromium"), Some(Some(Moved { rect: moved, owner: Some("0x1".into()) })));
+        // Равный ячейке прямоугольник изменённого места не даёт.
+        assert_eq!(moved_of("herdr"), Some(None));
+        // Запись без окон на столе (только полноэкранное) не меняется.
+        assert_eq!(moved_of("neovide"), None);
+        assert_eq!(a.geom.len(), 3);
+        assert!(!a.geom.iter().any(|(x, _)| x == "0x5"));
+        // Окно на другом столе и на special:pool не учитывается.
+        let away = vec![at(client("0x1", "chromium", "Новости", "2", &["app:chromium#1", "ws:work"]), moved), at(client("0x2", "chromium", "Почта", "special:pool", &["app:chromium#2", "ws:work"]), other)];
+        assert_eq!(absorb_plan(&cfg, &mut st, "work", 1, &away, mon), Absorb::default());
+        // Первый экземпляр на столе 1 — второй, если первый ушёл на другой стол.
+        let split = vec![at(client("0x1", "chromium", "Новости", "2", &["app:chromium#1", "ws:work"]), moved), at(client("0x2", "chromium", "Почта", "1", &["app:chromium#2", "ws:work"]), other)];
+        let a = absorb_plan(&cfg, &mut st, "work", 1, &split, mon);
+        assert_eq!(a.moved, vec![("chromium".to_string(), Some(Moved { rect: other, owner: Some("0x2".into()) }))]);
+        // Окно варианта без своей записи даёт место записи семейства.
+        let fam = Config::parse(&CFG.replace("main = \"herdr\"\napps = { herdr = \"center\", chromium = \"left\", neovide = \"right\" }", "main = \"wezterm\"\napps = { wezterm = \"center\", chromium = \"left\", neovide = \"right\" }")).unwrap();
+        let mut st = State::default();
+        let wins = vec![at(client("0x3", "wezterm-herdr", "herdr · dev-lab", "1", &["app:herdr#1", "ws:work"]), moved)];
+        let a = absorb_plan(&fam, &mut st, "work", 1, &wins, mon);
+        assert_eq!(a.moved, vec![("wezterm".to_string(), Some(Moved { rect: moved, owner: Some("0x3".into()) }))]);
+        // absorb_into пишет изменённые места только для workspace, активного на столе.
+        st.desktops.insert(1, Desktop { workspaces: vec!["work".into()], active: Some("work".into()) });
+        absorb_into(&fam, &mut st, "work", 2, &wins, mon);
+        assert!(st.moved.is_empty());
+        absorb_into(&fam, &mut st, "work", 1, &wins, mon);
+        assert_eq!(st.moved["work"]["wezterm"].rect, moved);
+        assert_eq!(st.rect_for(&fam, "work", "herdr", mon), Some(moved));
+        // Окно вернули ровно в ячейку: изменённое место снимается.
+        let back = vec![at(client("0x3", "wezterm-herdr", "herdr · dev-lab", "1", &["app:herdr#1", "ws:work"]), center)];
+        absorb_into(&fam, &mut st, "work", 1, &back, mon);
+        assert!(st.moved.is_empty());
     }
 
     #[test]
@@ -4314,7 +4716,7 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
         let pair: Vec<String> = cfg.workspaces["pair"].apps.keys().cloned().collect();
         assert_eq!(addrs(placed_windows(&cfg, &pair_clients, "pair", &pair, "chrome")), vec!["0x1", "0x3"]);
         assert_eq!(addrs(placed_windows(&cfg, &pair_clients, "pair", &pair, "chrome-ai")), vec!["0x2"]);
-        // Режим: в mix вариант берёт запись семейства (обмен ячеек переносит
+        // Режим: в mix вариант берёт запись семейства (обмен мест переносит
         // стопку семейства), в pair у chrome-ai свой mode = "stack".
         assert_eq!(cycle_mode(&cfg, "mix", "chrome-ai"), (Mode::Swap, "chrome".to_string()));
         assert_eq!(cycle_mode(&cfg, "pair", "chrome-ai"), (Mode::Stack, "chrome-ai".to_string()));
@@ -4346,17 +4748,21 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
 
     #[test]
     fn cycle_mode_of_app() {
-        // Приложение без ячейки в workspace режима swap выбирается подъёмом.
+        // Приложение без ячейки берёт режим workspace (изменение live-layout,
+        // решение D6: исключение для записи с rect снято).
         let text = format!("{CFG}\n[workspaces.dev]\ntemplate = \"thirds\"\nmain = \"herdr\"\n[workspaces.dev.apps]\nherdr = \"center\"\nchromium = {{ cell = \"left\", mode = \"stack\" }}\nneovide = \"right\"\ncalc = {{ rect = {{ x = 2600, y = 1500, w = 600, h = 400 }} }}\n");
         let cfg = Config::parse(&text).unwrap();
-        assert_eq!(cycle_mode(&cfg, "dev", "calc"), (Mode::Stack, "calc".to_string()));
+        assert_eq!(cycle_mode(&cfg, "dev", "calc"), (Mode::Swap, "calc".to_string()));
+        // Запись с rect и mode = "stack" выбирается подъёмом.
+        let stack = Config::parse(&text.replace("calc = { rect = { x = 2600, y = 1500, w = 600, h = 400 } }", "calc = { rect = { x = 2600, y = 1500, w = 600, h = 400 }, mode = \"stack\" }")).unwrap();
+        assert_eq!(cycle_mode(&stack, "dev", "calc"), (Mode::Stack, "calc".to_string()));
         // Режим stack у приложения с ячейкой: обмена нет.
         assert_eq!(cycle_mode(&cfg, "dev", "chromium"), (Mode::Stack, "chromium".to_string()));
         assert_eq!(cycle_mode(&cfg, "dev", "neovide"), (Mode::Swap, "neovide".to_string()));
         // Вариант без своей записи: режим и обмен — по записи семейства.
         assert_eq!(cycle_mode(&cfg, "dev", "chromium-mail"), (Mode::Stack, "chromium".to_string()));
         assert_eq!(cycle_mode(&cfg, "work", "herdr"), (Mode::Swap, "herdr".to_string()));
-        // Явный mode = "swap" у записи с rect: обмен с главной ячейкой, прежнее
+        // Явный mode = "swap" у записи с rect: обмен с главным местом, прежнее
         // главное встаёт в прямоугольник калькулятора.
         let swap = text.replace("calc = { rect = { x = 2600, y = 1500, w = 600, h = 400 } }", "calc = { rect = { x = 2600, y = 1500, w = 600, h = 400 }, mode = \"swap\" }");
         let cfg = Config::parse(&swap).unwrap();
@@ -4365,9 +4771,10 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
         let mon = (3840, 2160);
         let main = st.main_app(&cfg, "dev", mon);
         assert_eq!(main.as_deref(), Some("herdr"));
-        swap_cells(st.cells_of(&cfg, "dev", mon), main.as_deref(), "calc", "center");
+        swap_places(&mut st, "dev", main.as_deref(), "calc", "center", &|_| true);
         assert_eq!(st.main_app(&cfg, "dev", mon).as_deref(), Some("calc"));
         assert_eq!(st.rect_for(&cfg, "dev", "herdr", mon), Some(PxRect { x: 2600, y: 1500, w: 600, h: 400 }));
+        assert_eq!(st.rect_for(&cfg, "dev", "calc", mon), Some(PxRect { x: 1125, y: 10, w: 1920, h: 2140 }));
     }
 
     #[test]
@@ -4551,8 +4958,12 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
         assert_eq!(open_rect(&mut st, &cfg, None, "chromium", mon), None);
         assert_eq!(open_rect(&mut st, &cfg, Some("нет-такого"), "chromium", mon), None);
         // Окно встаёт туда, где приложение стоит сейчас, а не где записано в файле.
-        swap_cells(st.cells_of(&cfg, "work", mon), Some("herdr"), "chromium", "center");
+        swap_places(&mut st, "work", Some("herdr"), "chromium", "center", &|_| true);
         assert_eq!(open_rect(&mut st, &cfg, Some("work"), "chromium", mon), Some(PxRect { x: 1125, y: 10, w: 1920, h: 2140 }));
+        // Изменённое место приложения побеждает исходное (изменение live-layout).
+        let moved = PxRect { x: 100, y: 200, w: 800, h: 600 };
+        st.moved.entry("work".into()).or_default().insert("chromium".into(), Moved { rect: moved, owner: None });
+        assert_eq!(open_rect(&mut st, &cfg, Some("work"), "chromium", mon), Some(moved));
     }
 
     #[test]
@@ -4665,23 +5076,35 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
     }
 
     #[test]
-    fn keep_cells_resets_only_changed_workspace() {
+    fn keep_layout_resets_changed_workspace() {
         let cfg = Config::parse(CFG).unwrap();
         let changed = Config::parse(&CFG.replace("neovide = \"right\"", "neovide = { rect = { x = 0, y = 0, w = 10, h = 10 } }")).unwrap();
         let added = Config::parse(&format!("{CFG}\n[workspaces.surf]\ntemplate = \"thirds\"\napps = {{ neovide = \"right\" }}\n")).unwrap();
-        let cells = || BTreeMap::from([("work".to_string(), BTreeMap::from([("chromium".to_string(), Place::Cell("center".into()))]))]);
-        // Раздел workspace изменился: назначения снимаются и соберутся из файла.
-        let mut c = cells();
-        keep_cells(&cfg, &changed, &mut c);
-        assert!(c.is_empty());
-        // Правка соседнего workspace обмен ячеек в `work` не сбрасывает.
-        let mut c = cells();
-        keep_cells(&cfg, &added, &mut c);
-        assert_eq!(c["work"]["chromium"], Place::Cell("center".into()));
-        // Workspace из конфига исчез.
-        let mut c = cells();
-        keep_cells(&cfg, &Config::default(), &mut c);
-        assert!(c.is_empty());
+        let r = PxRect { x: 1, y: 2, w: 3, h: 4 };
+        let state = || {
+            let mut st = State::default();
+            st.cells.insert("work".into(), BTreeMap::from([("chromium".to_string(), Place::Cell("center".into()))]));
+            st.moved.entry("work".into()).or_default().insert("neovide".into(), Moved { rect: r, owner: None });
+            st.main.insert("work".into(), "chromium".into());
+            st.geom.entry("work".into()).or_default().insert("0x1".into(), r);
+            st
+        };
+        // Раздел workspace изменился: раскладка и память окон снимаются
+        // и соберутся из файла; workspace возвращается для применения.
+        let mut st = state();
+        assert_eq!(keep_layout(&cfg, &changed, &mut st), vec!["work".to_string()]);
+        assert!(st.cells.is_empty() && st.moved.is_empty() && st.main.is_empty() && st.geom.is_empty());
+        // Правка соседнего workspace раскладку work не сбрасывает; новый
+        // workspace возвращается, раскладки у него ещё нет.
+        let mut st = state();
+        assert_eq!(keep_layout(&cfg, &added, &mut st), vec!["surf".to_string()]);
+        assert_eq!(st.cells["work"]["chromium"], Place::Cell("center".into()));
+        assert_eq!(st.moved["work"]["neovide"].rect, r);
+        assert_eq!(st.main["work"], "chromium");
+        // Workspace из конфига исчез: раскладка снята, применять нечего.
+        let mut st = state();
+        assert!(keep_layout(&cfg, &Config::default(), &mut st).is_empty());
+        assert!(st.cells.is_empty() && st.moved.is_empty());
     }
 
     #[test]
@@ -4766,7 +5189,7 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
         // Цикл идёт по единственному окну chromium.
         let order = vec!["0x2".to_string()];
         let anchor = |main: Option<&str>, active: Option<&str>, focus: Option<&str>| anchor_window(&cfg, &clients, "work", main, &order, active, focus).unwrap_or_default();
-        // Режим обмена ячеек: возврат к окну прежнего главного приложения,
+        // Режим обмена мест: возврат к окну прежнего главного приложения,
         // каким бы ни было активное окно.
         assert_eq!(anchor(Some("0x1"), Some("0x3"), None), "0x1");
         // Режим stack: активное окно workspace.
@@ -4800,21 +5223,169 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
     }
 
     #[test]
-    fn swap_cells_exchanges_stacks() {
+    fn swap_places_exchanges_stacks() {
         let cfg = Config::parse(CFG).unwrap();
         let mon = (3840, 2160);
         let mut st = State::default();
-        swap_cells(st.cells_of(&cfg, "work", mon), Some("herdr"), "chromium", "center");
-        // Стопки меняются ячейками целиком, третье приложение не двигается.
+        let main = st.main_app(&cfg, "work", mon);
+        swap_places(&mut st, "work", main.as_deref(), "chromium", "center", &|_| true);
+        // Стопки меняются местами целиком, третье приложение не двигается.
         assert_eq!(st.rect_for(&cfg, "work", "chromium", mon), Some(PxRect { x: 1125, y: 10, w: 1920, h: 2140 }));
         assert_eq!(st.rect_for(&cfg, "work", "herdr", mon), Some(PxRect { x: -805, y: 10, w: 1920, h: 2140 }));
         assert_eq!(st.rect_for(&cfg, "work", "neovide", mon), Some(PxRect { x: 3055, y: 10, w: 1920, h: 2140 }));
-        // Приложение вне ячеек: прежнее главное остаётся без назначения.
+        assert_eq!(st.main_app(&cfg, "work", mon).as_deref(), Some("chromium"));
+        // Приложение вне раскладки: прежнее главное остаётся без места.
         let mut st = State::default();
-        swap_cells(st.cells_of(&cfg, "work", mon), Some("herdr"), "wezterm", "center");
+        st.cells_of(&cfg, "work", mon);
+        swap_places(&mut st, "work", Some("herdr"), "wezterm", "center", &|_| true);
         assert_eq!(st.cells_of(&cfg, "work", mon).get("herdr"), None);
+        assert_eq!(st.cells_of(&cfg, "work", mon).get("wezterm"), Some(&Place::Cell("center".into())));
+        // Без главного приложения вызванное получает ячейку main шаблона.
+        let mut st = State::default();
+        st.cells_of(&cfg, "work", mon).remove("herdr");
+        swap_places(&mut st, "work", None, "neovide", "center", &|_| true);
+        assert_eq!(st.rect_for(&cfg, "work", "neovide", mon), Some(PxRect { x: 1125, y: 10, w: 1920, h: 2140 }));
         // У семейства без cmd запускать нечего: место остаётся пустым, демон пишет в журнал.
         assert!(cfg.app_command(None, &cfg.apps["wezterm"]).is_none());
+    }
+
+    /// Пример пользователя: chrome-ai перетащен в work записью сессии
+    /// с прямоугольником в центре экрана.
+    fn user_example() -> (Config, State) {
+        let mut st = State::default();
+        let record = PxRect { x: 960, y: 540, w: 1920, h: 1080 };
+        st.extra.entry("work".into()).or_default().insert("chrome-ai".into(), ExtraApp { rect: record, ..ExtraApp::default() });
+        let (cfg, _) = merge_extra(&shared_cfg(), &st.extra);
+        (cfg, st)
+    }
+
+    #[test]
+    fn swap_places_exchanges_moved_rects() {
+        let (cfg, mut st) = user_example();
+        let mon = (3840, 2160);
+        let center = PxRect { x: 1125, y: 10, w: 1920, h: 2140 };
+        let r = PxRect { x: 400, y: 300, w: 1400, h: 1000 };
+        st.cells_of(&cfg, "work", mon);
+        st.moved.entry("work".into()).or_default().insert("chrome-ai".into(), Moved { rect: r, owner: Some("0xai".into()) });
+        assert_eq!(st.rect_for(&cfg, "work", "chrome-ai", mon), Some(r));
+        let main = st.main_app(&cfg, "work", mon);
+        assert_eq!(main.as_deref(), Some("herdr"));
+        swap_places(&mut st, "work", main.as_deref(), "chrome-ai", "center", &|_| true);
+        // chrome-ai главное и в center, herdr — в сдвинутом прямоугольнике.
+        assert_eq!(st.main_app(&cfg, "work", mon).as_deref(), Some("chrome-ai"));
+        assert_eq!(st.rect_for(&cfg, "work", "chrome-ai", mon), Some(center));
+        assert_eq!(st.rect_for(&cfg, "work", "herdr", mon), Some(r));
+        assert_eq!(st.cells["work"]["chrome-ai"], Place::Cell("center".into()));
+        assert_eq!(st.cells["work"]["herdr"], Place::Rect { rect: PxRect { x: 960, y: 540, w: 1920, h: 1080 } });
+        // Обратный обмен возвращает всё как было.
+        swap_places(&mut st, "work", Some("chrome-ai"), "herdr", "center", &|_| true);
+        assert_eq!(st.main_app(&cfg, "work", mon).as_deref(), Some("herdr"));
+        assert_eq!(st.rect_for(&cfg, "work", "herdr", mon), Some(center));
+        assert_eq!(st.rect_for(&cfg, "work", "chrome-ai", mon), Some(r));
+        // Главное тоже растянуто: его прямоугольник достаётся вызванному.
+        let wide = PxRect { x: 1125, y: 10, w: 2400, h: 2140 };
+        st.moved.get_mut("work").unwrap().insert("herdr".into(), Moved { rect: wide, owner: Some("0xh".into()) });
+        swap_places(&mut st, "work", Some("herdr"), "chrome-ai", "center", &|_| true);
+        assert_eq!(st.rect_for(&cfg, "work", "chrome-ai", mon), Some(wide));
+        assert_eq!(st.rect_for(&cfg, "work", "herdr", mon), Some(r));
+    }
+
+    #[test]
+    fn swap_places_drops_moved_of_app_without_windows() {
+        let cfg = Config::parse(CFG).unwrap();
+        let mon = (3840, 2160);
+        let mut st = State::default();
+        st.cells_of(&cfg, "work", mon);
+        let wide = PxRect { x: 1125, y: 10, w: 2400, h: 2140 };
+        st.moved.entry("work".into()).or_default().insert("herdr".into(), Moved { rect: wide, owner: Some("0xh".into()) });
+        // У neovide окон нет (запуск по клавише): растянутый прямоугольник
+        // herdr ему не достаётся, окно появится в ячейке center.
+        swap_places(&mut st, "work", Some("herdr"), "neovide", "center", &|a| a != "neovide");
+        assert_eq!(st.rect_for(&cfg, "work", "neovide", mon), Some(PxRect { x: 1125, y: 10, w: 1920, h: 2140 }));
+        assert_eq!(st.rect_for(&cfg, "work", "herdr", mon), Some(PxRect { x: 3055, y: 10, w: 1920, h: 2140 }));
+        assert!(st.moved.is_empty());
+    }
+
+    #[test]
+    fn swap_press_on_non_main_app_selects_active() {
+        let a = |s: &str| s.to_string();
+        let one = vec![a("0xai")];
+        // Окно неглавного приложения активно (его только что двигали мышью):
+        // выбирается оно, с обменом мест, а не конец цикла.
+        assert_eq!(swap_start(&one, Some("0xai"), false), Some(a("0xai")));
+        // Активно чужое окно — первый экземпляр.
+        assert_eq!(swap_start(&one, Some("0xh"), false), Some(a("0xai")));
+        // Из нескольких экземпляров выбирается активный.
+        let three = vec![a("0x1"), a("0x2"), a("0x3")];
+        assert_eq!(swap_start(&three, Some("0x2"), false), Some(a("0x2")));
+        // Приложение уже главное: прежний шаг цикла, за последним — конец цикла.
+        assert_eq!(swap_start(&one, Some("0xai"), true), None);
+        assert_eq!(cycle_step(&one, Some("0xai"), false, Some("0xh"), None), CycleStep::Back(a("0xh")));
+        // Три экземпляра главного приложения и клик по второму — третий.
+        assert_eq!(swap_start(&three, Some("0x2"), true), None);
+        assert_eq!(cycle_step(&three, Some("0x2"), false, Some("0xh"), None), CycleStep::Select(a("0x3")));
+        // Окон нет — решает запуск.
+        assert_eq!(swap_start(&[], Some("0xh"), false), None);
+    }
+
+    #[test]
+    fn closing_last_window_drops_moved_place() {
+        let cfg = Config::parse(CFG).unwrap();
+        let mon = (3840, 2160);
+        let r = PxRect { x: 2600, y: 300, w: 1800, h: 1500 };
+        let mut st = State::default();
+        st.moved.entry("work".into()).or_default().insert("neovide".into(), Moved { rect: r, owner: Some("0x3".into()) });
+        // Закрыто единственное окно neovide: место возвращается к ячейке right.
+        assert_eq!(drop_moved(&mut st, &cfg, "0x3", &[]), vec![("work".to_string(), "neovide".to_string())]);
+        assert_eq!(st.rect_for(&cfg, "work", "neovide", mon), Some(PxRect { x: 3055, y: 10, w: 1920, h: 2140 }));
+        // У chromium второе окно: место остаётся и меняет владельца.
+        let moved = PxRect { x: 100, y: 200, w: 800, h: 600 };
+        st.moved.entry("work".into()).or_default().insert("chromium".into(), Moved { rect: moved, owner: Some("0x1".into()) });
+        let rest = vec![client("0x2", "chromium", "Почта", "1", &["app:chromium#2", "ws:work"])];
+        assert!(drop_moved(&mut st, &cfg, "0x1", &rest).is_empty());
+        assert_eq!(st.moved["work"]["chromium"], Moved { rect: moved, owner: Some("0x2".into()) });
+        // Место из снимка без владельца переживает закрытие окна другого приложения.
+        st.moved.get_mut("work").unwrap().insert("herdr".into(), Moved { rect: r, owner: None });
+        assert!(drop_moved(&mut st, &cfg, "0x9", &rest).is_empty());
+        assert_eq!(st.moved["work"]["herdr"].rect, r);
+        // Окно, ушедшее из work в другой workspace, место в work отдаёт.
+        let left = vec![client("0x2", "chromium", "Почта", "1", &["app:chromium#2", "ws:surf"])];
+        assert_eq!(drop_moved(&mut st, &cfg, "0x2", &left), vec![("work".to_string(), "chromium".to_string())]);
+        // Окно, вставшее на место без владельца, становится владельцем.
+        claim_owner(&mut st, &cfg, "work", "herdr", "0x7");
+        assert_eq!(st.moved["work"]["herdr"].owner.as_deref(), Some("0x7"));
+    }
+
+    #[test]
+    fn arrange_resets_moved_keeps_swap() {
+        let (cfg, mut st) = user_example();
+        let mon = (3840, 2160);
+        let record = PxRect { x: 960, y: 540, w: 1920, h: 1080 };
+        let center = PxRect { x: 1125, y: 10, w: 1920, h: 2140 };
+        let r = PxRect { x: 400, y: 300, w: 1400, h: 1000 };
+        st.cells_of(&cfg, "work", mon);
+        st.moved.entry("work".into()).or_default().insert("chrome-ai".into(), Moved { rect: r, owner: Some("0xai".into()) });
+        swap_places(&mut st, "work", Some("herdr"), "chrome-ai", "center", &|_| true);
+        // Окно neovide растянуто, у chromium окно ушло на special:pool.
+        st.moved.get_mut("work").unwrap().insert("neovide".into(), Moved { rect: PxRect { x: 2000, y: 10, w: 3000, h: 2140 }, owner: Some("0x3".into()) });
+        st.geom.entry("work".into()).or_default().insert("0x2".into(), r);
+        let clients = [
+            client("0x1", "wezterm-herdr", "herdr · dev-lab", "1", &["app:herdr#1", "ws:work"]),
+            client("0xai", "google-chrome-ai", "ИИ", "1", &["app:chrome-ai#1", "ws:work"]),
+            client("0x3", "neovide", "[Scratch]", "1", &["app:neovide#1", "ws:work"]),
+        ];
+        let windows: Vec<&Client> = clients.iter().collect();
+        let plan = arrange_layout(&mut st, &cfg, Some("work"), &windows, mon);
+        let place = |addr: &str| plan.iter().find(|(a, _)| a == addr).map(|(_, r)| *r).unwrap();
+        // Исходные места нынешнего назначения: обмен сохранён.
+        assert_eq!(place("0xai"), center);
+        assert_eq!(place("0x1"), record);
+        assert_eq!(place("0x3"), PxRect { x: 3055, y: 10, w: 1920, h: 2140 });
+        assert_eq!(st.main_app(&cfg, "work", mon).as_deref(), Some("chrome-ai"));
+        assert!(st.moved.is_empty());
+        // Запомненные прямоугольники — места плана; окно не на столе забыто.
+        assert_eq!(st.geom["work"]["0x1"], record);
+        assert!(!st.geom["work"].contains_key("0x2"));
     }
 
     #[test]
@@ -4837,25 +5408,23 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
     #[test]
     fn raise_target_keeps_rect_on_move_in_both_modes() {
         let r = |x, y, w, h| PxRect { x, y, w, h };
-        let cell = Some(r(340, 10, 1200, 1400));
+        let place = Some(r(340, 10, 1200, 1400));
         let kept = Some(r(500, 50, 1000, 900));
         // Окно сдвинуто и растянуто мышью.
         let cur = r(420, 120, 1500, 1100);
-        // Перенос на другой стол: окно встаёт туда, где стояло, в обоих режимах,
-        // а не в ячейку и не в запомненный прямоугольник.
-        assert_eq!(raise_target(true, false, true, None, cell, cur), Some(cur));
-        assert_eq!(raise_target(true, true, true, kept, cell, cur), Some(cur));
-        // Поднятие в режиме обмена ячеек: окно встаёт в свою ячейку,
-        // пришло оно на стол или уже стояло на нём.
-        assert_eq!(raise_target(false, false, true, None, cell, cur), cell);
-        assert_eq!(raise_target(false, false, false, None, cell, cur), cell);
-        // Места у приложения нет — окно не двигается.
-        assert_eq!(raise_target(false, false, true, None, None, cur), None);
-        // Режим stack: вернувшееся окно — в запомненный прямоугольник, без него —
-        // на место из конфига; стоящее на столе окно не двигается.
-        assert_eq!(raise_target(false, true, true, kept, cell, cur), kept);
-        assert_eq!(raise_target(false, true, true, None, cell, cur), cell);
-        assert_eq!(raise_target(false, true, false, kept, cell, cur), None);
+        // Перенос на другой стол: окно встаёт туда, где стояло, а не на место
+        // и не в запомненный прямоугольник.
+        assert_eq!(raise_target(true, true, None, place, cur), Some(cur));
+        assert_eq!(raise_target(true, true, kept, place, cur), Some(cur));
+        // Окно, уже стоящее на столе, поднятие не двигает — режима у функции
+        // больше нет, в режиме обмена мест тоже.
+        assert_eq!(raise_target(false, false, kept, place, cur), None);
+        assert_eq!(raise_target(false, false, None, place, cur), None);
+        // Приходящее окно — в запомненный прямоугольник, без него — на место
+        // приложения в раскладке; места нет — окно не двигается.
+        assert_eq!(raise_target(false, true, kept, place, cur), kept);
+        assert_eq!(raise_target(false, true, None, place, cur), place);
+        assert_eq!(raise_target(false, true, None, None, cur), None);
     }
 
     #[test]
@@ -5129,11 +5698,22 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
         // Без записанного прямоугольника — место из конфига.
         e.rects.clear();
         assert_eq!(restore_place(&mut st, &cfg, &e, &act, 1, mon), (Home::Desktop(2), Some(PxRect { x: 3055, y: 10, w: 1920, h: 2140 })));
-        // Общее окно surf и work при текущем столе 1 — ячейка своего
-        // приложения в work (режим обмена), прямоугольник surf не берётся.
+        // Общее окно surf и work при текущем столе 1 — место своего
+        // приложения в раскладке work, прямоугольник surf не берётся.
         let mut e = entry("chromium", 2, &["surf", "work"], &[]);
         e.rects.insert("surf".into(), r);
         assert_eq!(restore_place(&mut st, &cfg, &e, &act, 1, mon), (Home::Desktop(1), Some(PxRect { x: -805, y: 10, w: 1920, h: 2140 })));
+        // Окно workspace режима обмена мест встаёт в свой прямоугольник
+        // из записи (изменение live-layout, решение D13).
+        let moved = PxRect { x: 2600, y: 300, w: 1800, h: 1500 };
+        e.rects.insert("work".into(), moved);
+        assert_eq!(restore_place(&mut st, &cfg, &e, &act, 1, mon), (Home::Desktop(1), Some(moved)));
+        // Без прямоугольника записи — изменённое место в раскладке из снимка.
+        let mut n = entry("neovide", 1, &["work"], &[]);
+        st.moved.entry("work".into()).or_default().insert("neovide".into(), Moved { rect: moved, owner: None });
+        assert_eq!(restore_place(&mut st, &cfg, &n, &act, 1, mon), (Home::Desktop(1), Some(moved)));
+        st.moved.clear();
+        n.rects.clear();
         // Скрытое при снимке окно восстанавливается видимым на своём столе.
         let mut h = entry("neovide", 2, &["work"], &[]);
         h.desktop = "hidden".into();
