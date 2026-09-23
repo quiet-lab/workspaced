@@ -3824,6 +3824,38 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
     }
 
     #[test]
+    fn family_key_cycles_variant_windows() {
+        // Задача 3.6: в mix клавиша семейства перебирает окна обоих профилей,
+        // клавиша варианта — только его окна; в pair у каждого свои окна.
+        let cfg = family_cfg();
+        let clients = vec![
+            crate::hypr::test_client("0x1", "google-chrome", "A", "1", &["app:chrome#1", "ws:mix"]),
+            crate::hypr::test_client("0x2", "google-chrome-ai", "B", "1", &["app:chrome-ai#1", "ws:mix"]),
+            crate::hypr::test_client("0x3", "google-chrome", "C", "1", &["app:chrome#2", "ws:mix"]),
+        ];
+        let addrs = |v: Vec<&Client>| v.into_iter().map(|c| c.address.clone()).collect::<Vec<_>>();
+        let mix: Vec<String> = cfg.workspaces["mix"].apps.keys().cloned().collect();
+        assert_eq!(addrs(placed_windows(&cfg, &clients, "mix", &mix, "chrome")), vec!["0x1", "0x2", "0x3"]);
+        assert_eq!(addrs(placed_windows(&cfg, &clients, "mix", &mix, "chrome-ai")), vec!["0x2"]);
+        let pair_clients: Vec<Client> = clients
+            .iter()
+            .map(|c| {
+                let mut c = c.clone();
+                c.tags = c.tags.iter().map(|t| t.replace("ws:mix", "ws:pair")).collect();
+                c
+            })
+            .collect();
+        let pair: Vec<String> = cfg.workspaces["pair"].apps.keys().cloned().collect();
+        assert_eq!(addrs(placed_windows(&cfg, &pair_clients, "pair", &pair, "chrome")), vec!["0x1", "0x3"]);
+        assert_eq!(addrs(placed_windows(&cfg, &pair_clients, "pair", &pair, "chrome-ai")), vec!["0x2"]);
+        // Режим: в mix вариант берёт запись семейства (обмен ячеек переносит
+        // стопку семейства), в pair у chrome-ai свой mode = "stack".
+        assert_eq!(cycle_mode(&cfg, "mix", "chrome-ai"), (Mode::Swap, "chrome".to_string()));
+        assert_eq!(cycle_mode(&cfg, "pair", "chrome-ai"), (Mode::Stack, "chrome-ai".to_string()));
+        assert_eq!(cycle_mode(&cfg, "pair", "chrome"), (Mode::Swap, "chrome".to_string()));
+    }
+
+    #[test]
     fn app_route_follows_own_key() {
         // Команда `app` — собственная клавиша приложения (решение D5).
         let cfg = overrides_cfg();
