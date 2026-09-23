@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 
 use anyhow::{Context, Result, bail};
-use toml_edit::{DocumentMut, InlineTable, Item, Table, Value, value};
+use toml_edit::{DocumentMut, InlineTable, Item, Table, TableLike, Value, value};
 
 use crate::config::{Config, Mode, PxRect};
 use crate::daemon::{self, Daemon};
@@ -41,6 +41,92 @@ fn app_item(place: &Place, live: Option<PxRect>, expected: Option<PxRect>) -> It
         (Place::Cell(_), Some(l), _) => Item::Value(rect_item(l)),
         (Place::Rect { rect }, live, _) => Item::Value(rect_item(live.unwrap_or(*rect))),
     }
+}
+
+/// Записать место приложения `name` в таблицу `apps` раздела workspace
+/// на месте (изменение workspace-overrides, решение D9). `short` — место
+/// в короткой форме от `app_item`: имя ячейки строкой или `{ rect = … }`.
+/// Строковая запись и запись `{ rect = … }` без других полей заменяются
+/// короткой формой; у записи-таблицы с `chain` или `mode` меняется только
+/// поле места (`cell` или `rect`) на прежней позиции, остальные поля
+/// остаются. Украшения записи (пробелы, комментарий в конце строки)
+/// сохраняются. Запись, которой в таблице не было, добавляется в конец;
+/// тогда возвращается `true`.
+fn set_place(apps: &mut dyn TableLike, name: &str, short: Item) -> bool {
+    let (key, place): (&str, Value) = match short.as_value() {
+        Some(Value::InlineTable(t)) => match t.get("rect") {
+            Some(r) => ("rect", r.clone()),
+            None => return false,
+        },
+        Some(v) => ("cell", v.clone()),
+        None => return false,
+    };
+    let is_place = |k: &str| k == "cell" || k == "rect";
+    let Some(item) = apps.get_mut(name) else {
+        apps.insert(name, short);
+        return true;
+    };
+    match item {
+        Item::Value(Value::InlineTable(t)) if t.iter().any(|(k, _)| !is_place(k)) => {
+            let mut out = InlineTable::new();
+            let mut placed = false;
+            for (k, v) in t.iter() {
+                if !is_place(k) {
+                    out.insert(k, v.clone());
+                } else if !placed {
+                    out.insert(key, place.clone());
+                    placed = true;
+                }
+            }
+            if !placed {
+                out.insert(key, place);
+            }
+            *out.decor_mut() = t.decor().clone();
+            *t = out;
+        }
+        Item::Table(t) => {
+            // Запись отдельной таблицей `[workspaces.<ws>.apps.<имя>]`:
+            // её форма сохраняется, меняется только поле места.
+            t.remove("cell");
+            t.remove("rect");
+            t.insert(key, Item::Value(place));
+        }
+        Item::Value(v) => {
+            let decor = v.decor().clone();
+            if let Ok(mut nv) = short.into_value() {
+                *nv.decor_mut() = decor;
+                *v = nv;
+            }
+        }
+        other => *other = short,
+    }
+    false
+}
+
+/// Записать места приложений в таблицу `apps` раздела workspace `ws`
+/// по порядку `places` (решение D9).
+fn write_places(doc: &mut DocumentMut, ws: &str, places: Vec<(String, Item)>) -> Result<()> {
+    let wtab = doc["workspaces"][ws].as_table_mut().context("workspace не таблица")?;
+    let apps = wtab
+        .entry("apps")
+        .or_insert_with(|| {
+            let mut t = Table::new();
+            t.set_implicit(false);
+            Item::Table(t)
+        })
+        .as_table_like_mut()
+        .context("apps workspace не таблица")?;
+    let mut added = false;
+    for (name, short) in places {
+        added |= set_place(apps, &name, short);
+    }
+    // Таблица apps в одну строку после добавления записи форматируется
+    // заново: иначе пробел, стоявший перед закрывающей скобкой, оказался бы
+    // перед запятой. Комментариев внутри такой таблицы не бывает.
+    if added && let Some(Item::Value(Value::InlineTable(t))) = wtab.get_mut("apps") {
+        t.fmt();
+    }
+    Ok(())
 }
 
 /// Нынешнее место приложения `app` в workspace `ws` для записи в конфиг:
@@ -265,10 +351,15 @@ pub fn save_workspace(d: &mut Daemon) -> Result<String> {
     if cfg.workspaces.get(&ws).map(|w| w.mode()) == Some(Mode::Stack) {
         wtab["mode"] = value("stack");
     }
-    // Приложения по ячейкам; окно не в своей ячейке — rect.
-    let mut apps_tab = Table::new();
-    apps_tab.set_implicit(false);
-    for (app, place) in &cells {
+    // Приложения по ячейкам; окно не в своей ячейке — rect. Записи идут
+    // в порядке раздела эффективного конфига: сначала записи файла, затем
+    // дополнительные приложения сессии; в файле они правятся на месте
+    // (решение D9), и новые встают в конец.
+    let mut order: Vec<String> = cfg.workspaces.get(&ws).map(|w| w.apps.keys().cloned().collect()).unwrap_or_default();
+    order.extend(cells.keys().filter(|a| !order.contains(a)).cloned().collect::<Vec<_>>());
+    let mut places: Vec<(String, Item)> = Vec::new();
+    for app in &order {
+        let Some(place) = cells.get(app) else { continue };
         let expected = d.state_mut().rect_for(&cfg, &ws, app, mon);
         // У приложения с несколькими окнами записывается место первого
         // экземпляра, входящего в workspace: стопка стоит в одном месте,
@@ -276,7 +367,7 @@ pub fn save_workspace(d: &mut Daemon) -> Result<String> {
         // Окно, убранное из workspace командой отделения, места не даёт,
         // а общее окно даёт место, которое занимает здесь (решение D12).
         let live = live_rect(&cfg, &clients, &ws, app);
-        apps_tab.insert(app, app_item(place, live, expected));
+        places.push((app.clone(), app_item(place, live, expected)));
     }
     // Посторонние окна на столе workspace становятся его приложениями: окно,
     // подходящее описанному в конфиге приложению по class и title, — под именем
@@ -322,12 +413,11 @@ pub fn save_workspace(d: &mut Daemon) -> Result<String> {
             ex.push(hypr::d_tag(&c.address, &format!("app:{name}#{}", next_instance(&mut used, &name))));
         }
         ex.push(hypr::d_tag(&c.address, &hypr::ws_tag(&ws)));
-        apps_tab.insert(&name, Item::Value(rect_item(c.rect())));
+        places.push((name.clone(), Item::Value(rect_item(c.rect()))));
         adopted.push(c.address.clone());
         log::info!("сохранение: окно {} ({}) → приложение {name} workspace {ws}", c.address, c.class);
     }
-    let wtab = doc["workspaces"][&ws].as_table_mut().unwrap();
-    wtab.insert("apps", Item::Table(apps_tab));
+    write_places(&mut doc, &ws, places)?;
 
     let path = d.cfg_path().to_path_buf();
     let out = doc.to_string();
@@ -532,6 +622,82 @@ apps = { chromium = "left" }
         assert_eq!(t["args"].as_array().unwrap().get(0).unwrap().as_str(), Some("--mode=paper"));
         assert_eq!(t["cwd"].as_str(), Some("/home/mne"));
         assert_eq!(t["class"].as_str(), Some("^Galculator$"));
+    }
+
+    const SURF: &str = r#"# Браузеры
+[workspaces.surf]
+template = "overlay"
+mode = "stack"
+# Две клавиши у каждого браузера.
+[workspaces.surf.apps]
+# Chrome профиля Default
+chrome = { cell = "left", chain = "SUPER+B" }
+yandex-browser = "center"  # главный
+chrome-ai = { cell = "right", chain = "SUPER+V", mode = "stack" }
+
+[startup]
+workspace = "surf"
+"#;
+
+    #[test]
+    fn save_keeps_overrides() {
+        let mut doc: DocumentMut = SURF.parse().unwrap();
+        let moved = PxRect { x: 700, y: 200, w: 1920, h: 1080 };
+        let places = vec![
+            ("chrome".to_string(), value("left")),
+            ("yandex-browser".to_string(), Item::Value(rect_item(moved))),
+            ("chrome-ai".to_string(), Item::Value(rect_item(moved))),
+        ];
+        write_places(&mut doc, "surf", places).unwrap();
+        let out = doc.to_string();
+        // Запись-таблица сохраняет chain и mode, поле cell заменено на rect
+        // на той же позиции; строковая запись стала { rect = … } и сохранила
+        // комментарий в конце строки.
+        assert!(out.contains("chrome = { cell = \"left\", chain = \"SUPER+B\" }"), "{out}");
+        assert!(out.contains("yandex-browser = { rect = { x = 700, y = 200, w = 1920, h = 1080 } }  # главный"), "{out}");
+        assert!(out.contains("chrome-ai = { rect = { x = 700, y = 200, w = 1920, h = 1080 }, chain = \"SUPER+V\", mode = \"stack\" }"), "{out}");
+        assert!(out.contains("# Chrome профиля Default\nchrome ="), "{out}");
+        assert!(out.contains("# Две клавиши у каждого браузера.\n[workspaces.surf.apps]"), "{out}");
+        // Записанный файл читается, место и переопределения на месте.
+        let text = format!("[templates.overlay]\nmain = \"center\"\ncells = {{ left = {{ x = 0, y = 0, w = 1, h = 1 }}, center = {{ x = 0, y = 0, w = 1, h = 1 }}, right = {{ x = 0, y = 0, w = 1, h = 1 }} }}\n[apps.chrome]\ncmd = \"c\"\n[apps.chrome-ai]\ncmd = \"c\"\n[apps.yandex-browser]\ncmd = \"y\"\n{out}");
+        let cfg = Config::parse(&text).unwrap();
+        let ai = &cfg.workspaces["surf"].apps["chrome-ai"];
+        assert_eq!(ai.place, crate::config::Placement::Rect { rect: moved.to_rect() });
+        assert_eq!((ai.chain.as_deref(), ai.mode.as_deref()), (Some("SUPER+V"), Some("stack")));
+        // Обратно в ячейку: запись-таблица получает cell, { rect } без других
+        // полей становится строкой.
+        let mut doc: DocumentMut = out.parse().unwrap();
+        write_places(&mut doc, "surf", vec![("yandex-browser".to_string(), value("center")), ("chrome-ai".to_string(), value("right"))]).unwrap();
+        let out = doc.to_string();
+        assert!(out.contains("yandex-browser = \"center\"  # главный"), "{out}");
+        assert!(out.contains("chrome-ai = { cell = \"right\", chain = \"SUPER+V\", mode = \"stack\" }"), "{out}");
+    }
+
+    #[test]
+    fn save_keeps_entry_order() {
+        let mut doc: DocumentMut = SURF.parse().unwrap();
+        // Порядок places — порядок раздела эффективного конфига: записи файла,
+        // затем дополнительные приложения сессии.
+        let calc = PxRect { x: 2600, y: 1500, w: 600, h: 400 };
+        let places = vec![
+            ("chrome".to_string(), value("left")),
+            ("yandex-browser".to_string(), value("center")),
+            ("chrome-ai".to_string(), value("right")),
+            ("galculator".to_string(), Item::Value(rect_item(calc))),
+        ];
+        write_places(&mut doc, "surf", places).unwrap();
+        let out = doc.to_string();
+        let pos = |k: &str| out.find(&format!("\n{k} =")).unwrap_or_else(|| panic!("{k}: {out}"));
+        assert!(pos("chrome") < pos("yandex-browser") && pos("yandex-browser") < pos("chrome-ai") && pos("chrome-ai") < pos("galculator"), "{out}");
+        assert!(out.contains("galculator = { rect = { x = 2600, y = 1500, w = 600, h = 400 } }\n\n[startup]"), "{out}");
+        // Без правки мест файл не меняется ни на символ.
+        let mut doc: DocumentMut = SURF.parse().unwrap();
+        write_places(&mut doc, "surf", vec![("chrome".to_string(), value("left")), ("yandex-browser".to_string(), value("center")), ("chrome-ai".to_string(), value("right"))]).unwrap();
+        assert_eq!(doc.to_string(), SURF);
+        // Раздел с таблицей apps в одну строку правится так же.
+        let mut doc: DocumentMut = "[workspaces.w]\napps = { a = \"left\", b = { cell = \"right\", chain = \"SUPER+X\" } }\n".parse().unwrap();
+        write_places(&mut doc, "w", vec![("a".to_string(), value("left")), ("b".to_string(), Item::Value(rect_item(calc))), ("c".to_string(), value("left"))]).unwrap();
+        assert_eq!(doc.to_string(), "[workspaces.w]\napps = { a = \"left\", b = { rect = { x = 2600, y = 1500, w = 600, h = 400 }, chain = \"SUPER+X\" }, c = \"left\" }\n");
     }
 
     #[test]
