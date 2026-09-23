@@ -37,7 +37,7 @@ impl Combo {
         parts.join("+")
     }
     /// Ключ сравнения: клавиши в Hyprland не зависят от регистра.
-    fn cmp_key(&self) -> (Vec<String>, String) {
+    pub(crate) fn cmp_key(&self) -> (Vec<String>, String) {
         (self.mods.clone(), self.key.to_ascii_lowercase())
     }
 }
@@ -177,16 +177,41 @@ impl Flags {
 }
 
 /// Привязка: цепочка, действие, флаги и откуда она взялась (для сообщений).
+/// `origin` — номер записи `[[binds]]`, из которой привязка получена; у клавиш
+/// `[keys]`, приложений и workspace его нет.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Binding {
     pub chain: Chain,
     pub source: String,
     pub act: Act,
     pub flags: Flags,
+    pub origin: Option<usize>,
 }
 
 fn plain(chain: Chain, source: String, command: String) -> Binding {
-    Binding { chain, source, act: Act::Daemon(command), flags: Flags::default() }
+    Binding { chain, source, act: Act::Daemon(command), flags: Flags::default(), origin: None }
+}
+
+/// Запись с подстановкой `n` на место `$n` в chain, exec, dispatch, desc
+/// и номере стола действия `move`; поле `range` снимается.
+pub(crate) fn substitute(b: &Bind, n: &str) -> Bind {
+    let sub = |s: &String| s.replace("$n", n);
+    let mut e = b.clone();
+    e.range = None;
+    e.chain = sub(&b.chain);
+    e.exec = b.exec.as_ref().map(sub);
+    e.desc = b.desc.as_ref().map(sub);
+    // Номер стола в действии `move` подставляется так же, как в цепочке:
+    // одна запись разворачивается в серию Ctrl+Super+1…8.
+    e.action = b.action.as_ref().map(|a| match a {
+        Action::Move(m) => Action::Move(MoveAction { desktop: Desk::Str(sub(&m.desktop.text())) }),
+        other => other.clone(),
+    });
+    e.dispatch = b.dispatch.as_ref().map(|d| match d {
+        Dispatch::One(s) => Dispatch::One(sub(s)),
+        Dispatch::Many(v) => Dispatch::Many(v.iter().map(sub).collect()),
+    });
+    e
 }
 
 /// Развернуть запись с `range`: подстановка `$n` в chain, exec и dispatch.
@@ -194,27 +219,63 @@ fn expand_range(b: &Bind) -> Vec<Bind> {
     let Some((from, to)) = b.range else {
         return vec![b.clone()];
     };
-    (from..=to)
-        .map(|n| {
-            let n = n.to_string();
-            let sub = |s: &String| s.replace("$n", &n);
-            let mut e = b.clone();
-            e.range = None;
-            e.chain = sub(&b.chain);
-            e.exec = b.exec.as_ref().map(sub);
-            // Номер стола в действии `move` подставляется так же, как в цепочке:
-            // одна запись разворачивается в серию Ctrl+Super+1…8.
-            e.action = b.action.as_ref().map(|a| match a {
-                Action::Move(m) => Action::Move(MoveAction { desktop: Desk::Str(sub(&m.desktop.text())) }),
-                other => other.clone(),
-            });
-            e.dispatch = b.dispatch.as_ref().map(|d| match d {
-                Dispatch::One(s) => Dispatch::One(sub(s)),
-                Dispatch::Many(v) => Dispatch::Many(v.iter().map(sub).collect()),
-            });
-            e
+    (from..=to).map(|n| substitute(b, &n.to_string())).collect()
+}
+
+/// Действие записи `[[binds]]`. `strict` — номер стола в `move` обязан быть
+/// числом; без него (подпись серии «1…8» в подсказке клавиш) текст номера
+/// попадает в команду как есть.
+pub(crate) fn bind_act(b: &Bind, strict: bool) -> Result<Act> {
+    let act = if let Some(a) = &b.action {
+        Act::Daemon(match a {
+            Action::Named(n) => match n.as_str() {
+                "sessions" => "workspaced sessions".to_string(),
+                "save-session" => "workspaced save-session".to_string(),
+                "save-workspace" => "workspaced save-workspace".to_string(),
+                "next-workspace" => "workspaced next".to_string(),
+                "maximize" => "workspaced maximize".to_string(),
+                "arrange" => "workspaced arrange".to_string(),
+                "detach" => "workspaced detach".to_string(),
+                other => bail!("привязка {:?}: неизвестное действие {other:?}", b.chain),
+            },
+            Action::Half(HalfAction { half }) => format!("workspaced half {half}"),
+            Action::Place(PlaceAction { place }) => format!("workspaced place {place}"),
+            // Номер стола проверяется здесь, а не при разборе конфига:
+            // в записи с `range` на его месте стоит `$n`, и число
+            // появляется только после разворачивания серии.
+            Action::Move(MoveAction { desktop }) => match desktop.number() {
+                Some(n) => format!("workspaced move-desktop {n}"),
+                None if !strict => format!("workspaced move-desktop {}", desktop.text()),
+                None => bail!("привязка {:?}: move должен быть номером стола от 1 до 8, получено {:?}", b.chain, desktop.text()),
+            },
+            Action::Target(TargetAction { desktop, workspace, app, pull }) => {
+                let mut cmd = match (workspace, app) {
+                    (_, Some(a)) => format!("workspaced app {a}"),
+                    (Some(w), None) => format!("workspaced raise {w}"),
+                    (None, None) => bail!("привязка {:?}: в action нужен workspace или app", b.chain),
+                };
+                if let (Some(w), Some(_)) = (workspace, app) {
+                    write!(cmd, " --workspace {w}").unwrap();
+                }
+                if let Some(d) = desktop {
+                    write!(cmd, " --desktop {d}").unwrap();
+                }
+                if *pull == Some(true) {
+                    cmd.push_str(" --pull");
+                }
+                cmd
+            }
         })
-        .collect()
+    } else if let Some(cmd) = &b.exec {
+        Act::Exec(cmd.clone())
+    } else if let Some(d) = &b.dispatch {
+        Act::Dispatch(d.exprs())
+    } else if let Some(body) = &b.lua {
+        Act::Lua(body.clone())
+    } else {
+        bail!("привязка {:?}: нет действия", b.chain);
+    };
+    Ok(act)
 }
 
 /// Цепочка в одинарных кавычках оболочки: в ней бывают пробелы
@@ -291,58 +352,9 @@ pub fn collect(cfg: &Config) -> Result<Vec<Binding>> {
     for (i, raw) in cfg.binds.iter().enumerate() {
         for b in expand_range(raw) {
             let source = format!("binds[{i}] {:?}", b.chain);
-            let act = if let Some(a) = &b.action {
-                Act::Daemon(match a {
-                    Action::Named(n) => match n.as_str() {
-                        "sessions" => "workspaced sessions".to_string(),
-                        "save-session" => "workspaced save-session".to_string(),
-                        "save-workspace" => "workspaced save-workspace".to_string(),
-                        "next-workspace" => "workspaced next".to_string(),
-                        "maximize" => "workspaced maximize".to_string(),
-                        "arrange" => "workspaced arrange".to_string(),
-                        "detach" => "workspaced detach".to_string(),
-                        other => bail!("привязка {:?}: неизвестное действие {other:?}", b.chain),
-                    },
-                    Action::Half(HalfAction { half }) => format!("workspaced half {half}"),
-                    Action::Place(PlaceAction { place }) => format!("workspaced place {place}"),
-                    // Номер стола проверяется здесь, а не при разборе конфига:
-                    // в записи с `range` на его месте стоит `$n`, и число
-                    // появляется только после разворачивания серии.
-                    Action::Move(MoveAction { desktop }) => {
-                        let Some(n) = desktop.number() else {
-                            bail!("привязка {:?}: move должен быть номером стола от 1 до 8, получено {:?}", b.chain, desktop.text())
-                        };
-                        format!("workspaced move-desktop {n}")
-                    }
-                    Action::Target(TargetAction { desktop, workspace, app, pull }) => {
-                        let mut cmd = match (workspace, app) {
-                            (_, Some(a)) => format!("workspaced app {a}"),
-                            (Some(w), None) => format!("workspaced raise {w}"),
-                            (None, None) => bail!("привязка {:?}: в action нужен workspace или app", b.chain),
-                        };
-                        if let (Some(w), Some(_)) = (workspace, app) {
-                            write!(cmd, " --workspace {w}").unwrap();
-                        }
-                        if let Some(d) = desktop {
-                            write!(cmd, " --desktop {d}").unwrap();
-                        }
-                        if *pull == Some(true) {
-                            cmd.push_str(" --pull");
-                        }
-                        cmd
-                    }
-                })
-            } else if let Some(cmd) = &b.exec {
-                Act::Exec(cmd.clone())
-            } else if let Some(d) = &b.dispatch {
-                Act::Dispatch(d.exprs())
-            } else if let Some(body) = &b.lua {
-                Act::Lua(body.clone())
-            } else {
-                bail!("привязка {:?}: нет действия", b.chain);
-            };
+            let act = bind_act(&b, true)?;
             let flags = Flags { locked: b.locked, repeating: b.repeating, mouse: b.mouse, release: b.release };
-            out.push(Binding { chain: parse_chain(&b.chain)?, source, act, flags });
+            out.push(Binding { chain: parse_chain(&b.chain)?, source, act, flags, origin: Some(i) });
         }
     }
     Ok(out)

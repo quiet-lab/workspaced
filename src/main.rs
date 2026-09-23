@@ -8,6 +8,7 @@ mod config;
 mod daemon;
 mod hypr;
 mod keys;
+mod keys_help;
 mod save;
 mod session;
 mod state;
@@ -29,7 +30,7 @@ enum Command {
     Daemon,
     /// Проверить конфиг и вывести сводку
     Check,
-    /// Напечатать привязки: код Lua для конфига Hyprland (--lua) или таблицу (--list)
+    /// Напечатать привязки: код Lua для конфига Hyprland (--lua), таблицу (--list) или перечень по группам в JSON (--json)
     Keys {
         /// Код Lua; удачный результат сохраняется в ~/.local/state/workspaced/keys.lua
         #[arg(long)]
@@ -37,6 +38,10 @@ enum Command {
         /// Таблица всех привязок: цепочка, действие, флаги, источник
         #[arg(long)]
         list: bool,
+        /// Перечень для окна подсказки панели: группы по назначению, в каждой
+        /// цепочка, её подпись, описание, действие и источник
+        #[arg(long)]
+        json: bool,
     },
     /// Поставить активное окно в половину рабочей области
     Half {
@@ -132,9 +137,11 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Daemon => daemon::run(),
         Command::Check => check(),
-        Command::Keys { list, .. } => {
+        Command::Keys { list, json: as_json, .. } => {
             let cfg = config::Config::load(&config::config_path())?;
-            if list {
+            if as_json {
+                println!("{}", serde_json::to_string_pretty(&keys_help::to_json(&cfg)?)?);
+            } else if list {
                 print!("{}", keys::to_list(&cfg)?);
             } else {
                 let code = keys::to_lua(&cfg)?;

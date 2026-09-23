@@ -341,6 +341,10 @@ pub struct Keys {
     /// намеренно свободные сочетания Openbox).
     #[serde(default)]
     pub reserved: Vec<String>,
+    /// Описания зарезервированных сочетаний для окна подсказки клавиш:
+    /// сочетание → что оно делает («SUPER+space» = «Следующая раскладка»).
+    #[serde(default)]
+    pub reserved_desc: BTreeMap<String, String>,
 }
 
 /// Половина рабочей области: `{ half = "left" }`.
@@ -461,6 +465,13 @@ pub struct Bind {
     pub mouse: bool,
     #[serde(default)]
     pub release: bool,
+    /// Описание для окна подсказки клавиш (`workspaced keys --json`); без него
+    /// описание выводится из действия.
+    #[serde(default)]
+    pub desc: Option<String>,
+    /// Группа в окне подсказки клавиш; без неё группа выводится из действия.
+    #[serde(default)]
+    pub group: Option<String>,
 }
 
 impl Bind {
