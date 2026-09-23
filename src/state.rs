@@ -113,8 +113,8 @@ impl State {
                 .map(|w| {
                     w.apps
                         .iter()
-                        .map(|(a, p)| {
-                            let place = match p {
+                        .map(|(a, e)| {
+                            let place = match &e.place {
                                 Placement::Cell(c) => Place::Cell(c.clone()),
                                 Placement::Rect { rect } => Place::Rect { rect: rect.resolve(mon.0, mon.1) },
                             };

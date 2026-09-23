@@ -199,6 +199,75 @@ pub enum Placement {
     Rect { rect: Rect },
 }
 
+/// Запись приложения в таблице `apps` workspace (изменение
+/// workspace-overrides, решение D1): место — ячейка шаблона или свой
+/// прямоугольник — и необязательные переопределения клавиши (`chain`)
+/// и режима клавиши (`mode`) этого приложения в этом workspace. В файле
+/// запись бывает строкой (имя ячейки), таблицей `{ rect = … }` или таблицей
+/// с полем `cell` либо `rect` и полями `chain`, `mode`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WsApp {
+    pub place: Placement,
+    pub chain: Option<String>,
+    pub mode: Option<String>,
+    /// Ошибка места в записи-таблице: нет ни `cell`, ни `rect`, либо заданы
+    /// оба. Разбор её не отклоняет, чтобы проверка конфига назвала
+    /// workspace и приложение (решение D8).
+    pub place_error: Option<&'static str>,
+}
+
+impl WsApp {
+    /// Запись только о месте: так в эффективный конфиг входят записи
+    /// дополнительных приложений сессии (решение D11).
+    pub fn at(place: Placement) -> WsApp {
+        WsApp { place, chain: None, mode: None, place_error: None }
+    }
+
+    /// Место задано ячейкой шаблона.
+    pub fn has_cell(&self) -> bool {
+        matches!(self.place, Placement::Cell(_))
+    }
+}
+
+impl<'de> Deserialize<'de> for WsApp {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = WsApp;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("имя ячейки строкой или таблица с cell либо rect и необязательными chain, mode")
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> std::result::Result<WsApp, E> {
+                Ok(WsApp::at(Placement::Cell(v.to_string())))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> std::result::Result<WsApp, A::Error> {
+                let (mut cell, mut rect, mut chain, mut mode) = (None::<String>, None::<Rect>, None::<String>, None::<String>);
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "cell" => cell = Some(map.next_value()?),
+                        "rect" => rect = Some(map.next_value()?),
+                        "chain" => chain = Some(map.next_value()?),
+                        "mode" => mode = Some(map.next_value()?),
+                        // Неизвестный ключ пропускается: обёртка serde_ignored
+                        // видит пропуск и пишет предупреждение с путём ключа.
+                        _ => {
+                            map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                let (place, place_error) = match (cell, rect) {
+                    (Some(c), None) => (Placement::Cell(c), None),
+                    (None, Some(r)) => (Placement::Rect { rect: r }, None),
+                    (None, None) => (Placement::Cell(String::new()), Some("нужно место: поле cell или rect")),
+                    (Some(c), Some(_)) => (Placement::Cell(c), Some("заданы оба поля cell и rect, допустимо одно")),
+                };
+                Ok(WsApp { place, chain, mode, place_error })
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
 /// Поведение клавиши приложения в workspace (спецификация ws-daemon,
 /// «Цепочка приложения»): обмен ячеек с главной или подъём окна на месте.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,7 +278,7 @@ pub enum Mode {
     Stack,
 }
 
-/// Допустимые значения поля `mode` у workspace.
+/// Допустимые значения поля `mode` у workspace и у записи приложения в нём.
 pub const MODES: [&str; 2] = ["swap", "stack"];
 
 fn default_mode() -> String {
@@ -238,12 +307,19 @@ pub struct Workspace {
     /// Порядок записей сохраняется таким, как в файле: по нему конец цикла
     /// клавиши выбирает следующее приложение workspace.
     #[serde(default)]
-    pub apps: IndexMap<String, Placement>,
+    pub apps: IndexMap<String, WsApp>,
+}
+
+impl Mode {
+    /// Режим по значению поля `mode`; значение проверено при чтении конфига.
+    pub fn of(name: &str) -> Mode {
+        if name == "stack" { Mode::Stack } else { Mode::Swap }
+    }
 }
 
 impl Workspace {
     pub fn mode(&self) -> Mode {
-        if self.mode == "stack" { Mode::Stack } else { Mode::Swap }
+        Mode::of(&self.mode)
     }
 }
 
@@ -508,11 +584,19 @@ impl Config {
             if !MODES.contains(&w.mode.as_str()) {
                 bail!("workspace {wname}: mode должен быть одним из {}, получено {:?}", MODES.join(", "), w.mode);
             }
-            for (aname, place) in &w.apps {
+            for (aname, entry) in &w.apps {
                 if !self.apps.contains_key(aname) {
                     bail!("workspace {wname}: приложение {aname:?} не описано в [apps]");
                 }
-                if let Placement::Cell(cell) = place
+                if let Some(e) = entry.place_error {
+                    bail!("workspace {wname}: запись приложения {aname}: {e}");
+                }
+                if let Some(m) = &entry.mode
+                    && !MODES.contains(&m.as_str())
+                {
+                    bail!("workspace {wname}: приложение {aname}: mode должен быть одним из {}, получено {m:?}", MODES.join(", "));
+                }
+                if let Placement::Cell(cell) = &entry.place
                     && !t.cells.contains_key(cell)
                 {
                     bail!("workspace {wname}: приложение {aname} ссылается на ячейку {cell:?}, которой нет в шаблоне {}", w.template);
@@ -636,6 +720,69 @@ impl Config {
                 false
             }
         })
+    }
+
+    /// Запись, описывающая приложение в workspace (изменение
+    /// workspace-overrides, решение D6): запись самого приложения, а без неё —
+    /// запись его семейства. Возвращает имя записи и её саму.
+    pub fn ws_entry(&self, ws: &str, app: &str) -> Option<(&str, &WsApp)> {
+        let w = self.workspaces.get(ws)?;
+        if let Some((k, e)) = w.apps.get_key_value(app) {
+            return Some((k.as_str(), e));
+        }
+        let f = self.family_of(app)?;
+        w.apps.get_key_value(f).map(|(k, e)| (k.as_str(), e))
+    }
+
+    /// Ключ приложения в workspace (решение D2): `chain` записи самого
+    /// приложения в этом workspace, а без него — собственный `chain`
+    /// приложения.
+    pub fn app_key(&self, ws: &str, app: &str) -> Option<&str> {
+        self.workspaces
+            .get(ws)
+            .and_then(|w| w.apps.get(app))
+            .and_then(|e| e.chain.as_deref())
+            .or_else(|| self.apps.get(app)?.chain.as_deref())
+    }
+
+    /// Workspace переопределяет клавишу приложения: у записи самого
+    /// приложения есть `chain`, и он не совпадает с собственной клавишей.
+    /// Переопределение, совпадающее с собственной клавишей, ничего не меняет
+    /// (решение D2); приложение, описанное только через семейство, своей
+    /// записи не имеет и клавишу не переопределяет.
+    pub fn overrides_key(&self, ws: &str, app: &str) -> bool {
+        let Some(c) = self.workspaces.get(ws).and_then(|w| w.apps.get(app)).and_then(|e| e.chain.as_deref()) else {
+            return false;
+        };
+        match self.apps.get(app).and_then(|a| a.chain.as_deref()) {
+            Some(own) => !crate::keys::same_chain(c, own),
+            None => true,
+        }
+    }
+
+    /// Режим клавиши приложения в workspace (решение D7): поле `mode` записи,
+    /// описывающей приложение; без него — режим workspace, кроме приложения
+    /// без ячейки в workspace режима `swap`, которое выбирается в режиме
+    /// `stack`. Приложение без записи в workspace берёт режим workspace.
+    pub fn app_mode(&self, ws: &str, app: &str) -> Mode {
+        let ws_mode = self.workspaces.get(ws).map(Workspace::mode).unwrap_or(Mode::Swap);
+        match self.ws_entry(ws, app) {
+            Some((_, e)) => match &e.mode {
+                Some(m) => Mode::of(m),
+                None if ws_mode == Mode::Swap && !e.has_cell() => Mode::Stack,
+                None => ws_mode,
+            },
+            None => ws_mode,
+        }
+    }
+
+    /// Приложение, которым workspace откликается на цепочку: запись, ключ
+    /// которой (`app_key`) совпадает с цепочкой. При двух откликах —
+    /// запись, стоящая раньше в разделе (решение D8): записи файла идут
+    /// раньше записей сессии.
+    pub fn responds(&self, ws: &str, chain: &str) -> Option<String> {
+        let w = self.workspaces.get(ws)?;
+        w.apps.keys().find(|a| self.app_key(ws, a).is_some_and(|k| crate::keys::same_chain(k, chain))).cloned()
     }
 
     /// Варианты семейства по именам.
@@ -782,6 +929,122 @@ apps = { terminal = "right" }
         let bad = text.replace("mode = \"stack\"", "mode = \"stak\"");
         let err = Config::parse(&bad).unwrap_err().to_string();
         assert!(err.contains("work") && err.contains("stak") && err.contains("swap") && err.contains("stack"), "{err}");
+    }
+
+    /// Приложения браузеров и workspace для проверок записи приложения
+    /// в workspace (изменение workspace-overrides).
+    const OVERRIDES: &str = r#"
+[templates.overlay]
+main = "center"
+[templates.overlay.cells]
+left = { x = 340, y = 10, w = 1920, h = 2140 }
+center = { x = 1125, y = 10, w = 1920, h = 2140 }
+right = { x = 1910, y = 10, w = 1920, h = 2140 }
+
+[apps.chrome]
+cmd = "chrome"
+chain = "SUPER+SHIFT+B"
+[apps.chrome-ai]
+cmd = "chrome"
+chain = "SUPER+SHIFT+V"
+[apps.yandex]
+cmd = "yandex"
+chain = "SUPER+SHIFT+Y"
+[apps.calc]
+cmd = "galculator"
+[apps.chromium]
+cmd = "chromium"
+chain = "SUPER+C"
+
+[workspaces.surf]
+template = "overlay"
+mode = "stack"
+[workspaces.surf.apps]
+chrome = { cell = "left", chain = "SUPER+B" }
+yandex = "center"
+chrome-ai = { cell = "right", chain = "SUPER+V" }
+
+[workspaces.work]
+template = "overlay"
+[workspaces.work.apps]
+chromium = "left"
+calc = { rect = { x = 2600, y = 1500, w = 600, h = 400 } }
+"#;
+
+    #[test]
+    fn ws_app_entry_forms() {
+        // Прежние формы читаются без правки: строка и { rect = … }.
+        let cfg = Config::parse(MINIMAL).unwrap();
+        assert_eq!(cfg.workspaces["work"].apps["terminal"], WsApp::at(Placement::Cell("right".into())));
+        let cfg = Config::parse(OVERRIDES).unwrap();
+        let surf = &cfg.workspaces["surf"];
+        assert_eq!(surf.apps.keys().map(String::as_str).collect::<Vec<_>>(), vec!["chrome", "yandex", "chrome-ai"]);
+        let ai = &surf.apps["chrome-ai"];
+        assert_eq!((ai.place.clone(), ai.chain.as_deref(), ai.mode.as_deref()), (Placement::Cell("right".into()), Some("SUPER+V"), None));
+        let calc = &cfg.workspaces["work"].apps["calc"];
+        assert!(!calc.has_cell() && calc.chain.is_none() && calc.mode.is_none());
+        // Таблица с rect, chain и mode.
+        let text = OVERRIDES.replace(
+            "calc = { rect = { x = 2600, y = 1500, w = 600, h = 400 } }",
+            "calc = { rect = { x = 2600, y = 1500, w = 600, h = 400 }, mode = \"swap\", chain = \"SUPER+K\" }",
+        );
+        let cfg = Config::parse(&text).unwrap();
+        let calc = &cfg.workspaces["work"].apps["calc"];
+        assert_eq!((calc.chain.as_deref(), calc.mode.as_deref()), (Some("SUPER+K"), Some("swap")));
+        assert_eq!(calc.place, Placement::Rect { rect: PxRect { x: 2600, y: 1500, w: 600, h: 400 }.to_rect() });
+        // Неизвестный ключ записи — предупреждение, а не отказ.
+        let text = OVERRIDES.replace("chrome-ai = { cell = \"right\", chain = \"SUPER+V\" }", "chrome-ai = { cell = \"right\", chian = \"SUPER+V\" }");
+        let cfg = Config::parse(&text).unwrap();
+        assert!(cfg.workspaces["surf"].apps["chrome-ai"].chain.is_none());
+    }
+
+    #[test]
+    fn ws_app_entry_errors() {
+        let entry = "chrome-ai = { cell = \"right\", chain = \"SUPER+V\" }";
+        for bad in ["chrome-ai = { chain = \"SUPER+V\" }", "chrome-ai = { cell = \"right\", rect = { x = 0, y = 0, w = 10, h = 10 } }"] {
+            let err = Config::parse(&OVERRIDES.replace(entry, bad)).unwrap_err().to_string();
+            assert!(err.contains("surf") && err.contains("chrome-ai"), "{bad}: {err}");
+        }
+        let err = Config::parse(&OVERRIDES.replace(entry, "chrome-ai = { cell = \"right\", mode = \"stak\" }")).unwrap_err().to_string();
+        assert!(err.contains("surf") && err.contains("chrome-ai") && err.contains("stak") && err.contains("swap") && err.contains("stack"), "{err}");
+        // Ячейка проверяется и в записи-таблице.
+        let err = Config::parse(&OVERRIDES.replace(entry, "chrome-ai = { cell = \"top\" }")).unwrap_err().to_string();
+        assert!(err.contains("surf") && err.contains("chrome-ai") && err.contains("top"), "{err}");
+    }
+
+    #[test]
+    fn app_key_and_mode_in_workspace() {
+        let text = OVERRIDES.replace(
+            "chromium = \"left\"",
+            "chromium = { cell = \"left\", mode = \"stack\" }\nyandex = \"right\"",
+        );
+        let cfg = Config::parse(&text).unwrap();
+        // Ключ: переопределение главнее собственной клавиши.
+        assert_eq!(cfg.app_key("surf", "chrome-ai"), Some("SUPER+V"));
+        assert_eq!(cfg.app_key("surf", "yandex"), Some("SUPER+SHIFT+Y"));
+        assert_eq!(cfg.app_key("work", "chrome-ai"), Some("SUPER+SHIFT+V"));
+        assert!(cfg.overrides_key("surf", "chrome-ai") && !cfg.overrides_key("surf", "yandex") && !cfg.overrides_key("work", "chrome-ai"));
+        // Отклик workspace на цепочку — по ключам записей, регистр клавиши не важен.
+        assert_eq!(cfg.responds("surf", "super+v"), Some("chrome-ai".into()));
+        assert_eq!(cfg.responds("surf", "SUPER+SHIFT+Y"), Some("yandex".into()));
+        assert_eq!(cfg.responds("surf", "SUPER+SHIFT+V"), None);
+        assert_eq!(cfg.responds("work", "SUPER+V"), None);
+        // Режим: поле записи, иначе режим workspace; без ячейки в swap — stack.
+        assert_eq!(cfg.app_mode("surf", "chrome"), Mode::Stack);
+        assert_eq!(cfg.app_mode("work", "calc"), Mode::Stack);
+        assert_eq!(cfg.app_mode("work", "chromium"), Mode::Stack);
+        assert_eq!(cfg.app_mode("work", "yandex"), Mode::Swap);
+        let swap = text.replace("calc = { rect = { x = 2600, y = 1500, w = 600, h = 400 } }", "calc = { rect = { x = 2600, y = 1500, w = 600, h = 400 }, mode = \"swap\" }");
+        assert_eq!(Config::parse(&swap).unwrap().app_mode("work", "calc"), Mode::Swap);
+        // Переопределение, совпадающее с собственной клавишей, ничего не меняет.
+        let same = text.replace("yandex = \"center\"", "yandex = { cell = \"center\", chain = \"shift+super+Y\" }");
+        assert!(!Config::parse(&same).unwrap().overrides_key("surf", "yandex"));
+        // Вариант без своей записи описан записью семейства и берёт её режим.
+        let fam = text.replace("[apps.chrome-ai]\ncmd = \"chrome\"", "[apps.chrome-ai]\nfamily = \"chrome\"\ncmd = \"chrome\"").replace("chrome-ai = { cell = \"right\", chain = \"SUPER+V\" }\n", "");
+        let cfg = Config::parse(&fam).unwrap();
+        assert_eq!(cfg.ws_entry("surf", "chrome-ai").map(|(n, _)| n), Some("chrome"));
+        assert_eq!(cfg.app_key("surf", "chrome-ai"), Some("SUPER+SHIFT+V"));
+        assert!(!cfg.overrides_key("surf", "chrome-ai"));
     }
 
     #[test]

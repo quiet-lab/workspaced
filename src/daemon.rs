@@ -12,7 +12,8 @@ use std::sync::mpsc::{self, Sender};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
-use crate::config::{Config, Mode, Placement, PxRect, config_path};
+use crate::config::{Config, Mode, Placement, PxRect, WsApp, config_path};
+use crate::keys::same_chain;
 use crate::hypr::{self, Client, Event, Hypr};
 use crate::session;
 use crate::state::{Cycle, Desktop, ExtraApp, Foreign, Place, State};
@@ -1232,18 +1233,18 @@ impl Daemon {
         }
     }
 
-    /// Выбрать окно (спецификация ws-daemon, «Цепочка приложения»): в режиме
-    /// обмена ячеек приложение окна сначала занимает главную ячейку, в режиме
-    /// `stack` окно только поднимается наверх и получает фокус. Без `swap`
-    /// окно только получает фокус и поднимается наверх в любом режиме: так
-    /// выбирается окно, только что открытое или перетащенное в workspace
-    /// (решение D15).
+    /// Выбрать окно (спецификация ws-daemon, «Цепочка приложения»): при
+    /// `swap` — режим обмена ячеек вызванного приложения — приложение окна
+    /// сначала занимает главную ячейку; без него окно только поднимается
+    /// наверх и получает фокус. Режим задаёт вызванное приложение, а не
+    /// workspace (изменение workspace-overrides, решение D7); без обмена
+    /// выбирается и окно, только что открытое или перетащенное в workspace
+    /// (изменение shared-windows, решение D15).
     fn select_window(&mut self, ws: &str, addr: &str, clients: &[Client], swap: bool) -> Result<()> {
         let cfg = self.cfg.clone();
         let ws_apps = self.ws_apps(ws);
         let mut ex = Vec::new();
         if swap
-            && cfg.workspaces.get(ws).map(|w| w.mode()) == Some(Mode::Swap)
             && let Some(c) = clients.iter().find(|c| c.address == addr)
             && let Some(app) = ws_app_of(&cfg, ws, &ws_apps, c)
         {
@@ -1266,6 +1267,11 @@ impl Daemon {
         self.adopt_untagged(&mut clients, std::slice::from_ref(&app.to_string()), Some(ws))?;
         let cfg = self.cfg.clone();
         let ws_apps = self.ws_apps(ws);
+        // Весь цикл идёт в режиме вызванного приложения (решение D7), а обмен
+        // ячеек переносит запись, которая его описывает: у варианта без своей
+        // записи это запись семейства (решение D6).
+        let (mode, entry) = cycle_mode(&cfg, ws, app);
+        let swap = mode == Mode::Swap;
         let wins = placed_windows(&cfg, &clients, ws, &ws_apps, app);
         let order: Vec<String> = wins.iter().filter(|c| !c.on_hidden()).map(|c| c.address.clone()).collect();
         if order.is_empty() && !wins.is_empty() {
@@ -1278,10 +1284,10 @@ impl Daemon {
         let on_instance = active.as_deref().is_some_and(|a| order.iter().any(|x| x == a));
         if fresh || !on_instance {
             // Начало цикла: запомнить окно, к которому вернёт его конец.
-            let main_window = (cfg.workspaces.get(ws).map(|w| w.mode()) == Some(Mode::Swap))
+            let main_window = swap
                 .then(|| self.st.main_app(&cfg, ws, self.mon))
                 .flatten()
-                .filter(|m| m != app)
+                .filter(|m| *m != entry)
                 .and_then(|m| placed_windows(&cfg, &clients, ws, &ws_apps, &m).into_iter().find(|c| !c.on_hidden()).map(|c| c.address.clone()));
             let focus = self.st.focus.get(ws).cloned();
             let back = anchor_window(&cfg, &clients, ws, main_window.as_deref(), &order, active.as_deref(), focus.as_deref());
@@ -1294,29 +1300,29 @@ impl Daemon {
             .filter(|c| c.app == app)
             .and_then(|c| c.back.clone())
             .filter(|a| clients.iter().any(|c| c.address == *a && !c.on_hidden()));
-        let next = next_app_window(&cfg, &clients, ws, app);
+        let next = next_app_window(&cfg, &clients, ws, &entry);
         match cycle_step(&order, active.as_deref(), fresh, prev.as_deref(), next.as_deref()) {
             CycleStep::Launch => {
                 // Запуск — это тоже выбор экземпляра: в режиме обмена ячеек
                 // приложение сначала занимает главную ячейку, и окно появляется
                 // уже в ней, а прежнее главное уходит в ячейку приложения.
                 let mut ex = Vec::new();
-                if cfg.workspaces.get(ws).map(|w| w.mode()) == Some(Mode::Swap) {
-                    self.swap_to_main(ws, app, &clients, &mut ex);
+                if swap {
+                    self.swap_to_main(ws, &entry, &clients, &mut ex);
                 }
                 self.hypr.dispatch_all(&ex)?;
                 let rect = self.st.rect_for(&cfg, ws, app, self.mon);
                 let n = self.current;
                 self.spawn(app, Some(ws), n, rect.map(Target::Place).unwrap_or(Target::Free(None)), true)
             }
-            CycleStep::Select(addr) => self.select_window(ws, &addr, &clients, start != Start::Joined),
+            CycleStep::Select(addr) => self.select_window(ws, &addr, &clients, swap && start != Start::Joined),
             CycleStep::Back(addr) => {
                 log::info!("{ws}: цикл {app} закончен, возврат к окну {addr}");
-                self.select_window(ws, &addr, &clients, true)
+                self.select_window(ws, &addr, &clients, swap)
             }
             CycleStep::NextApp(addr) => {
                 log::info!("{ws}: цикл {app} закончен, prev нет — следующее приложение workspace, окно {addr}");
-                self.select_window(ws, &addr, &clients, true)
+                self.select_window(ws, &addr, &clients, swap)
             }
         }
     }
@@ -1346,7 +1352,36 @@ impl Daemon {
             raised = true;
         }
         let n = self.current;
-        match app_route(&self.cfg, &self.st.desktops, n, apps, pull) {
+        let route = app_route(&self.cfg, &self.st.desktops, n, apps, pull);
+        self.follow_route(route, raised, apps)
+    }
+
+    /// Клавиша приложения по нажатой цепочке (изменение workspace-overrides,
+    /// решения D3, D4): приложение и workspace выбираются по активному
+    /// workspace текущего стола и ключам приложений в workspace. Цепочка,
+    /// на которую не отзывается ни одно приложение, — строка в журнале
+    /// без действия.
+    pub fn key(&mut self, chain: &str) -> Result<()> {
+        let parsed = crate::keys::parse_chain(chain)?;
+        let chain = crate::keys::chain_compact(&parsed);
+        let n = self.current;
+        let Some(route) = key_route(&self.cfg, &self.st.desktops, n, &chain) else {
+            log::info!("клавиша {chain}: ни одно приложение на неё не отзывается");
+            return Ok(());
+        };
+        log::info!("клавиша {chain}: {route:?}");
+        let app = match &route {
+            AppRoute::Cycle { app, .. } | AppRoute::Raise { app, .. } | AppRoute::Pull { app, .. } | AppRoute::Open { app, .. } | AppRoute::Free { app } => app.clone(),
+        };
+        self.follow_route(route, false, &[app])
+    }
+
+    /// Выполнить путь клавиши приложения. `raised` — workspace поднят этой
+    /// же командой, и цикл начинается заново; `apps` — кандидаты, чьи
+    /// свободные окна захватываются при цикле вне workspace.
+    fn follow_route(&mut self, route: AppRoute, raised: bool, apps: &[String]) -> Result<()> {
+        let n = self.current;
+        match route {
             AppRoute::Cycle { ws, app } => self.cycle(&ws, &app, if raised { Start::Raised } else { Start::Continue }),
             AppRoute::Raise { ws, app, desktop } => {
                 self.raise(&ws, desktop)?;
@@ -1739,6 +1774,10 @@ impl Daemon {
                     self.app(&apps, desktop, ws.as_deref(), pull).map(|_| json!({"ok": true}))
                 }
             }
+            "key" => match s("chain") {
+                Some(chain) => self.key(&chain).map(|_| json!({"ok": true})),
+                None => Err(anyhow::anyhow!("нет цепочки")),
+            },
             "next" => self.next().map(|_| json!({"ok": true})),
             "move-desktop" => match desktop {
                 Some(n) => self.move_desktop(n).map(|_| json!({"ok": true})),
@@ -2233,39 +2272,127 @@ pub enum AppRoute {
     Free { app: String },
 }
 
-/// Выбор пути клавиши приложения. `apps` — кандидаты с одной цепочкой:
-/// действует тот, чей workspace найдётся раньше. Запущенным считается
-/// workspace из списка какого-либо стола, в том числе ожидающий ленивого
-/// поднятия; workspace вне списков клавиша приложения не поднимает.
-pub fn app_route(cfg: &Config, desktops: &BTreeMap<u8, Desktop>, current: u8, apps: &[String], pull: bool) -> AppRoute {
-    let described = |ws: &str| -> Option<String> { apps.iter().find(|a| cfg.workspaces.get(ws).is_some_and(|w| w.apps.contains_key(*a))).cloned() };
-    let first = apps.first().cloned().unwrap_or_default();
-    let active = desktops.get(&current).and_then(|d| d.active.clone());
-    if let Some(ws) = &active
-        && let Some(app) = described(ws)
-    {
-        return AppRoute::Cycle { ws: ws.clone(), app };
-    }
-    if pull && let Some(ws) = &active {
-        return AppRoute::Pull { ws: ws.clone(), app: first };
-    }
+/// Запущенные workspace в порядке поиска: список текущего стола по порядку,
+/// затем списки столов по возрастанию номера. Второе значение — стол, на
+/// который нужно перейти, если workspace не в списке текущего стола.
+/// Запущенным считается workspace из списка какого-либо стола, в том числе
+/// ожидающий ленивого поднятия; workspace вне списков клавиша приложения
+/// не поднимает.
+fn running(desktops: &BTreeMap<u8, Desktop>, current: u8) -> Vec<(String, Option<u8>)> {
+    let mut out: Vec<(String, Option<u8>)> = Vec::new();
     let here = desktops.get(&current).map(|d| d.workspaces.clone()).unwrap_or_default();
-    for ws in &here {
-        if let Some(app) = described(ws) {
-            return AppRoute::Raise { ws: ws.clone(), app, desktop: None };
+    for ws in here {
+        if !out.iter().any(|(w, _)| *w == ws) {
+            out.push((ws, None));
         }
     }
     for (k, d) in desktops.iter().filter(|(k, _)| **k != current) {
         for ws in &d.workspaces {
-            if let Some(app) = described(ws) {
-                return AppRoute::Raise { ws: ws.clone(), app, desktop: Some(*k) };
+            if !out.iter().any(|(w, _)| w == ws) {
+                out.push((ws.clone(), Some(*k)));
             }
         }
     }
-    match active {
-        Some(ws) => AppRoute::Open { ws, app: first },
-        None => AppRoute::Free { app: first },
+    out
+}
+
+/// Путь клавиши приложения по нажатой цепочке `chain` (изменение
+/// workspace-overrides, решение D4; спецификация ws-daemon, «Цепочка
+/// приложения»). `Own` — приложения с собственной клавишей `chain` по именам,
+/// `W` — активный workspace текущего стола:
+///
+/// 1. `W` откликается на цепочку — цикл отозвавшегося приложения в `W`;
+/// 2. приложение из `Own` описано в `W` — цикл его в `W`;
+/// 3. запущенный `V` откликается на цепочку либо описывает приложение из
+///    `Own`, не переопределяя его клавишу (решение D13), — поднять `V`;
+/// 4. приложение из `Own` описано только в запущенных workspace, которые
+///    переопределили его клавишу, — перетащить его окна в `W` (случай «в»),
+///    а без `W` поднять первый такой workspace;
+/// 5. иначе первое приложение из `Own`, а без собственной клавиши — первое
+///    по имени, которому цепочка назначена ключом в каком-либо workspace:
+///    открыть в `W` (случай «а») или цикл вне workspace.
+///
+/// `None` — на цепочку не отзывается ни одно приложение.
+pub fn key_route(cfg: &Config, desktops: &BTreeMap<u8, Desktop>, current: u8, chain: &str) -> Option<AppRoute> {
+    let own: Vec<String> = cfg.apps.iter().filter(|(_, a)| a.chain.as_deref().is_some_and(|c| same_chain(c, chain))).map(|(n, _)| n.clone()).collect();
+    let active = desktops.get(&current).and_then(|d| d.active.clone());
+    if let Some(w) = &active {
+        if let Some(app) = cfg.responds(w, chain) {
+            return Some(AppRoute::Cycle { ws: w.clone(), app });
+        }
+        if let Some(app) = own.iter().find(|x| ws_has_app(cfg, w, x)) {
+            return Some(AppRoute::Cycle { ws: w.clone(), app: app.clone() });
+        }
     }
+    let run = running(desktops, current);
+    for (v, desktop) in &run {
+        let app = cfg.responds(v, chain).or_else(|| own.iter().find(|x| ws_has_app(cfg, v, x) && !cfg.overrides_key(v, x)).cloned());
+        if let Some(app) = app {
+            return Some(AppRoute::Raise { ws: v.clone(), app, desktop: *desktop });
+        }
+    }
+    for x in &own {
+        if let Some((v, desktop)) = run.iter().find(|(v, _)| ws_has_app(cfg, v, x)) {
+            return Some(match &active {
+                Some(w) => AppRoute::Pull { ws: w.clone(), app: x.clone() },
+                None => AppRoute::Raise { ws: v.clone(), app: x.clone(), desktop: *desktop },
+            });
+        }
+    }
+    let app = own.first().cloned().or_else(|| {
+        cfg.apps
+            .keys()
+            .find(|a| cfg.workspaces.iter().any(|(w, x)| x.apps.get(*a).and_then(|e| e.chain.as_deref()).is_some_and(|c| same_chain(c, chain)) && cfg.overrides_key(w, a)))
+            .cloned()
+    })?;
+    Some(match active {
+        Some(ws) => AppRoute::Open { ws, app },
+        None => AppRoute::Free { app },
+    })
+}
+
+/// Путь команды `workspaced app <имя>` — собственной клавиши приложения
+/// (решение D5): те же шаги, что у `key_route`, где `Own` — это приложение,
+/// а workspace откликается, если описывает его и не переопределяет его
+/// клавишу. `pull` перетаскивает окна в активный workspace сразу после
+/// шага 2. `apps` — кандидаты (прежняя привязка `workspaced app a b c`):
+/// действует тот, чей путь найдётся на более раннем шаге, при равенстве —
+/// первый по порядку.
+pub fn app_route(cfg: &Config, desktops: &BTreeMap<u8, Desktop>, current: u8, apps: &[String], pull: bool) -> AppRoute {
+    let active = desktops.get(&current).and_then(|d| d.active.clone());
+    let run = running(desktops, current);
+    let one = |x: &String| -> (u8, AppRoute) {
+        if let Some(w) = &active
+            && ws_has_app(cfg, w, x)
+        {
+            let step = if cfg.overrides_key(w, x) { 2 } else { 1 };
+            return (step, AppRoute::Cycle { ws: w.clone(), app: x.clone() });
+        }
+        if pull && let Some(w) = &active {
+            return (2, AppRoute::Pull { ws: w.clone(), app: x.clone() });
+        }
+        if let Some((v, desktop)) = run.iter().find(|(v, _)| ws_has_app(cfg, v, x) && !cfg.overrides_key(v, x)) {
+            return (3, AppRoute::Raise { ws: v.clone(), app: x.clone(), desktop: *desktop });
+        }
+        if let Some((v, desktop)) = run.iter().find(|(v, _)| ws_has_app(cfg, v, x)) {
+            return (4, match &active {
+                Some(w) => AppRoute::Pull { ws: w.clone(), app: x.clone() },
+                None => AppRoute::Raise { ws: v.clone(), app: x.clone(), desktop: *desktop },
+            });
+        }
+        (5, match &active {
+            Some(w) => AppRoute::Open { ws: w.clone(), app: x.clone() },
+            None => AppRoute::Free { app: x.clone() },
+        })
+    };
+    let mut best: Option<(u8, AppRoute)> = None;
+    for x in apps {
+        let r = one(x);
+        if best.as_ref().is_none_or(|(b, _)| r.0 < *b) {
+            best = Some(r);
+        }
+    }
+    best.map(|(_, r)| r).unwrap_or(AppRoute::Free { app: String::new() })
 }
 
 /// Теги состава, которые пора снять (решение D2): workspace исчез
@@ -2346,7 +2473,7 @@ pub fn merge_extra(file: &Config, extra: &BTreeMap<String, BTreeMap<String, Extr
                         cfg.apps.insert(name.clone(), e.to_app());
                     }
                     if let Some(w) = cfg.workspaces.get_mut(ws) {
-                        w.apps.insert(name.clone(), Placement::Rect { rect: e.rect.to_rect() });
+                        w.apps.insert(name.clone(), WsApp::at(Placement::Rect { rect: e.rect.to_rect() }));
                     }
                 }
             }
@@ -2486,7 +2613,7 @@ pub fn app_name(class: &str, taken: &[String]) -> String {
 }
 
 /// Входит ли приложение в workspace: само или как вариант своего семейства.
-fn ws_has_app(cfg: &Config, ws: &str, app: &str) -> bool {
+pub fn ws_has_app(cfg: &Config, ws: &str, app: &str) -> bool {
     cfg.workspaces.get(ws).is_some_and(|w| w.apps.keys().any(|x| cfg.app_is(app, x)))
 }
 
@@ -2894,6 +3021,15 @@ fn ws_app_of(cfg: &Config, ws: &str, ws_apps: &[String], c: &Client) -> Option<S
         return Some(own);
     }
     ws_apps.iter().find(|x| cfg.app_is(&own, x)).cloned()
+}
+
+/// Режим цикла клавиши приложения `app` в workspace `ws` и имя записи,
+/// которую переносит обмен ячеек (изменение workspace-overrides, решения D6
+/// и D7): режим — `Config::app_mode`, запись — собственная запись приложения,
+/// а у варианта без неё — запись семейства.
+pub fn cycle_mode(cfg: &Config, ws: &str, app: &str) -> (Mode, String) {
+    let entry = cfg.ws_entry(ws, app).map(|(n, _)| n.to_string()).unwrap_or_else(|| app.to_string());
+    (cfg.app_mode(ws, app), entry)
 }
 
 /// Чем начат цикл клавиши приложения.
@@ -3615,6 +3751,124 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
         assert_eq!(app_route(&cfg, &d, 4, &a("chrome-ai"), true), AppRoute::Free { app: s("chrome-ai") });
     }
 
+    /// Конфиг сессии в миниатюре (изменение workspace-overrides, решение
+    /// D10): у браузеров собственные клавиши Shift+Super+буква, `surf`
+    /// переопределяет их на Super+буква; `ai` описывает `chrome-ai` без
+    /// переопределения. Семейство `chrome` с вариантом `chrome-ai` — в
+    /// `family_cfg`.
+    fn overrides_cfg() -> Config {
+        let text = CFG.replace("[apps.calc]", "[apps.chrome]\ncmd = \"chrome\"\nchain = \"SUPER+SHIFT+B\"\n\n[apps.chrome-ai]\ncmd = \"chrome\"\nchain = \"SUPER+SHIFT+V\"\n\n[apps.yandex]\ncmd = \"yandex\"\nchain = \"SUPER+SHIFT+Y\"\n\n[apps.calc]")
+            .replace("[apps.herdr]\n", "[apps.herdr]\nchain = \"SUPER+T\"\n")
+            + "\n[workspaces.surf]\ntemplate = \"thirds\"\nmode = \"stack\"\n[workspaces.surf.apps]\nchrome = { cell = \"left\", chain = \"SUPER+B\" }\nyandex = { cell = \"center\", chain = \"SUPER+Y\" }\nchrome-ai = { cell = \"right\", chain = \"SUPER+V\" }\n\n[workspaces.ai]\ntemplate = \"thirds\"\napps = { chrome-ai = \"center\" }\n";
+        Config::parse(&text).unwrap()
+    }
+
+    fn family_cfg() -> Config {
+        let text = CFG.replace("[apps.calc]", "[apps.chrome]\ncmd = \"chrome\"\nclass = \"^google-chrome$\"\nchain = \"SUPER+B\"\n\n[apps.chrome-ai]\nfamily = \"chrome\"\ncmd = \"chrome\"\nclass = \"^google-chrome-ai$\"\nchain = \"SUPER+V\"\n\n[apps.calc]")
+            + "\n[workspaces.mix]\ntemplate = \"thirds\"\napps = { chrome = \"center\" }\n\n[workspaces.pair]\ntemplate = \"thirds\"\napps = { chrome = \"left\", chrome-ai = { cell = \"right\", mode = \"stack\" } }\n";
+        Config::parse(&text).unwrap()
+    }
+
+    fn desk(ws: &[&str], active: Option<&str>) -> Desktop {
+        Desktop { workspaces: ws.iter().map(|w| w.to_string()).collect(), active: active.map(String::from) }
+    }
+
+    #[test]
+    fn key_route_cases() {
+        let cfg = overrides_cfg();
+        let s = |v: &str| v.to_string();
+        let mut d: BTreeMap<u8, Desktop> = BTreeMap::new();
+        d.insert(1, desk(&["work"], Some("work")));
+        d.insert(2, desk(&["surf"], Some("surf")));
+        // Шаги 1 и 2: в surf обе клавиши ведут цикл chrome-ai.
+        assert_eq!(key_route(&cfg, &d, 2, "SUPER+V"), Some(AppRoute::Cycle { ws: s("surf"), app: s("chrome-ai") }));
+        assert_eq!(key_route(&cfg, &d, 2, "super+shift+v"), Some(AppRoute::Cycle { ws: s("surf"), app: s("chrome-ai") }));
+        // Шаг 1 в work: собственная клавиша приложения work.
+        assert_eq!(key_route(&cfg, &d, 1, "SUPER+T"), Some(AppRoute::Cycle { ws: s("work"), app: s("herdr") }));
+        // Шаг 3: клавиша surf поднимает surf на его столе.
+        assert_eq!(key_route(&cfg, &d, 1, "SUPER+V"), Some(AppRoute::Raise { ws: s("surf"), app: s("chrome-ai"), desktop: Some(2) }));
+        // Шаг 4, случай «в»: собственная клавиша перетаскивает окна в work.
+        assert_eq!(key_route(&cfg, &d, 1, "SUPER+SHIFT+V"), Some(AppRoute::Pull { ws: s("work"), app: s("chrome-ai") }));
+        assert_eq!(key_route(&cfg, &d, 1, "SUPER+SHIFT+Y"), Some(AppRoute::Pull { ws: s("work"), app: s("yandex") }));
+        // Смешанный случай: ai описывает chrome-ai без переопределения — случай «б».
+        d.insert(3, desk(&["ai"], Some("ai")));
+        assert_eq!(key_route(&cfg, &d, 1, "SUPER+SHIFT+V"), Some(AppRoute::Raise { ws: s("ai"), app: s("chrome-ai"), desktop: Some(3) }));
+        d.remove(&3);
+        // Без активного workspace: обе клавиши поднимают surf.
+        d.insert(4, Desktop::default());
+        assert_eq!(key_route(&cfg, &d, 4, "SUPER+V"), Some(AppRoute::Raise { ws: s("surf"), app: s("chrome-ai"), desktop: Some(2) }));
+        assert_eq!(key_route(&cfg, &d, 4, "SUPER+SHIFT+V"), Some(AppRoute::Raise { ws: s("surf"), app: s("chrome-ai"), desktop: Some(2) }));
+        // Шаг 5: surf не запущен — обе клавиши открывают chrome-ai в work,
+        // а на столе без workspace — цикл вне workspace.
+        d.remove(&2);
+        assert_eq!(key_route(&cfg, &d, 1, "SUPER+V"), Some(AppRoute::Open { ws: s("work"), app: s("chrome-ai") }));
+        assert_eq!(key_route(&cfg, &d, 1, "SUPER+SHIFT+V"), Some(AppRoute::Open { ws: s("work"), app: s("chrome-ai") }));
+        assert_eq!(key_route(&cfg, &d, 4, "SUPER+V"), Some(AppRoute::Free { app: s("chrome-ai") }));
+        // На цепочку никто не отзывается.
+        assert_eq!(key_route(&cfg, &d, 1, "SUPER+F12"), None);
+
+        // Семейство (решение D6): mix описывает только семейство, pair — оба.
+        let cfg = family_cfg();
+        let mut d: BTreeMap<u8, Desktop> = BTreeMap::new();
+        d.insert(1, desk(&["mix"], Some("mix")));
+        d.insert(2, desk(&["pair"], Some("pair")));
+        assert_eq!(key_route(&cfg, &d, 1, "SUPER+B"), Some(AppRoute::Cycle { ws: s("mix"), app: s("chrome") }));
+        assert_eq!(key_route(&cfg, &d, 1, "SUPER+V"), Some(AppRoute::Cycle { ws: s("mix"), app: s("chrome-ai") }));
+        assert_eq!(key_route(&cfg, &d, 2, "SUPER+B"), Some(AppRoute::Cycle { ws: s("pair"), app: s("chrome") }));
+        assert_eq!(key_route(&cfg, &d, 2, "SUPER+V"), Some(AppRoute::Cycle { ws: s("pair"), app: s("chrome-ai") }));
+        // Вариант, описанный в запущенном mix только через семейство, клавишу
+        // не переопределяет: из work mix поднимается (решение D13).
+        d.insert(3, desk(&["work"], Some("work")));
+        d.remove(&2);
+        assert_eq!(key_route(&cfg, &d, 3, "SUPER+V"), Some(AppRoute::Raise { ws: s("mix"), app: s("chrome-ai"), desktop: Some(1) }));
+    }
+
+    #[test]
+    fn app_route_follows_own_key() {
+        // Команда `app` — собственная клавиша приложения (решение D5).
+        let cfg = overrides_cfg();
+        let s = |v: &str| v.to_string();
+        let a = |v: &str| vec![v.to_string()];
+        let mut d: BTreeMap<u8, Desktop> = BTreeMap::new();
+        d.insert(1, desk(&["work"], Some("work")));
+        d.insert(2, desk(&["surf"], Some("surf")));
+        // Случай «в» и без --pull: surf переопределил клавишу chrome-ai.
+        assert_eq!(app_route(&cfg, &d, 1, &a("chrome-ai"), false), AppRoute::Pull { ws: s("work"), app: s("chrome-ai") });
+        assert_eq!(app_route(&cfg, &d, 2, &a("chrome-ai"), false), AppRoute::Cycle { ws: s("surf"), app: s("chrome-ai") });
+        // Workspace без переопределения поднимается.
+        d.insert(3, desk(&["ai"], Some("ai")));
+        assert_eq!(app_route(&cfg, &d, 1, &a("chrome-ai"), false), AppRoute::Raise { ws: s("ai"), app: s("chrome-ai"), desktop: Some(3) });
+        // Кандидаты: действует тот, чей путь найден на более раннем шаге.
+        assert_eq!(app_route(&cfg, &d, 1, &[s("yandex"), s("herdr")], false), AppRoute::Cycle { ws: s("work"), app: s("herdr") });
+        assert_eq!(app_route(&cfg, &d, 1, &[s("yandex"), s("chrome-ai")], false), AppRoute::Raise { ws: s("ai"), app: s("chrome-ai"), desktop: Some(3) });
+    }
+
+    #[test]
+    fn cycle_mode_of_app() {
+        // Приложение без ячейки в workspace режима swap выбирается подъёмом.
+        let text = format!("{CFG}\n[workspaces.dev]\ntemplate = \"thirds\"\nmain = \"herdr\"\n[workspaces.dev.apps]\nherdr = \"center\"\nchromium = {{ cell = \"left\", mode = \"stack\" }}\nneovide = \"right\"\ncalc = {{ rect = {{ x = 2600, y = 1500, w = 600, h = 400 }} }}\n");
+        let cfg = Config::parse(&text).unwrap();
+        assert_eq!(cycle_mode(&cfg, "dev", "calc"), (Mode::Stack, "calc".to_string()));
+        // Режим stack у приложения с ячейкой: обмена нет.
+        assert_eq!(cycle_mode(&cfg, "dev", "chromium"), (Mode::Stack, "chromium".to_string()));
+        assert_eq!(cycle_mode(&cfg, "dev", "neovide"), (Mode::Swap, "neovide".to_string()));
+        // Вариант без своей записи: режим и обмен — по записи семейства.
+        assert_eq!(cycle_mode(&cfg, "dev", "chromium-mail"), (Mode::Stack, "chromium".to_string()));
+        assert_eq!(cycle_mode(&cfg, "work", "herdr"), (Mode::Swap, "herdr".to_string()));
+        // Явный mode = "swap" у записи с rect: обмен с главной ячейкой, прежнее
+        // главное встаёт в прямоугольник калькулятора.
+        let swap = text.replace("calc = { rect = { x = 2600, y = 1500, w = 600, h = 400 } }", "calc = { rect = { x = 2600, y = 1500, w = 600, h = 400 }, mode = \"swap\" }");
+        let cfg = Config::parse(&swap).unwrap();
+        assert_eq!(cycle_mode(&cfg, "dev", "calc"), (Mode::Swap, "calc".to_string()));
+        let mut st = State::default();
+        let mon = (3840, 2160);
+        let main = st.main_app(&cfg, "dev", mon);
+        assert_eq!(main.as_deref(), Some("herdr"));
+        swap_cells(st.cells_of(&cfg, "dev", mon), main.as_deref(), "calc", "center");
+        assert_eq!(st.main_app(&cfg, "dev", mon).as_deref(), Some("calc"));
+        assert_eq!(st.rect_for(&cfg, "dev", "herdr", mon), Some(PxRect { x: 2600, y: 1500, w: 600, h: 400 }));
+    }
+
     #[test]
     fn pull_record_kind() {
         let cfg = shared_cfg();
@@ -3879,11 +4133,11 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
         assert!(dropped.is_empty());
         // Новое приложение появилось и в [apps], и в таблице apps workspace.
         assert_eq!(eff.apps["galculator"].cmd.as_deref(), Some("galculator"));
-        assert_eq!(eff.workspaces["work"].apps["galculator"], Placement::Rect { rect: rect.to_rect() });
+        assert_eq!(eff.workspaces["work"].apps["galculator"].place, Placement::Rect { rect: rect.to_rect() });
         // Запись только о месте описание приложения конфига не подменяет,
         // а лишь добавляет его в этот workspace.
         assert_eq!(eff.apps["chromium-mail"].title.as_deref(), Some("^Gmail"));
-        assert_eq!(eff.workspaces["work"].apps["chromium-mail"], Placement::Rect { rect: rect.to_rect() });
+        assert_eq!(eff.workspaces["work"].apps["chromium-mail"].place, Placement::Rect { rect: rect.to_rect() });
         // Файл конфига не менялся.
         assert!(!cfg.apps.contains_key("galculator"));
         assert!(!cfg.workspaces["work"].apps.contains_key("galculator"));
@@ -3906,7 +4160,7 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
         extra.entry("work".into()).or_default().insert("herdr".into(), place_only);
         let (eff, dropped) = merge_extra(&cfg, &extra);
         assert_eq!(dropped.len(), 1);
-        assert_eq!(eff.workspaces["work"].apps["herdr"], Placement::Cell("center".into()));
+        assert_eq!(eff.workspaces["work"].apps["herdr"].place, Placement::Cell("center".into()));
     }
 
     #[test]

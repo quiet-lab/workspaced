@@ -77,6 +77,24 @@ pub fn parse_chain(s: &str) -> Result<Chain> {
     Ok(chain)
 }
 
+/// Ключ сравнения цепочки: модификаторы по порядку и клавиши без учёта
+/// регистра, как их сравнивает Hyprland.
+pub type ChainKey = Vec<(Vec<String>, String)>;
+
+/// Ключ сравнения разобранной цепочки.
+pub fn chain_key(chain: &Chain) -> ChainKey {
+    chain.iter().map(Combo::cmp_key).collect()
+}
+
+/// Две записи цепочки означают одно и то же. Цепочка с ошибкой ни с чем
+/// не совпадает: конфиг с ней не проходит проверку.
+pub fn same_chain(a: &str, b: &str) -> bool {
+    match (parse_chain(a), parse_chain(b)) {
+        (Ok(x), Ok(y)) => chain_key(&x) == chain_key(&y),
+        _ => false,
+    }
+}
+
 pub fn chain_compact(chain: &Chain) -> String {
     chain.iter().map(Combo::compact).collect::<Vec<_>>().join(" ")
 }
@@ -98,7 +116,14 @@ impl Act {
     /// Строка для списка: «raise dots», «exec wezterm-gui», «dispatch window.close()».
     pub fn describe(&self) -> String {
         match self {
-            Act::Daemon(cmd) => cmd.strip_prefix("workspaced ").unwrap_or(cmd).to_string(),
+            Act::Daemon(cmd) => {
+                let cmd = cmd.strip_prefix("workspaced ").unwrap_or(cmd);
+                // Цепочка клавиши приложения в списке без кавычек оболочки.
+                match cmd.strip_prefix("key '").and_then(|c| c.strip_suffix('\'')) {
+                    Some(chain) => format!("key {}", chain.replace("'\\''", "'")),
+                    None => cmd.to_string(),
+                }
+            }
             Act::Exec(cmd) => format!("exec {cmd}"),
             Act::Dispatch(v) => format!("dispatch {}", v.join("; ")),
             Act::Lua(body) => {
@@ -192,9 +217,15 @@ fn expand_range(b: &Bind) -> Vec<Bind> {
         .collect()
 }
 
+/// Цепочка в одинарных кавычках оболочки: в ней бывают пробелы
+/// (`SUPER+TAB v`), а привязка выполняется через `sh -c`.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 /// Собрать все привязки из конфига в порядке файла: `[keys]`, приложения,
-/// workspace, `[[binds]]`. Приложения с одной цепочкой объединяются в одну
-/// команду `workspaced app a b c`: демон выбирает по активному workspace.
+/// workspace, `[[binds]]`. Все отклики на одну цепочку клавиши приложения
+/// объединяются в одну команду `workspaced key '<цепочка>'`.
 pub fn collect(cfg: &Config) -> Result<Vec<Binding>> {
     let mut out: Vec<Binding> = Vec::new();
     let named = [
@@ -208,26 +239,49 @@ pub fn collect(cfg: &Config) -> Result<Vec<Binding>> {
             out.push(plain(parse_chain(c)?, source.to_string(), command.to_string()));
         }
     }
-    // Приложения: группировка по цепочке.
-    let mut by_chain: BTreeMap<Chain, Vec<String>> = BTreeMap::new();
+    // Клавиши приложений (изменение workspace-overrides, решение D3):
+    // собственные клавиши и ключи записей workspace, отличные от собственной
+    // клавиши. Все отклики на одну цепочку дают одну привязку
+    // `workspaced key '<цепочка>'`, а какое приложение и в каком workspace она
+    // вызывает, демон решает при нажатии по активному workspace стола.
+    let mut by_chain: Vec<(Chain, Vec<String>)> = Vec::new();
+    let mut respond = |chain: Chain, source: String| {
+        let k = chain_key(&chain);
+        match by_chain.iter_mut().find(|(c, _)| chain_key(c) == k) {
+            Some((_, sources)) => sources.push(source),
+            None => by_chain.push((chain, vec![source])),
+        }
+    };
     for (name, app) in &cfg.apps {
         if let Some(c) = &app.chain {
-            by_chain.entry(parse_chain(c)?).or_default().push(name.clone());
+            respond(parse_chain(c)?, format!("apps.{name}"));
         }
     }
-    for (chain, apps) in by_chain {
-        let key = chain_compact(&chain);
-        // Два приложения с одной цепочкой внутри одного workspace — ошибка.
-        for (wname, w) in &cfg.workspaces {
-            let inside: Vec<&String> = apps.iter().filter(|a| w.apps.contains_key(*a)).collect();
-            if inside.len() > 1 {
-                bail!(
-                    "workspace {wname}: приложения {} имеют одну цепочку {key:?}",
-                    inside.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" и ")
-                );
+    for (wname, w) in &cfg.workspaces {
+        for (aname, e) in &w.apps {
+            if let Some(c) = e.chain.as_deref().filter(|_| cfg.overrides_key(wname, aname)) {
+                respond(parse_chain(c)?, format!("workspaces.{wname}.apps.{aname}"));
             }
         }
-        out.push(plain(chain, format!("apps.{}", apps.join(",")), format!("workspaced app {}", apps.join(" "))));
+    }
+    // Две записи одного workspace с одним ключом — ошибка (решение D8):
+    // ключ записи — переопределение, а без него собственная клавиша.
+    for (wname, w) in &cfg.workspaces {
+        let mut seen: Vec<(ChainKey, &str)> = Vec::new();
+        for aname in w.apps.keys() {
+            let Some(k) = cfg.app_key(wname, aname) else { continue };
+            let chain = parse_chain(k)?;
+            let key = chain_key(&chain);
+            if let Some((_, other)) = seen.iter().find(|(x, _)| *x == key) {
+                bail!("workspace {wname}: приложения {other} и {aname} имеют одну цепочку {:?}", chain_compact(&chain));
+            }
+            seen.push((key, aname.as_str()));
+        }
+    }
+    by_chain.sort_by(|a, b| a.0.cmp(&b.0));
+    for (chain, sources) in by_chain {
+        let command = format!("workspaced key {}", shell_quote(&chain_compact(&chain)));
+        out.push(plain(chain, sources.join(","), command));
     }
     for (name, w) in &cfg.workspaces {
         if let Some(c) = &w.chain {
@@ -543,6 +597,89 @@ apps = { firefox-chat = "c" }
         assert!(err.contains("dev-front") && err.contains("firefox-front") && err.contains("firefox-back"), "{err}");
     }
 
+    /// Браузеры с собственными клавишами и workspace `surf`, который
+    /// переопределяет клавишу `chrome-ai` (изменение workspace-overrides).
+    fn overrides() -> String {
+        r#"
+[templates.t]
+main = "c"
+cells = { c = { x = 0, y = 0, w = 10, h = 10 }, l = { x = 0, y = 0, w = 5, h = 10 }, r = { x = 5, y = 0, w = 5, h = 10 } }
+[apps.chrome]
+cmd = "chrome"
+chain = "SUPER+B"
+[apps.chrome-ai]
+cmd = "chrome"
+chain = "SUPER+SHIFT+V"
+[workspaces.surf]
+template = "t"
+chain = "SUPER+TAB s"
+[workspaces.surf.apps]
+chrome = "l"
+chrome-ai = { cell = "r", chain = "SUPER+V" }
+"#
+        .to_string()
+    }
+
+    #[test]
+    fn override_keys_collected() {
+        let cfg = Config::parse(&overrides()).unwrap();
+        let binds = collect(&cfg).unwrap();
+        let by = |c: &str| binds.iter().find(|b| chain_compact(&b.chain) == c).unwrap_or_else(|| panic!("нет привязки {c}: {binds:?}"));
+        assert_eq!(by("SUPER+V").act, Act::Daemon("workspaced key 'SUPER+V'".into()));
+        assert_eq!(by("SUPER+V").source, "workspaces.surf.apps.chrome-ai");
+        assert_eq!(by("SUPER+SHIFT+V").act, Act::Daemon("workspaced key 'SUPER+SHIFT+V'".into()));
+        assert_eq!(by("SUPER+SHIFT+V").source, "apps.chrome-ai");
+        let list = to_list(&cfg).unwrap();
+        assert!(list.lines().any(|l| l.starts_with("SUPER+V ") && l.contains("key SUPER+V") && l.ends_with("workspaces.surf.apps.chrome-ai")), "{list}");
+        assert!(list.lines().any(|l| l.starts_with("SUPER+SHIFT+V ") && l.contains("key SUPER+SHIFT+V") && l.ends_with("apps.chrome-ai")), "{list}");
+        let lua = to_lua(&cfg).unwrap();
+        luac(&lua);
+        assert!(lua.contains("hl.bind(\"SUPER + V\", hl.dsp.exec_cmd(\"workspaced key 'SUPER+V'\"))"), "{lua}");
+        // Цепочка из нескольких звеньев — в кавычках, одним словом команды.
+        let text = overrides().replace("chain = \"SUPER+V\"", "chain = \"SUPER+TAB v\"");
+        let lua = to_lua(&Config::parse(&text).unwrap()).unwrap();
+        luac(&lua);
+        assert!(lua.contains("ws_run(\"workspaced key 'SUPER+TAB v'\")"), "{lua}");
+        // Одна цепочка у собственной клавиши и у ключа другого workspace — одна
+        // привязка с двумя источниками.
+        let text = overrides() + "[apps.mail]\ncmd = \"mail\"\nchain = \"super+v\"\n";
+        let cfg = Config::parse(&text).unwrap();
+        let binds = collect(&cfg).unwrap();
+        let v: Vec<&Binding> = binds.iter().filter(|b| chain_key(&b.chain) == chain_key(&parse_chain("SUPER+V").unwrap())).collect();
+        assert_eq!(v.len(), 1, "{binds:?}");
+        assert_eq!(v[0].source, "apps.mail,workspaces.surf.apps.chrome-ai");
+    }
+
+    #[test]
+    fn override_frees_own_key() {
+        // Ключи в surf различаются: chrome — Super+V, chrome-ai — Super+B.
+        let text = overrides()
+            .replace("chain = \"SUPER+SHIFT+V\"", "chain = \"SUPER+V\"")
+            .replace("chrome = \"l\"", "chrome = { cell = \"l\", chain = \"SUPER+V\" }")
+            .replace("chrome-ai = { cell = \"r\", chain = \"SUPER+V\" }", "chrome-ai = { cell = \"r\", chain = \"SUPER+B\" }");
+        let cfg = Config::parse(&text).unwrap();
+        assert_eq!(cfg.responds("surf", "SUPER+V"), Some("chrome".into()));
+        assert_eq!(cfg.responds("surf", "SUPER+B"), Some("chrome-ai".into()));
+    }
+
+    #[test]
+    fn override_conflicts_in_workspace() {
+        let text = overrides().replace("chain = \"SUPER+V\"", "chain = \"SUPER+B\"");
+        let err = Config::parse(&text).unwrap_err().to_string();
+        assert!(err.contains("surf") && err.contains("chrome") && err.contains("chrome-ai") && err.contains("SUPER+B"), "{err}");
+    }
+
+    #[test]
+    fn override_conflicts_with_workspace_chain() {
+        let text = overrides().replace("chain = \"SUPER+V\"", "chain = \"SUPER+TAB s\"");
+        let err = Config::parse(&text).unwrap_err().to_string();
+        assert!(err.contains("workspaces.surf.apps.chrome-ai") && err.contains("workspaces.surf") && err.contains("SUPER+TAB s"), "{err}");
+        // Зарезервированное сочетание в переопределении тоже недопустимо.
+        let text = overrides() + "[keys]\nreserved = [\"SUPER+V\"]\n";
+        let err = Config::parse(&text).unwrap_err().to_string();
+        assert!(err.contains("workspaces.surf.apps.chrome-ai") && err.contains("зарезервированное"), "{err}");
+    }
+
     #[test]
     fn two_save_chains_share_a_prefix() {
         // Общий первый сегмент у двух цепочек допустим: обе живут в одной
@@ -715,7 +852,7 @@ dispatch = "exit()"
         assert!(a.contains("hl.bind(\"SUPER + SHIFT + C\", function()\n  local ok, err = pcall(function()\n    local soft"), "{a}");
         assert!(a.contains("hl.define_submap(\"ws:SUPER + W 3\", function()"), "{a}");
         assert!(a.contains("ws_run(\"workspaced raise dev-front --desktop 3\")"), "{a}");
-        assert!(a.contains("ws_run(\"workspaced app firefox-chat firefox-front\")"), "{a}");
+        assert!(a.contains("ws_run(\"workspaced key 'SUPER+A b'\")"), "{a}");
         assert!(a.contains("hl.bind(\"SUPER + A\", hl.dsp.submap(\"ws:SUPER + A\"))"), "{a}");
         // Диспетчер в конце цепочки сбрасывает подкарту.
         assert!(a.contains("hl.bind(\"x\", function() hl.dispatch(hl.dsp.exit()); hl.dispatch(hl.dsp.submap(\"reset\")) end)"), "{a}");
