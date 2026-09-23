@@ -896,18 +896,16 @@ impl Daemon {
                 if moving {
                     ex.push(hypr::d_move_to(&c.address, &n.to_string()));
                 }
-                if stack {
-                    // Окно, уже стоящее на столе, поднятие не двигает: оно там,
-                    // где его оставил пользователь. Вернувшееся окно встаёт
-                    // в запомненный прямоугольник, а без него — на место из конфига.
-                    let kept = self.st.geom.get(ws).and_then(|g| g.get(&c.address)).copied();
-                    let target = if moving { kept.or(rect) } else { None };
-                    if let Some(r) = target {
-                        ex.extend(hypr::d_place(&c.address, r));
-                    }
-                    self.st.geom.entry(ws.to_string()).or_default().insert(c.address.clone(), target.unwrap_or_else(|| c.rect()));
-                } else if let Some(r) = rect {
+                // Окно, которое едет вместе с workspace с прежнего стола,
+                // сохраняет прямоугольник, прочитанный у композитора до переноса.
+                let carried = moving_ws && c.desktop() == was_on;
+                let kept = self.st.geom.get(ws).and_then(|g| g.get(&c.address)).copied();
+                let target = raise_target(carried, stack, moving, kept, rect, c.rect());
+                if let Some(r) = target {
                     ex.extend(hypr::d_place(&c.address, r));
+                }
+                if stack {
+                    self.st.geom.entry(ws.to_string()).or_default().insert(c.address.clone(), target.unwrap_or_else(|| c.rect()));
                 }
             }
             if main_app.as_deref() == Some(app) {
@@ -1229,11 +1227,8 @@ impl Daemon {
                 Ok(())
             }
             MoveStep::Move(ws) => {
-                // Окна запоминают, где их оставили: в режиме `stack` перенос
-                // не отменяет сдвиг окна мышью, и на новом столе окно встаёт
-                // туда, где стояло.
-                let clients = self.hypr.clients()?;
-                self.remember_geometry(&ws, &clients);
+                // Окна встают на новом столе туда, где стояли на прежнем,
+                // в обоих режимах: это делает `raise` (`raise_target`).
                 log::info!("перенос workspace {ws} со стола {cur} на стол {n}");
                 self.raise(&ws, Some(n))
             }
@@ -1985,6 +1980,31 @@ pub fn move_step(current: u8, target: u8, active: Option<&str>) -> MoveStep {
         None => MoveStep::Nothing,
         Some(ws) if target == current => MoveStep::Here(ws.to_string()),
         Some(ws) => MoveStep::Move(ws.to_string()),
+    }
+}
+
+/// Куда поднятие workspace ставит окно его приложения (спецификация ws-daemon,
+/// «Поднятие workspace на столе», «Перенос workspace на стол», «Расстановка
+/// окон»). `carried` — окно едет вместе с workspace с прежнего стола при
+/// переносе; `moving` — окно приходит на стол (с `special:pool` или с другого
+/// стола); `kept` — прямоугольник, запомненный в режиме `stack`; `cell` —
+/// место приложения по правилу мест; `current` — прямоугольник окна у
+/// композитора до поднятия. `None` — окно не двигается.
+///
+/// При переносе окно в обоих режимах встаёт ровно туда, где стояло: перенос
+/// на другой стол расстановкой не является, назначения ячеек не меняются.
+/// При поднятии в режиме обмена ячеек окно встаёт в свою ячейку; в режиме
+/// `stack` окно, уже стоящее на столе, не двигается, а вернувшееся встаёт
+/// в запомненный прямоугольник или, без него, на место из конфига.
+pub fn raise_target(carried: bool, stack: bool, moving: bool, kept: Option<PxRect>, cell: Option<PxRect>, current: PxRect) -> Option<PxRect> {
+    if carried {
+        Some(current)
+    } else if !stack {
+        cell
+    } else if moving {
+        kept.or(cell)
+    } else {
+        None
     }
 }
 
@@ -2880,6 +2900,30 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
         assert_eq!(depth_plan(&order, Some("0x9"), true), vec!["0x1", "0x2", "0x3"]);
         // Окон нет — поднимать нечего.
         assert!(depth_plan(&[], Some("0x1"), true).is_empty());
+    }
+
+    #[test]
+    fn raise_target_keeps_rect_on_move_in_both_modes() {
+        let r = |x, y, w, h| PxRect { x, y, w, h };
+        let cell = Some(r(340, 10, 1200, 1400));
+        let kept = Some(r(500, 50, 1000, 900));
+        // Окно сдвинуто и растянуто мышью.
+        let cur = r(420, 120, 1500, 1100);
+        // Перенос на другой стол: окно встаёт туда, где стояло, в обоих режимах,
+        // а не в ячейку и не в запомненный прямоугольник.
+        assert_eq!(raise_target(true, false, true, None, cell, cur), Some(cur));
+        assert_eq!(raise_target(true, true, true, kept, cell, cur), Some(cur));
+        // Поднятие в режиме обмена ячеек: окно встаёт в свою ячейку,
+        // пришло оно на стол или уже стояло на нём.
+        assert_eq!(raise_target(false, false, true, None, cell, cur), cell);
+        assert_eq!(raise_target(false, false, false, None, cell, cur), cell);
+        // Места у приложения нет — окно не двигается.
+        assert_eq!(raise_target(false, false, true, None, None, cur), None);
+        // Режим stack: вернувшееся окно — в запомненный прямоугольник, без него —
+        // на место из конфига; стоящее на столе окно не двигается.
+        assert_eq!(raise_target(false, true, true, kept, cell, cur), kept);
+        assert_eq!(raise_target(false, true, true, None, cell, cur), cell);
+        assert_eq!(raise_target(false, true, false, kept, cell, cur), None);
     }
 
     #[test]
