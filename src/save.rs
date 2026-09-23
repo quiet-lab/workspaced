@@ -263,10 +263,8 @@ pub fn save_session(d: &mut Daemon) -> Result<(usize, usize, usize)> {
     for (n, ws) in &desks {
         adopted += accept_desktop(d, *n, ws)?;
     }
+    crate::session::absorb_all(d)?;
     let clients = d.clients()?;
-    for (n, ws) in &desks {
-        d.absorb(ws, *n, &clients);
-    }
     let windows: usize = desks.iter().map(|(_, ws)| daemon::ws_windows(&clients, ws).len()).sum();
     d.save_session_file();
     d.broadcast();

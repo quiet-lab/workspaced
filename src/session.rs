@@ -156,11 +156,24 @@ pub fn save_default(d: &Daemon) -> Result<()> {
     write("default", &snapshot(d)?)
 }
 
-pub fn save_named(d: &Daemon, name: &str) -> Result<()> {
+pub fn save_named(d: &mut Daemon, name: &str) -> Result<()> {
     if name == "default" {
         bail!("сессию default записывает команда сохранения сессии (save-session)");
     }
+    absorb_all(d)?;
     write(name, &snapshot(d)?)
+}
+
+/// Снять с экрана раскладку каждого workspace, активного на своём столе
+/// (изменение live-layout, решение D4): снимок — копия состояния на момент
+/// команды, в том числе сдвинутых окон.
+pub fn absorb_all(d: &mut Daemon) -> Result<()> {
+    let clients = d.clients()?;
+    let desks: Vec<(u8, String)> = daemon::actives(d.state()).into_iter().collect();
+    for (n, ws) in desks {
+        d.absorb(&ws, n, &clients);
+    }
+    Ok(())
 }
 
 /// Список сессий с картой столов (для окна выбора и `session list --json`).
@@ -470,6 +483,7 @@ pub fn load_pairs(live: &[(String, u32)], entries: &[(u32, usize)]) -> (Vec<(Str
 /// Загрузка сессии посреди работы: сверка, закрытие лишнего, запуск недостающего.
 pub fn load(d: &mut Daemon, name: &str) -> Result<()> {
     let s = read(name)?;
+    absorb_all(d)?;
     save_default(d)?;
     // Ожидания прежнего восстановления снимаются до сверки (решение D10).
     d.end_restore_wait(None, true, "загрузка сессии");
