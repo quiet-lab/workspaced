@@ -1,6 +1,6 @@
 //! Модель демона: столы, назначение ячеек, посторонние окна — и формат сессии.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
 
@@ -98,6 +98,14 @@ pub struct State {
     /// workspace на стол»). Живёт до остановки демона, в снимок сессии не
     /// попадает: это след работы пользователя, а не состояние окон.
     pub prev_active: BTreeMap<u8, String>,
+    /// План восстановления экземпляров из снимка сессии (изменение
+    /// session-instances, решения D4, D5, D8): записи окон приложений,
+    /// ожидающие запуска или окна. Живёт только в памяти демона.
+    pub restore: Vec<RestoreEntry>,
+    /// Приложения, которые демон запустил при восстановлении: только их
+    /// процесс может открыть свои окна заново, и только для них записи
+    /// без командной строки ждут окон (решение D10).
+    pub restore_apps: BTreeSet<String>,
 }
 
 impl State {
@@ -159,6 +167,59 @@ impl State {
     }
 }
 
+// ---- Восстановление экземпляров ----------------------------------------------
+
+/// Состояние записи плана восстановления (решения D4, D10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreState {
+    /// Ждёт: запись с командной строкой — запуска при поднятии своего
+    /// workspace, запись без неё — окна, которое откроет процесс приложения
+    /// (первый экземпляр запускается командой приложения).
+    Waiting,
+    /// Процесс запущен по командной строке записи; ждёт окна этого процесса.
+    Launched(u32),
+    /// Окно получено, либо ожидание снято.
+    Done,
+}
+
+/// Запись плана восстановления: окно приложения из снимка сессии, которое
+/// ждёт запуска или появления (изменение session-instances, решение D5).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RestoreEntry {
+    pub app: String,
+    pub instance: u32,
+    pub workspaces: Vec<String>,
+    /// «1»…«8», «pool» или «hidden» на момент снимка.
+    pub desktop: String,
+    pub rect: PxRect,
+    pub rects: BTreeMap<String, PxRect>,
+    pub cmd: Vec<String>,
+    pub cwd: Option<String>,
+    pub state: RestoreState,
+}
+
+impl RestoreEntry {
+    /// Запись по окну снимка нового формата; окно без номера экземпляра
+    /// (прежний формат) и постороннее окно записи не дают.
+    pub fn from_window(w: &SessionWindow) -> Option<RestoreEntry> {
+        Some(RestoreEntry {
+            app: w.app.clone()?,
+            instance: w.instance?,
+            workspaces: w.workspaces.clone(),
+            desktop: w.desktop.clone(),
+            rect: w.rect,
+            rects: w.rects.clone(),
+            cmd: w.cmd.clone(),
+            cwd: w.cwd.clone(),
+            state: RestoreState::Waiting,
+        })
+    }
+    /// Запись ещё ждёт запуска или окна.
+    pub fn open(&self) -> bool {
+        self.state != RestoreState::Done
+    }
+}
+
 // ---- Сессия ------------------------------------------------------------------
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -172,10 +233,21 @@ pub struct SessionWorkspace {
 }
 
 /// Окно в снимке: окно приложения либо постороннее (с командой и каталогом).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Окно приложения записывается экземпляром (изменение session-instances,
+/// решение D1): номер, workspace по тегам состава и прямоугольники режима
+/// `stack`; командная строка у него есть только по решению D2. Поля
+/// необязательные: снимок прежнего формата читается, а прежняя версия демона
+/// пропускает новые поля.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionWindow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app: Option<String>,
+    /// Номер экземпляра из тега `app:<имя>#<номер>`; признак нового формата.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance: Option<u32>,
+    /// Workspace окна по тегам состава, по алфавиту.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workspaces: Vec<String>,
     /// Привязка постороннего окна из снимков прежних версий: читается ради
     /// совместимости, не учитывается и не записывается.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -187,6 +259,11 @@ pub struct SessionWindow {
     pub cmd: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// workspace режима `stack` → прямоугольник, запомненный для него.
+    /// Таблица пишется последней: TOML требует, чтобы вложенные таблицы
+    /// шли после простых полей.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub rects: BTreeMap<String, PxRect>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -296,5 +373,60 @@ chromium = "left"
         let mut st = State::default();
         st.cells_of(&cfg, "work", mon).insert("herdr".into(), Place::Cell("left".into()));
         assert_eq!(st.rect_for(&cfg, "work", "herdr", mon), Some(PxRect { x: -805, y: 10, w: 1920, h: 2140 }));
+    }
+
+    #[test]
+    fn session_window_instance_roundtrip() {
+        // Новый формат: номер, состав, прямоугольники stack, команда экземпляра.
+        let r = PxRect { x: 1700, y: 60, w: 1920, h: 2140 };
+        let w = SessionWindow {
+            app: Some("neovide".into()),
+            instance: Some(2),
+            workspaces: vec!["surf".into(), "work".into()],
+            desktop: "1".into(),
+            rect: PxRect { x: 3055, y: 10, w: 1920, h: 2140 },
+            rects: BTreeMap::from([("surf".to_string(), r)]),
+            cmd: vec!["neovide".into(), "notes.md".into()],
+            cwd: Some("/home/mne/notes".into()),
+            ..SessionWindow::default()
+        };
+        let s = Session { saved: "t".into(), active_desktop: 1, windows: vec![w.clone()], ..Session::default() };
+        let text = toml::to_string_pretty(&s).unwrap();
+        let back: Session = toml::from_str(&text).unwrap();
+        let b = &back.windows[0];
+        assert_eq!(b.instance, Some(2));
+        assert_eq!(b.workspaces, w.workspaces);
+        assert_eq!(b.rects, w.rects);
+        assert_eq!(b.cmd, w.cmd);
+        let e = RestoreEntry::from_window(b).unwrap();
+        assert_eq!((e.app.as_str(), e.instance, e.state), ("neovide", 2, RestoreState::Waiting));
+
+        // Пустые поля не пишутся.
+        let bare = SessionWindow { app: Some("chromium".into()), instance: Some(1), desktop: "1".into(), ..SessionWindow::default() };
+        let text = toml::to_string_pretty(&Session { windows: vec![bare], ..Session::default() }).unwrap();
+        assert!(!text.contains("workspaces = []") && !text.contains("rects") && !text.contains("cmd"), "{text}");
+
+        // Прежний формат: номера нет, запись плана не получается.
+        let old = r#"
+saved = "2026-09-23T14:12:21+03:00"
+active_desktop = 2
+[[windows]]
+app = "neovide"
+desktop = "1"
+[windows.rect]
+x = 3055
+y = 10
+w = 1920
+h = 2140
+"#;
+        let s: Session = toml::from_str(old).unwrap();
+        assert_eq!(s.windows[0].instance, None);
+        assert!(s.windows[0].workspaces.is_empty() && s.windows[0].rects.is_empty());
+        assert!(RestoreEntry::from_window(&s.windows[0]).is_none());
+
+        // Неизвестные поля (снимок более новой версии) разбору не мешают.
+        let newer = format!("{old}future = 1\n");
+        let s: Session = toml::from_str(&newer.replace("desktop = \"1\"", "desktop = \"1\"\nstate = \"x\"")).unwrap();
+        assert_eq!(s.windows[0].app.as_deref(), Some("neovide"));
     }
 }

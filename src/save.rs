@@ -295,6 +295,11 @@ fn update_extra_rects(d: &mut Daemon, ws: &str, clients: &[Client]) -> usize {
 /// места приложений, описанных в конфиге, не меняются. Возвращает число
 /// workspace, окон в них и принятых окон.
 pub fn save_session(d: &mut Daemon) -> Result<(usize, usize, usize)> {
+    // Сохранение — явное действие пользователя: окна, которых ждёт
+    // восстановление из прежнего снимка, больше не ждутся, а записи
+    // workspace, ещё не поднятых после старта, переходят в новый снимок
+    // (изменение session-instances, решения D10, D16).
+    d.end_restore_wait(None, false, "сохранение сессии");
     let desks: Vec<(u8, String)> = d.state().desktops.iter().filter_map(|(n, x)| Some((*n, x.active.clone()?))).collect();
     let mut adopted = 0;
     for (n, ws) in &desks {

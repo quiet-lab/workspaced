@@ -1,7 +1,7 @@
 //! Демон: владелец модели. Слушает события Hyprland, выполняет команды клиентов
 //! и панели, запускает приложения, расставляет окна, пишет сессию `default`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
@@ -16,7 +16,7 @@ use crate::config::{Config, Mode, Placement, PxRect, WsApp, config_path};
 use crate::keys::same_chain;
 use crate::hypr::{self, Client, Event, Hypr};
 use crate::session;
-use crate::state::{Cycle, Desktop, ExtraApp, Foreign, Place, State};
+use crate::state::{Cycle, Desktop, ExtraApp, Foreign, Place, RestoreEntry, RestoreState, State};
 
 /// Куда поставить окно после появления.
 #[derive(Debug, Clone)]
@@ -630,14 +630,16 @@ impl Daemon {
                 p.exe = Some(e);
             }
         }
-        let hit = if classless(&c) {
-            None
-        } else {
-            self.pending.iter().position(|p| ancestors.contains(&(p.pid as i32))).or_else(|| self.pending.iter().position(|p| p.matches(&c, &ancestors)))
-        };
-        if let Some(i) = hit {
+        // Порядок сопоставления (изменение session-instances, решение D5):
+        // совпадения по pid раньше совпадений по классу, иначе окно
+        // экземпляра, запущенного по записи снимка, досталось бы ожиданию
+        // запуска приложения по классу.
+        let classy = !classless(&c);
+        if let Some(i) = self.pending.iter().position(|p| classy && ancestors.contains(&(p.pid as i32))) {
             let p = self.pending.remove(i);
             self.adopt(&c, p)?;
+        } else if let Some(i) = match_restore(&self.st.restore, None, &ancestors, None).filter(|_| classy) {
+            self.restore_new(&c, &clients, i, "по pid запущенного процесса")?;
         } else {
             let (cmd, cwd) = proc_info(c.pid);
             if let Some(i) = self.expected.iter().position(|e| e.cmd == cmd && e.cwd == cwd) {
@@ -655,6 +657,11 @@ impl Daemon {
                 }
                 self.st.foreign.insert(c.address.clone(), Foreign { rect: e.rect, cmd, cwd });
                 self.hypr.dispatch_all(&ex)?;
+            } else if let Some(i) = self.pending.iter().position(|p| p.matches(&c, &ancestors)) {
+                let p = self.pending.remove(i);
+                self.adopt(&c, p)?;
+            } else if let Some(i) = self.awaited_entry(&c) {
+                self.restore_new(&c, &clients, i, "окно, открытое процессом приложения")?;
             } else {
                 // Окно, появившееся на столе с активным workspace, входит
                 // в этот workspace (решение D1): приложение конфига
@@ -677,6 +684,24 @@ impl Daemon {
     /// D7), workspace получает запись о месте приложения.
     fn adopt(&mut self, c: &Client, p: Pending) -> Result<()> {
         let clients = self.hypr.clients().unwrap_or_default();
+        // Окно, принятое ожиданием запуска, исполняет запись снимка этого
+        // приложения, если такая ждёт (решения D5, D7): номер, состав и место
+        // берутся из записи вместо места ожидания.
+        if let Some(i) = match_restore(&self.st.restore, Some(&p.app), &[], p.workspace.as_deref()) {
+            let e = self.st.restore[i].clone();
+            self.st.restore[i].state = RestoreState::Done;
+            let (mut ex, home, num) = self.instance_ex(c, &clients, &e, true);
+            if p.focus {
+                ex.push(hypr::d_focus_window(&c.address));
+                ex.push(hypr::d_bring_to_top());
+            } else {
+                ex.extend(self.focus_main_ex(home, &p.app, &clients));
+            }
+            log::info!("окно {} → приложение {} (экземпляр {num}) по записи снимка {}#{}, workspace {}", c.address, p.app, e.app, e.instance, entry_members(&self.cfg, &e).join(", "));
+            self.hypr.dispatch_all(&ex)?;
+            self.restore_progress(&e.app);
+            return Ok(());
+        }
         let num = free_instance(&clients, &p.app);
         let mut ex = entry_tags(&c.address, &p.app, num, p.workspace.as_deref());
         let joining = p.workspace.as_deref().filter(|w| !ws_has_app(&self.cfg, w, &p.app)).map(String::from);
@@ -870,6 +895,12 @@ impl Daemon {
     /// постороннего окна из снимка выхода процесса не переживает: восстановить
     /// его уже нечем.
     fn on_child_exit(&mut self, pid: u32) -> Result<()> {
+        if let Some(i) = self.st.restore.iter().position(|e| e.state == RestoreState::Launched(pid)) {
+            let e = &mut self.st.restore[i];
+            e.state = RestoreState::Done;
+            log::warn!("восстановление экземпляра {}#{}: процесс {pid} ({:?}) завершился без окна, запись снята", e.app, e.instance, e.cmd);
+            return Ok(());
+        }
         if let Some(i) = self.expected.iter().position(|e| e.pid == pid) {
             let e = self.expected.remove(i);
             log::warn!("восстановление окна {:?}: процесс завершился, окна нет", e.cmd);
@@ -975,8 +1006,11 @@ impl Daemon {
     /// Отдать workspace `ws` в общее пользование окна других workspace
     /// (решение D3, `share_plan`): окна получают тег состава `ws` и не
     /// теряют прежних.
-    fn share_windows(&mut self, clients: &mut [Client], ws: &str, apps: &[String]) -> Result<()> {
-        let plan = share_plan(&self.cfg, clients, ws, apps);
+    fn share_windows(&mut self, clients: &mut [Client], ws: &str, apps: &[String], skip: &[String]) -> Result<()> {
+        let mut plan = share_plan(&self.cfg, clients, ws, apps);
+        // Приложения, чьи экземпляры восстанавливаются для `ws`, окон других
+        // workspace не получают (изменение session-instances, решение D11).
+        plan.retain(|(_, app)| !skip.contains(app));
         let mut ex = Vec::new();
         for (i, app) in &plan {
             let c = &mut clients[*i];
@@ -1026,9 +1060,20 @@ impl Daemon {
         let w = self.cfg.workspaces[ws].clone();
         let apps: Vec<String> = w.apps.keys().cloned().collect();
         let stack = w.mode() == Mode::Stack;
+        // Экземпляры снимка с командной строкой, входящие в `ws`, запускаются
+        // раньше захвата и запуска приложений (решения D4, D11).
+        let launch: Vec<usize> = self.st.restore.iter().enumerate().filter(|(_, e)| e.state == RestoreState::Waiting && !e.cmd.is_empty() && e.workspaces.iter().any(|x| x == ws)).map(|(i, _)| i).collect();
+        for i in launch {
+            self.spawn_instance(i);
+        }
         let mut clients = self.hypr.clients()?;
         self.adopt_untagged(&mut clients, &apps, Some(ws))?;
-        self.share_windows(&mut clients, ws, &apps)?;
+        let steps: BTreeMap<String, RaiseStep> = {
+            let cfg = &self.cfg;
+            apps.iter().map(|a| (a.clone(), raise_restore_step(cfg, &self.st.restore, a, ws, !placed_windows(cfg, &clients, ws, &apps, a).is_empty()))).collect()
+        };
+        let held: Vec<String> = steps.iter().filter(|(_, s)| **s != RaiseStep::Normal).map(|(a, _)| a.clone()).collect();
+        self.share_windows(&mut clients, ws, &apps, &held)?;
         let before = actives(&self.st);
         // Вытесняемый workspace запоминает, где оставлены его окна: в режиме
         // `stack` следующее поднятие вернёт их именно туда.
@@ -1058,6 +1103,17 @@ impl Daemon {
             // пользователем не трогаются.
             let wins = placed_windows(&cfg, &clients, ws, &apps, app);
             if wins.is_empty() {
+                match steps.get(app).copied().unwrap_or(RaiseStep::Normal) {
+                    RaiseStep::Wait => {
+                        log::info!("workspace {ws}: окно экземпляра {app}, запущенного по снимку, ещё не появилось — приложение не запускается");
+                        continue;
+                    }
+                    RaiseStep::LaunchFirst => {
+                        log::info!("workspace {ws}: первый экземпляр {app} из снимка запускается командой приложения");
+                        self.st.restore_apps.insert(app.clone());
+                    }
+                    RaiseStep::Normal => {}
+                }
                 let target = rect.map(Target::Place).unwrap_or(Target::Free(None));
                 // Сбой запуска одного приложения поднятие не обрывает: его место
                 // остаётся пустым, остальные приложения встают, workspace
@@ -1338,6 +1394,11 @@ impl Daemon {
                 bail!("приложение {a} не описано");
             }
         }
+        // Вызов приложения — действие пользователя: окна, которые процесс
+        // приложения открывает сам, больше не ждутся (решение D10).
+        for a in apps {
+            self.end_restore_wait(Some(a), false, "вызов приложения");
+        }
         if let Some(n) = desktop
             && n != self.current
         {
@@ -1385,6 +1446,7 @@ impl Daemon {
         let app = match &route {
             AppRoute::Cycle { app, .. } | AppRoute::Raise { app, .. } | AppRoute::Pull { app, .. } | AppRoute::Open { app, .. } | AppRoute::Free { app } => app.clone(),
         };
+        self.end_restore_wait(Some(&app), false, "клавиша приложения");
         self.follow_route(route, false, &[app])
     }
 
@@ -1661,6 +1723,187 @@ impl Daemon {
         Ok(pid)
     }
 
+    // ---- Восстановление экземпляров ----------------------------------------------
+
+    /// Диспетчеры, которыми окно становится экземпляром записи снимка
+    /// (решения D6, D7, D13): тег экземпляра с номером записи, если он
+    /// свободен (`retag`; без него номер окна сохраняется — загрузка сессии),
+    /// теги состава ровно тех workspace записи, которые описывают приложение
+    /// (лишние снимаются), место по `restore_place`, прямоугольники записи —
+    /// в память режима `stack`. Возвращает диспетчеры, куда окно ушло и номер.
+    fn instance_ex(&mut self, c: &Client, clients: &[Client], e: &RestoreEntry, retag: bool) -> (Vec<String>, Home, u32) {
+        let cfg = self.cfg.clone();
+        let addr = c.address.clone();
+        let mut ex = Vec::new();
+        let num = if retag { restored_number(clients, &e.app, e.instance) } else { c.app_instance().map(|(_, n)| n).unwrap_or(e.instance) };
+        if retag {
+            ex.extend(c.app_tags().map(|t| hypr::d_untag(&addr, t)));
+            ex.push(hypr::d_tag(&addr, &format!("app:{}#{num}", e.app)));
+        }
+        let members = entry_members(&cfg, e);
+        for w in c.workspaces().into_iter().filter(|w| !members.contains(w)) {
+            ex.push(hypr::d_untag(&addr, &hypr::ws_tag(&w)));
+        }
+        for w in members.iter().filter(|w| !c.in_ws(w)) {
+            ex.push(hypr::d_tag(&addr, &hypr::ws_tag(w)));
+        }
+        let act = actives(&self.st);
+        let (home, rect) = restore_place(&mut self.st, &cfg, e, &act, self.current, self.mon);
+        match home {
+            Home::Desktop(k) => {
+                if c.desktop() != Some(k) {
+                    ex.push(hypr::d_move_to(&addr, &k.to_string()));
+                }
+                if let Some(r) = rect {
+                    ex.extend(hypr::d_place(&addr, r));
+                }
+            }
+            Home::Pool => ex.push(hypr::d_move_to(&addr, "special:pool")),
+            Home::Keep => {}
+        }
+        for (w, r) in e.rects.iter().filter(|(w, _)| members.contains(w)) {
+            self.st.geom.entry(w.clone()).or_default().insert(addr.clone(), *r);
+        }
+        if let Home::Desktop(k) = home
+            && let Some(w) = act.get(&k)
+            && cfg.workspaces.get(w).map(|x| x.mode()) == Some(Mode::Stack)
+        {
+            self.st.geom.entry(w.clone()).or_default().insert(addr.clone(), rect.unwrap_or_else(|| c.rect()));
+        }
+        self.st.foreign.remove(&addr);
+        (ex, home, num)
+    }
+
+    /// Фокус главному окну активного workspace стола, куда встало окно,
+    /// если это стол композитора: новое окно забирает фокус у композитора,
+    /// а восстановление фокус не меняет (решение D7).
+    fn focus_main_ex(&mut self, home: Home, app: &str, clients: &[Client]) -> Vec<String> {
+        let Home::Desktop(k) = home else { return Vec::new() };
+        if k != self.current {
+            return Vec::new();
+        }
+        let Some(ws) = self.st.desktops.get(&k).and_then(|d| d.active.clone()) else { return Vec::new() };
+        let main = self.cfg.workspaces.get(&ws).and_then(|w| w.main.clone()).or_else(|| self.st.main_app(&self.cfg, &ws, self.mon));
+        match main.filter(|m| m != app).and_then(|m| first_window(&self.cfg, clients, &m).filter(|w| w.desktop() == Some(k)).map(|w| w.address.clone())) {
+            Some(a) => vec![hypr::d_focus_window(&a), hypr::d_bring_to_top()],
+            None => Vec::new(),
+        }
+    }
+
+    /// Новое окно исполняет запись плана номер `i` (решения D5–D7).
+    fn restore_new(&mut self, c: &Client, clients: &[Client], i: usize, how: &str) -> Result<()> {
+        let e = self.st.restore[i].clone();
+        self.st.restore[i].state = RestoreState::Done;
+        let (mut ex, home, num) = self.instance_ex(c, clients, &e, true);
+        ex.extend(self.focus_main_ex(home, &e.app, clients));
+        log::info!("окно {} ({}) → приложение {} (экземпляр {num}) по записи снимка {}#{} ({how}), workspace {}", c.address, c.class, e.app, e.app, e.instance, entry_members(&self.cfg, &e).join(", "));
+        self.hypr.dispatch_all(&ex)?;
+        self.restore_progress(&e.app);
+        Ok(())
+    }
+
+    /// Живое окно, переиспользованное загрузкой сессии для записи снимка
+    /// (решение D9): номер сохраняется, состав и место — из записи.
+    pub fn reuse_window(&mut self, c: &Client, e: &RestoreEntry) {
+        let clients = self.hypr.clients().unwrap_or_default();
+        let (ex, _, num) = self.instance_ex(c, &clients, e, false);
+        log::info!("загрузка сессии: окно {} ({}) — экземпляр {num} приложения {} по записи {}#{}, workspace {}", c.address, c.class, e.app, e.app, e.instance, entry_members(&self.cfg, e).join(", "));
+        if let Err(err) = self.hypr.dispatch_all(&ex) {
+            log::warn!("загрузка сессии: окно {}: {err:#}", c.address);
+        }
+    }
+
+    /// Запись без командной строки, которую может исполнить окно `c`,
+    /// открытое процессом приложения (решения D5, D10): приложение окна
+    /// демон запустил при восстановлении, окно не диалог и не из списка
+    /// `ignore_classes`.
+    fn awaited_entry(&self, c: &Client) -> Option<usize> {
+        if classless(c) || self.cfg.ignored_class(&c.class) {
+            return None;
+        }
+        let app = app_for_window(&self.cfg, c)?;
+        if !self.st.restore_apps.contains(&app) || self.cfg.apps.get(&app).is_some_and(|a| a.is_dialog(&c.title)) {
+            return None;
+        }
+        match_restore(&self.st.restore, Some(&app), &[], None)
+    }
+
+    /// Все записи приложения исполнены — ожидание его окон закончено.
+    fn restore_progress(&mut self, app: &str) {
+        if !self.st.restore.iter().any(|e| e.app == app && e.open()) && self.st.restore_apps.remove(app) {
+            log::info!("восстановление {app}: все записи снимка исполнены");
+        }
+    }
+
+    /// Запустить запись плана с командной строкой (решения D2, D4).
+    fn spawn_instance(&mut self, i: usize) {
+        let e = self.st.restore[i].clone();
+        let Some(cmd) = launchable(&e.cmd, e.cwd.as_deref(), None) else {
+            log::warn!("восстановление экземпляра {}#{}: исполняемый файл команды {:?} не найден, запись снята", e.app, e.instance, e.cmd);
+            self.st.restore[i].state = RestoreState::Done;
+            return;
+        };
+        match self.spawn_foreign(&cmd, e.cwd.as_deref()) {
+            Ok(pid) => {
+                log::info!("восстановление экземпляра {}#{}: запущен pid {pid} ({} в {})", e.app, e.instance, cmd.join(" "), e.cwd.as_deref().unwrap_or("~"));
+                self.st.restore[i].state = RestoreState::Launched(pid);
+            }
+            Err(err) => {
+                log::warn!("восстановление экземпляра {}#{}: {err:#}; запись снята", e.app, e.instance);
+                self.st.restore[i].state = RestoreState::Done;
+            }
+        }
+    }
+
+    /// Записи без workspace (свободные окна приложений) запускаются после
+    /// поднятия workspace активного стола (решение D4): своей командой,
+    /// а без неё первый экземпляр — командой приложения, если у приложения
+    /// нет окон. Окно, скрытое при снимке, не запускается, как свободные
+    /// окна снимка на `special:hidden` (решение D16).
+    pub fn spawn_free_entries(&mut self) {
+        let cfg = self.cfg.clone();
+        let free: Vec<usize> = self.st.restore.iter().enumerate().filter(|(_, e)| e.state == RestoreState::Waiting && entry_members(&cfg, e).is_empty() && e.desktop != "hidden").map(|(i, _)| i).collect();
+        for i in free {
+            let e = self.st.restore[i].clone();
+            if !e.cmd.is_empty() {
+                self.spawn_instance(i);
+                continue;
+            }
+            let first = self.st.restore.iter().filter(|x| x.app == e.app).map(|x| x.instance).min() == Some(e.instance);
+            let live = self.hypr.clients().map(|cl| cl.iter().any(|c| c.app().as_deref() == Some(e.app.as_str()))).unwrap_or(false);
+            if !first || live {
+                continue;
+            }
+            self.st.restore_apps.insert(e.app.clone());
+            let (desktop, target) = match e.desktop.parse::<u8>() {
+                Ok(n) => (n, Target::Free(Some(e.rect))),
+                Err(_) => (self.current, Target::Pool),
+            };
+            log::info!("восстановление {}#{}: свободное окно приложения запускается командой приложения", e.app, e.instance);
+            if let Err(err) = self.spawn(&e.app, None, desktop, target, false) {
+                log::warn!("восстановление {}#{}: {err:#}", e.app, e.instance);
+            }
+        }
+    }
+
+    /// Снять ожидания плана восстановления (решение D10, `end_wait`):
+    /// приложения `app`, все ожидания окон (`app` нет) или весь план (`all`).
+    pub fn end_restore_wait(&mut self, app: Option<&str>, all: bool, why: &str) {
+        let dropped = end_wait(&mut self.st.restore, &self.st.restore_apps, app, all);
+        match app {
+            Some(a) if !all => {
+                self.st.restore_apps.remove(a);
+            }
+            _ => self.st.restore_apps.clear(),
+        }
+        if all {
+            self.st.restore.clear();
+        }
+        if !dropped.is_empty() {
+            log::info!("{why}: ожидание окон снимка снято — {}", dropped.join(", "));
+        }
+    }
+
     // ---- Половина рабочей области ---------------------------------------------
 
     /// Активное окно в половину рабочей области активного монитора. Расстояния
@@ -1875,6 +2118,21 @@ impl Daemon {
         obj.insert("ok".into(), json!(true));
         obj.insert("windows".into(), json!(windows));
         obj.insert("pending".into(), json!(pending));
+        let restore: Vec<Value> = self
+            .st
+            .restore
+            .iter()
+            .map(|e| {
+                let state = match e.state {
+                    RestoreState::Waiting => "waiting".to_string(),
+                    RestoreState::Launched(pid) => format!("launched {pid}"),
+                    RestoreState::Done => "done".to_string(),
+                };
+                json!({ "app": e.app, "instance": e.instance, "workspaces": e.workspaces, "cmd": e.cmd, "state": state })
+            })
+            .collect();
+        obj.insert("restore".into(), json!(restore));
+        obj.insert("restore_apps".into(), json!(self.st.restore_apps));
         obj.insert("cells".into(), serde_json::to_value(&self.st.cells).unwrap_or_default());
         obj.insert("lazy".into(), serde_json::to_value(&self.st.lazy).unwrap_or_default());
         obj.remove("event");
@@ -2946,6 +3204,124 @@ pub fn stale_tagged<'a>(cfg: &Config, clients: &'a [Client]) -> Vec<&'a Client> 
 /// заводится не больше одного, поэтому записи выбираются по имени.
 pub fn stale_pending(cfg: &Config, apps: &[String]) -> Vec<String> {
     apps.iter().filter(|a| !cfg.apps.contains_key(*a)).cloned().collect()
+}
+
+// ---- Восстановление экземпляров из снимка ------------------------------------
+
+/// Workspace записи снимка, которые описывают её приложение в эффективном
+/// конфиге: только в них окно может входить тегом состава (решение D7).
+pub fn entry_members(cfg: &Config, e: &RestoreEntry) -> Vec<String> {
+    e.workspaces.iter().filter(|w| ws_has_app(cfg, w, &e.app)).cloned().collect()
+}
+
+/// Место окна, восстановленного по записи снимка (изменение session-instances,
+/// решения D7, D13): по правилу размещения (`window_home`) для нынешних
+/// активных workspace столов (`actives`, `current` — стол композитора).
+/// На столе, где активен его workspace, окно встаёт в режиме обмена ячеек
+/// в ячейку своего приложения, в режиме `stack` — в прямоугольник записи для
+/// этого workspace, а без него — на место из конфига; без активного
+/// workspace — на `special:pool`. Скрытое при снимке окно восстанавливается
+/// видимым: стол снимка для окна с workspace не учитывается. Запись без
+/// workspace (свободное окно приложения) встаёт на свой стол в свой
+/// прямоугольник; с `pool` — на `special:pool`; с `hidden` — на текущий стол.
+pub fn restore_place(st: &mut State, cfg: &Config, e: &RestoreEntry, actives: &BTreeMap<u8, String>, current: u8, mon: (i32, i32)) -> (Home, Option<PxRect>) {
+    let members = entry_members(cfg, e);
+    if members.is_empty() {
+        return match e.desktop.parse::<u8>() {
+            Ok(n) if (1..=8).contains(&n) => (Home::Desktop(n), Some(e.rect)),
+            _ if e.desktop == "pool" => (Home::Pool, None),
+            _ => (Home::Desktop(current), Some(e.rect)),
+        };
+    }
+    match window_home(&members, actives, current, Spot::Pool) {
+        Home::Desktop(k) => {
+            let Some(w) = actives.get(&k) else { return (Home::Desktop(k), None) };
+            let stack = cfg.workspaces.get(w).map(|x| x.mode()) == Some(Mode::Stack);
+            let kept = if stack { e.rects.get(w).copied() } else { None };
+            (Home::Desktop(k), kept.or_else(|| st.rect_for(cfg, w, &e.app, mon)))
+        }
+        h => (h, None),
+    }
+}
+
+/// Запись плана для появившегося окна (решение D5). По `ancestors` (pid окна
+/// и его предки) ищется запись с командной строкой, для которой запущен один
+/// из этих процессов. По `app` — ожидающая запись этого приложения без
+/// командной строки: с наименьшим номером среди тех, у которых в списке
+/// есть `workspace` (для него приложение запущено), а без таких — с наименьшим
+/// номером вообще. Совпадение по pid проверяется первым.
+pub fn match_restore(entries: &[RestoreEntry], app: Option<&str>, ancestors: &[i32], workspace: Option<&str>) -> Option<usize> {
+    if let Some(i) = entries.iter().position(|e| matches!(e.state, RestoreState::Launched(pid) if ancestors.contains(&(pid as i32)))) {
+        return Some(i);
+    }
+    let app = app?;
+    let open: Vec<(usize, &RestoreEntry)> = entries.iter().enumerate().filter(|(_, e)| e.state == RestoreState::Waiting && e.cmd.is_empty() && e.app == app).collect();
+    let by_ws = open.iter().filter(|(_, e)| workspace.is_some_and(|w| e.workspaces.iter().any(|x| x == w))).min_by_key(|(_, e)| e.instance);
+    by_ws.or_else(|| open.iter().min_by_key(|(_, e)| e.instance)).map(|(i, _)| *i)
+}
+
+/// Что делает поднятие workspace для приложения без окон в нём (решение D11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RaiseStep {
+    /// Как прежде: окна других workspace в общее пользование, без них запуск.
+    Normal,
+    /// Первый экземпляр приложения из снимка входит в workspace и ещё
+    /// не восстановлен: запустить приложение его командой, окон других
+    /// workspace не отдавать.
+    LaunchFirst,
+    /// Окно экземпляра, запущенного по записи с командной строкой, ещё
+    /// не появилось: ни отдачи окон, ни запуска.
+    Wait,
+}
+
+/// Шаг поднятия `ws` для приложения `app` (решение D11). `has_windows` —
+/// у приложения уже есть окна в `ws`, тогда восстановление ничего не меняет.
+/// Первый экземпляр — запись с наименьшим номером среди записей приложения
+/// в снимке, в том числе исполненных.
+pub fn raise_restore_step(cfg: &Config, entries: &[RestoreEntry], app: &str, ws: &str, has_windows: bool) -> RaiseStep {
+    if has_windows {
+        return RaiseStep::Normal;
+    }
+    let in_ws = |e: &RestoreEntry| e.workspaces.iter().any(|w| w == ws);
+    let first = entries.iter().filter(|e| e.app == app).min_by_key(|e| e.instance);
+    if first.is_some_and(|e| e.state == RestoreState::Waiting && e.cmd.is_empty() && in_ws(e)) {
+        return RaiseStep::LaunchFirst;
+    }
+    if entries.iter().any(|e| matches!(e.state, RestoreState::Launched(_)) && cfg.app_is(&e.app, app) && in_ws(e)) {
+        return RaiseStep::Wait;
+    }
+    RaiseStep::Normal
+}
+
+/// Снять ожидания плана восстановления (решение D10); возвращает снятые
+/// записи как `имя#номер` для журнала. `all` — весь план (загрузка сессии).
+/// С `app` — ожидание окон этого приложения без командной строки (клавиша
+/// приложения, `workspaced app`). Без `app` — все ожидания окон (команда
+/// сохранения): записи, чей процесс запущен, и записи без командной строки
+/// приложений из `restore_apps`. Записи, которые ждут поднятия своего
+/// workspace, команда сохранения не снимает.
+pub fn end_wait(entries: &mut [RestoreEntry], restore_apps: &BTreeSet<String>, app: Option<&str>, all: bool) -> Vec<String> {
+    let mut out = Vec::new();
+    for e in entries.iter_mut().filter(|e| e.open()) {
+        let hit = all
+            || match app {
+                Some(a) => e.app == a && e.cmd.is_empty(),
+                None => matches!(e.state, RestoreState::Launched(_)) || (e.cmd.is_empty() && restore_apps.contains(&e.app)),
+            };
+        if hit {
+            e.state = RestoreState::Done;
+            out.push(format!("{}#{}", e.app, e.instance));
+        }
+    }
+    out
+}
+
+/// Номер экземпляра окна, восстановленного по записи с номером `num`
+/// (решение D6): номер записи, если его нет среди живых окон приложения,
+/// иначе наименьший свободный.
+pub fn restored_number(clients: &[Client], app: &str, num: u32) -> u32 {
+    let used = clients.iter().filter_map(|c| c.app_instance()).any(|(a, n)| a == app && n == num);
+    if used { free_instance(clients, app) } else { num }
 }
 
 /// Наименьший свободный номер, начиная с 1, среди занятых.
@@ -4639,5 +5015,154 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
         let full = PxRect { x: 0, y: 0, w: 3840, h: 2160 };
         assert_eq!(place_rect(full, 5, "bottom-left").unwrap(), PxRect { x: 10, y: 1085, w: 1905, h: 1065 });
         assert_eq!(place_rect(full, 5, "top-center").unwrap(), PxRect { x: 967, y: 10, w: 1905, h: 1065 });
+    }
+
+    // ---- Восстановление экземпляров (изменение session-instances) ----------
+
+    fn restore_cfg() -> Config {
+        let text = format!("{CFG}\n[apps.chrome-ai]\ncmd = \"google-chrome\"\nclass = \"^google-chrome-ai$\"\n\n[workspaces.surf]\ntemplate = \"thirds\"\nmode = \"stack\"\napps = {{ chrome-ai = \"right\", chromium = \"left\" }}\n");
+        Config::parse(&text).unwrap()
+    }
+
+    fn entry(app: &str, num: u32, ws: &[&str], cmd: &[&str]) -> RestoreEntry {
+        RestoreEntry {
+            app: app.into(),
+            instance: num,
+            workspaces: ws.iter().map(|w| w.to_string()).collect(),
+            desktop: "1".into(),
+            rect: PxRect { x: 100, y: 100, w: 800, h: 600 },
+            rects: BTreeMap::new(),
+            cmd: cmd.iter().map(|c| c.to_string()).collect(),
+            cwd: None,
+            state: RestoreState::Waiting,
+        }
+    }
+
+    #[test]
+    fn raise_waits_for_restored_instance() {
+        let cfg = restore_cfg();
+        // neovide: первый экземпляр в work, второй — с командой — в surf.
+        let mut e = vec![entry("neovide", 1, &["work"], &[]), entry("neovide", 2, &["surf"], &["neovide", "notes.md"]), entry("chromium", 1, &["work"], &[]), entry("chromium", 2, &["surf", "work"], &[])];
+        // Первый экземпляр ждёт запуска: work запускает neovide его командой.
+        assert_eq!(raise_restore_step(&cfg, &e, "neovide", "work", false), RaiseStep::LaunchFirst);
+        // Окна уже есть — восстановление ничего не решает.
+        assert_eq!(raise_restore_step(&cfg, &e, "neovide", "work", true), RaiseStep::Normal);
+        // Запись с командой в surf ещё не запущена — как прежде.
+        assert_eq!(raise_restore_step(&cfg, &e, "neovide", "surf", false), RaiseStep::Normal);
+        // Запущена, окна нет: surf не получает окно neovide из work и не запускает neovide.
+        e[1].state = RestoreState::Launched(4242);
+        assert_eq!(raise_restore_step(&cfg, &e, "neovide", "surf", false), RaiseStep::Wait);
+        // Первый экземпляр исполнен: запись без команды (второе окно chromium)
+        // решению D3 шага 4 не мешает.
+        e[2].state = RestoreState::Done;
+        assert_eq!(raise_restore_step(&cfg, &e, "chromium", "surf", false), RaiseStep::Normal);
+        // Первый экземпляр chromium ждёт, но в surf не входит.
+        e[2].state = RestoreState::Waiting;
+        assert_eq!(raise_restore_step(&cfg, &e, "chromium", "surf", false), RaiseStep::Normal);
+        assert_eq!(raise_restore_step(&cfg, &e, "chromium", "work", false), RaiseStep::LaunchFirst);
+    }
+
+    #[test]
+    fn restore_match_prefers_pid() {
+        let mut e = vec![entry("neovide", 1, &["work"], &[]), entry("neovide", 2, &["work"], &["neovide", "notes.md"])];
+        e[1].state = RestoreState::Launched(500);
+        // Окно процесса 501, потомка запущенного 500: запись с командой,
+        // хотя по приложению подошла бы и запись номер 1.
+        assert_eq!(match_restore(&e, Some("neovide"), &[501, 500, 1], Some("work")), Some(1));
+        // Чужой процесс: запись без команды с наименьшим номером.
+        assert_eq!(match_restore(&e, Some("neovide"), &[777], Some("work")), Some(0));
+        // Без приложения — только по pid.
+        assert_eq!(match_restore(&e, None, &[777], None), None);
+        assert_eq!(match_restore(&e, None, &[500], None), Some(1));
+    }
+
+    #[test]
+    fn restore_match_by_number_and_workspace() {
+        let mut e = vec![entry("chromium", 1, &["work"], &[]), entry("chromium", 2, &["surf", "work"], &[]), entry("chromium", 3, &["surf"], &[])];
+        // Для work — наименьший номер среди записей с work.
+        assert_eq!(match_restore(&e, Some("chromium"), &[], Some("work")), Some(0));
+        // Для surf — наименьший среди записей с surf.
+        assert_eq!(match_restore(&e, Some("chromium"), &[], Some("surf")), Some(1));
+        // Workspace не задан или ни в одной записи — наименьший вообще.
+        assert_eq!(match_restore(&e, Some("chromium"), &[], None), Some(0));
+        assert_eq!(match_restore(&e, Some("chromium"), &[], Some("chat")), Some(0));
+        // Исполненные записи не участвуют.
+        e[0].state = RestoreState::Done;
+        assert_eq!(match_restore(&e, Some("chromium"), &[], Some("work")), Some(1));
+        // Записи другого приложения не подходят.
+        assert_eq!(match_restore(&e, Some("neovide"), &[], Some("work")), None);
+    }
+
+    #[test]
+    fn restored_window_keeps_number_and_membership() {
+        let cfg = restore_cfg();
+        // Окно второго экземпляра появилось раньше первого: номер 2 свободен.
+        let clients = vec![hypr::test_client("0xa", "neovide", "", "1", &[])];
+        assert_eq!(restored_number(&clients, "neovide", 2), 2);
+        // Номер занят живым окном — наименьший свободный.
+        let clients = vec![hypr::test_client("0xb", "neovide", "", "1", &["app:neovide#2"]), hypr::test_client("0xa", "neovide", "", "1", &[])];
+        assert_eq!(restored_number(&clients, "neovide", 2), 1);
+        // Состав — только workspace записи, описывающие приложение.
+        let e = entry("chromium", 2, &["chat", "surf", "work"], &[]);
+        assert_eq!(entry_members(&cfg, &e), vec!["surf".to_string(), "work".to_string()]);
+        let e = entry("chrome-ai", 1, &["work"], &[]);
+        assert!(entry_members(&cfg, &e).is_empty());
+    }
+
+    #[test]
+    fn restored_window_goes_home() {
+        let cfg = restore_cfg();
+        let mon = (3840, 2160);
+        let mut st = State::default();
+        let act = desks(&[(1, "work"), (2, "surf")]);
+        // Окно из surf при активном work на текущем столе уходит на стол surf
+        // в прямоугольник, записанный для surf.
+        let mut e = entry("chrome-ai", 1, &["surf"], &[]);
+        let r = PxRect { x: 1700, y: 60, w: 1920, h: 2140 };
+        e.rects.insert("surf".into(), r);
+        assert_eq!(restore_place(&mut st, &cfg, &e, &act, 1, mon), (Home::Desktop(2), Some(r)));
+        // Без записанного прямоугольника — место из конфига.
+        e.rects.clear();
+        assert_eq!(restore_place(&mut st, &cfg, &e, &act, 1, mon), (Home::Desktop(2), Some(PxRect { x: 3055, y: 10, w: 1920, h: 2140 })));
+        // Общее окно surf и work при текущем столе 1 — ячейка своего
+        // приложения в work (режим обмена), прямоугольник surf не берётся.
+        let mut e = entry("chromium", 2, &["surf", "work"], &[]);
+        e.rects.insert("surf".into(), r);
+        assert_eq!(restore_place(&mut st, &cfg, &e, &act, 1, mon), (Home::Desktop(1), Some(PxRect { x: -805, y: 10, w: 1920, h: 2140 })));
+        // Скрытое при снимке окно восстанавливается видимым на своём столе.
+        let mut h = entry("neovide", 2, &["work"], &[]);
+        h.desktop = "hidden".into();
+        assert_eq!(restore_place(&mut st, &cfg, &h, &act, 2, mon), (Home::Desktop(1), Some(PxRect { x: 3055, y: 10, w: 1920, h: 2140 })));
+        // Ни один workspace окна не активен — special:pool.
+        let only = desks(&[(1, "work")]);
+        assert_eq!(restore_place(&mut st, &cfg, &entry("chrome-ai", 1, &["surf"], &[]), &only, 1, mon), (Home::Pool, None));
+        // Свободное окно приложения — свой стол и свой прямоугольник.
+        let mut f = entry("calc", 1, &[], &[]);
+        f.desktop = "3".into();
+        assert_eq!(restore_place(&mut st, &cfg, &f, &act, 1, mon), (Home::Desktop(3), Some(f.rect)));
+        f.desktop = "pool".into();
+        assert_eq!(restore_place(&mut st, &cfg, &f, &act, 1, mon), (Home::Pool, None));
+    }
+
+    #[test]
+    fn restore_wait_ends_on_key_and_save() {
+        let mut e = vec![entry("chromium", 1, &["work"], &[]), entry("chromium", 2, &["work"], &[]), entry("neovide", 2, &["work"], &["neovide", "x"]), entry("chrome-ai", 1, &["surf"], &[])];
+        e[0].state = RestoreState::Done;
+        e[2].state = RestoreState::Launched(10);
+        let apps: BTreeSet<String> = ["chromium".to_string()].into();
+        // Клавиша chromium снимает ожидание его записей без команды.
+        let mut k = e.clone();
+        assert_eq!(end_wait(&mut k, &apps, Some("chromium"), false), vec!["chromium#2".to_string()]);
+        assert_eq!(k[2].state, RestoreState::Launched(10));
+        // Сохранение снимает ожидания окон: запущенный экземпляр и записи
+        // приложения, запущенного при восстановлении; запись workspace, ещё
+        // не поднятого (chrome-ai), остаётся ждать поднятия.
+        let mut sv = e.clone();
+        assert_eq!(end_wait(&mut sv, &apps, None, false), vec!["chromium#2".to_string(), "neovide#2".to_string()]);
+        assert_eq!(sv[3].state, RestoreState::Waiting);
+        // Загрузка снимает весь план.
+        let mut ld = e.clone();
+        assert_eq!(end_wait(&mut ld, &apps, None, true).len(), 3);
+        assert!(ld.iter().all(|x| !x.open()));
     }
 }
