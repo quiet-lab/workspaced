@@ -110,6 +110,13 @@ pub struct State {
     pub geom: BTreeMap<String, HashMap<String, PxRect>>,
     /// workspace → имя → дополнительное приложение сессии.
     pub extra: BTreeMap<String, BTreeMap<String, ExtraApp>>,
+    /// Записи дополнительных приложений сессии (workspace, имя), взятые
+    /// из снимка и ещё не получившие окна в своём workspace (изменение
+    /// session-windows-transient, решение D2). Только такая запись живёт без
+    /// окон: закрытие окон её не снимает, а снимок переносит её как есть.
+    /// Запись выходит из ожидания, как только у приложения появляется окно
+    /// в этом workspace, и дальше живёт, пока окна есть.
+    pub extra_wait: BTreeSet<(String, String)>,
     /// адрес окна → посторонняя привязка.
     pub foreign: HashMap<String, Foreign>,
     /// Столы, чей активный workspace поднимается при первом переходе (ленивое восстановление).

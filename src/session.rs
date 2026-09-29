@@ -320,6 +320,7 @@ fn apply_lists(d: &mut Daemon, s: &Session) {
     st.main.clear();
     st.geom.clear();
     st.extra.clear();
+    st.extra_wait.clear();
     for (w, sw) in &s.workspaces {
         if !cfg_ws.contains(w) {
             continue;
@@ -337,6 +338,11 @@ fn apply_lists(d: &mut Daemon, s: &Session) {
         }
         if !sw.extra_apps.is_empty() {
             st.extra.insert(w.clone(), sw.extra_apps.clone());
+            // Записи снимка ждут окон: без окон их держит только ожидание,
+            // пока окно не появится (изменение session-windows-transient,
+            // решение D2). Окна, уже открытые в workspace (перезапуск
+            // демона), выводят запись из ожидания при первой же сверке.
+            st.extra_wait.extend(sw.extra_apps.keys().map(|a| (w.clone(), a.clone())));
         }
     }
     st.lazy.clear();

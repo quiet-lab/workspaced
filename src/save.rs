@@ -297,6 +297,14 @@ pub fn record_name(cfg: &Config, file: &Config, ws: &str, clients: &[Client], ap
     }
 }
 
+/// Записи сессии workspace `ws` (`extra`), у которых в нём нет окон:
+/// команда записи workspace их не пишет (изменение
+/// session-windows-transient, решение D5).
+pub fn absent_records(cfg: &Config, clients: &[Client], ws: &str, extra: Option<&BTreeMap<String, ExtraApp>>) -> Vec<String> {
+    let apps: Vec<String> = cfg.workspaces.get(ws).map(|w| w.apps.keys().cloned().collect()).unwrap_or_default();
+    extra.map(|m| m.keys().filter(|a| daemon::placed_windows(cfg, clients, ws, &apps, a).is_empty()).cloned().collect()).unwrap_or_default()
+}
+
 pub fn save_workspace(d: &mut Daemon) -> Result<String> {
     let n = d.current_desktop();
     let Some(ws) = d.state().desktops.get(&n).and_then(|x| x.active.clone()) else { bail!("на столе {n} нет активного workspace") };
@@ -314,7 +322,11 @@ pub fn save_workspace(d: &mut Daemon) -> Result<String> {
     // на другой стол, даёт место, снятое, когда оно стояло здесь.
     d.absorb(&ws, n, &clients);
     let cells = d.state_mut().cells_of(&cfg, &ws, mon).clone();
-    let main_app = d.state_mut().main_app(&cfg, &ws, mon);
+    // Записи сессии без окон — записи снимка, чьё окно ещё не появилось, —
+    // в конфиг не попадают: команда записывает окна, открытые в workspace
+    // сейчас (изменение session-windows-transient, решение D5).
+    let absent = absent_records(&cfg, &clients, &ws, d.state().extra.get(&ws));
+    let main_app = d.state_mut().main_app(&cfg, &ws, mon).filter(|m| !absent.contains(m));
     let template: BTreeMap<String, PxRect> = cfg
         .workspaces
         .get(&ws)
@@ -325,7 +337,7 @@ pub fn save_workspace(d: &mut Daemon) -> Result<String> {
     // Дополнительные приложения сессии переходят в конфиг: их описание идёт
     // в [apps], а место — вместе с остальными приложениями workspace, потому
     // что они уже в его раскладке.
-    let extra: BTreeMap<String, ExtraApp> = d.state().extra.get(&ws).cloned().unwrap_or_default();
+    let extra: BTreeMap<String, ExtraApp> = d.state().extra.get(&ws).cloned().unwrap_or_default().into_iter().filter(|(a, _)| !absent.contains(a)).collect();
 
     let root = doc.as_table_mut();
     for (name, e) in &extra {
@@ -356,7 +368,7 @@ pub fn save_workspace(d: &mut Daemon) -> Result<String> {
     order.extend(cells.keys().filter(|a| !order.contains(a)).cloned().collect::<Vec<_>>());
     let mut places: Vec<(String, Item)> = Vec::new();
     let mut main_name = main_app.clone();
-    for app in &order {
+    for app in order.iter().filter(|a| !absent.contains(a)) {
         let Some(place) = cells.get(app) else { continue };
         let rect = d.state_mut().rect_for(&cfg, &ws, app, mon);
         if let Some(item) = place_item(&template, Some(place), rect) {
@@ -438,12 +450,18 @@ pub fn save_workspace(d: &mut Daemon) -> Result<String> {
     // Раскладка workspace собирается заново из только что записанного
     // конфига: изменённые места стали местами из описания, а новые
     // приложения иначе не попали бы в неё до перезапуска демона.
-    // Дополнительные приложения сессии этого workspace перешли в конфиг.
+    // Дополнительные приложения сессии этого workspace перешли в конфиг;
+    // остаются только записи без окон, которые ещё ждут окна из снимка.
     let st = d.state_mut();
     st.cells.remove(&ws);
     st.moved.remove(&ws);
     st.main.remove(&ws);
-    st.extra.remove(&ws);
+    if let Some(m) = st.extra.get_mut(&ws) {
+        m.retain(|a, _| absent.contains(a));
+        if m.is_empty() {
+            st.extra.remove(&ws);
+        }
+    }
     // Перечитывать конфиг здесь не нужно: запись во временный файл
     // с переименованием — завершённая запись, и наблюдатель каталога
     // присылает демону событие сам. Явный вызов давал второе перечитывание
@@ -816,5 +834,22 @@ workspace = "surf"
         let mut st = work_on_one();
         let items = layout_items(&cfg, &mut st, "work", &clients);
         assert_eq!(items.iter().find(|(a, _)| a == "chromium").unwrap().1, "\"left\"");
+    }
+
+    #[test]
+    fn save_workspace_skips_records_without_windows() {
+        // Запись workspace пишет окна, открытые в нём сейчас: запись сессии,
+        // ждущая окна из снимка, в конфиг не попадает (изменение
+        // session-windows-transient, решение D5).
+        let file = Config::parse(CFG).unwrap();
+        let rect = PxRect { x: 100, y: 100, w: 800, h: 600 };
+        let mut extra: BTreeMap<String, BTreeMap<String, ExtraApp>> = BTreeMap::new();
+        let m = extra.entry("work".into()).or_default();
+        m.insert("galculator".into(), ExtraApp { class: Some("Galculator".into()), cmd: vec!["galculator".into()], cwd: None, rect });
+        m.insert("telegram".into(), ExtraApp { class: Some("org.telegram.desktop".into()), cmd: vec!["telegram-desktop".into()], cwd: None, rect });
+        let (cfg, _) = daemon::merge_extra(&file, &extra);
+        let clients = vec![test_client("0x1", "Galculator", "Калькулятор", "1", &["app:galculator#1", "ws:work"])];
+        assert_eq!(absent_records(&cfg, &clients, "work", extra.get("work")), vec!["telegram".to_string()]);
+        assert!(absent_records(&cfg, &clients, "surf", extra.get("surf")).is_empty());
     }
 }

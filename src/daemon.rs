@@ -198,6 +198,7 @@ pub fn run() -> Result<()> {
     }
     let mut d = Daemon { cfg: cfg.clone(), cfg_file: cfg, cfg_text, cfg_path, expected: Vec::new(), hypr, st: State::default(), mon, current, pending: Vec::new(), subs: Vec::new(), tx: tx.clone(), maximized: HashMap::new() };
     d.startup()?;
+    d.settle_wait();
     // Конфиг при старте прочитан выше, значит привязки в нём могут быть новее
     // тех, что знает композитор: файл могли поправить, пока демон не работал,
     // или демон перезапустили с бинарником, где появились новые действия.
@@ -227,6 +228,7 @@ pub fn run() -> Result<()> {
                 }
             }
         }
+        d.settle_wait();
     }
     Ok(())
 }
@@ -536,6 +538,9 @@ impl Daemon {
                     Ok(mut clients) => {
                         clients.retain(|c| c.address != addr);
                         self.drop_moved_of(&addr, &clients, "окно закрыто");
+                        // Запись сессии живёт, пока открыто её окно
+                        // (изменение session-windows-transient, решение D1).
+                        self.sweep_extra_records(&clients, "окно закрыто");
                     }
                     Err(e) => log::warn!("закрытие окна {addr}: {e:#}"),
                 }
@@ -869,6 +874,41 @@ impl Daemon {
         }
     }
 
+    /// Снять записи сессии, у которых в своём workspace не осталось окон
+    /// (`sweep_extras`), и пересобрать эффективный конфиг.
+    fn sweep_extra_records(&mut self, clients: &[Client], why: &str) {
+        let cfg = self.cfg.clone();
+        let dropped = sweep_extras(&cfg, &mut self.st, clients);
+        if dropped.is_empty() {
+            return;
+        }
+        for (w, a) in &dropped {
+            log::info!("workspace {w}: {why}, окон приложения {a} в нём не осталось — запись сессии {a} снята");
+        }
+        self.rebuild_cfg();
+    }
+
+    /// Вывести из ожидания записи сессии из снимка, у которых появилось окно
+    /// (`settle_extra_wait`). Вызывается после каждого сообщения демону:
+    /// окно входит в workspace разными путями (ожидание запуска, запись
+    /// снимка, захват при поднятии), и сверка после сообщения видит итог
+    /// любого из них. Пока ожиданий нет, композитор не спрашивается.
+    pub fn settle_wait(&mut self) {
+        if self.st.extra_wait.is_empty() {
+            return;
+        }
+        let clients = match self.hypr.clients() {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!("сверка записей сессии, ждущих окон: {e:#}");
+                return;
+            }
+        };
+        for (w, a) in settle_extra_wait(&self.cfg, &mut self.st, &clients) {
+            log::info!("workspace {w}: запись сессии {a} из снимка получила окно и живёт, пока окно открыто");
+        }
+    }
+
     /// Записать дополнительное приложение сессии и пересобрать эффективный
     /// конфиг: после этого приложение живёт наравне с приложениями файла.
     fn remember_extra(&mut self, ws: &str, name: &str, e: ExtraApp) {
@@ -1071,7 +1111,8 @@ impl Daemon {
     /// (решение D3, `share_plan`): окна получают тег состава `ws` и не
     /// теряют прежних.
     fn share_windows(&mut self, clients: &mut [Client], ws: &str, apps: &[String], skip: &[String]) -> Result<()> {
-        let mut plan = share_plan(&self.cfg, clients, ws, apps);
+        let session: Vec<String> = self.st.extra.get(ws).map(|m| m.keys().cloned().collect()).unwrap_or_default();
+        let mut plan = share_plan(&self.cfg, clients, ws, apps, &session);
         // Приложения, чьи экземпляры восстанавливаются для `ws`, окон других
         // workspace не получают (изменение session-instances, решение D11).
         plan.retain(|(_, app)| !skip.contains(app));
@@ -1124,16 +1165,29 @@ impl Daemon {
         let w = self.cfg.workspaces[ws].clone();
         let apps: Vec<String> = w.apps.keys().cloned().collect();
         // Экземпляры снимка с командной строкой, входящие в `ws`, запускаются
-        // раньше захвата и запуска приложений (решения D4, D11).
-        let launch: Vec<usize> = self.st.restore.iter().enumerate().filter(|(_, e)| e.state == RestoreState::Waiting && !e.cmd.is_empty() && e.workspaces.iter().any(|x| x == ws)).map(|(i, _)| i).collect();
-        for i in launch {
+        // раньше захвата и запуска приложений (решения D4, D11 изменения
+        // session-instances); экземпляры записей сессии — после приложений
+        // конфига (изменение session-windows-transient, решение D4).
+        let session: Vec<String> = self.st.extra.get(ws).map(|m| m.keys().cloned().collect()).unwrap_or_default();
+        let (early, late) = instance_launches(&self.st.restore, ws, &session);
+        for i in early {
             self.spawn_instance(i);
         }
         let mut clients = self.hypr.clients()?;
         self.adopt_untagged(&mut clients, &apps, Some(ws))?;
         let steps: BTreeMap<String, RaiseStep> = {
             let cfg = &self.cfg;
-            apps.iter().map(|a| (a.clone(), raise_restore_step(cfg, &self.st.restore, a, ws, !placed_windows(cfg, &clients, ws, &apps, a).is_empty()))).collect()
+            let restore = &self.st.restore;
+            apps.iter()
+                .map(|a| {
+                    let step = raise_restore_step(cfg, restore, a, ws, !placed_windows(cfg, &clients, ws, &apps, a).is_empty());
+                    // Экземпляр записи сессии запустится после приложений
+                    // конфига: приложение ждёт его окна, а не запускается
+                    // второй раз.
+                    let later = late.iter().any(|i| restore[*i].app == *a);
+                    (a.clone(), if later && step == RaiseStep::Normal { RaiseStep::Wait } else { step })
+                })
+                .collect()
         };
         let held: Vec<String> = steps.iter().filter(|(_, s)| **s != RaiseStep::Normal).map(|(a, _)| a.clone()).collect();
         self.share_windows(&mut clients, ws, &apps, &held)?;
@@ -1241,6 +1295,9 @@ impl Daemon {
                     main_addr = Some(c.address.clone());
                 }
             }
+        }
+        for i in late {
+            self.spawn_instance(i);
         }
         // Окна других workspace уходят со стола по правилу размещения: на стол,
         // где активен другой их workspace, либо на `special:pool`. Свободные
@@ -2752,12 +2809,17 @@ pub fn follow_plan(st: &mut State, cfg: &Config, clients: &[Client], n: u8, mon:
 /// пользование (решение D3): для приложения, у которого после захвата
 /// свободных окон нет ни одного окна в `ws`, — все его нескрытые окна
 /// (по семейству — окна семейства, по варианту — окна варианта). Окна,
-/// уже входящие в `ws`, другими не дополняются. Возвращает номер окна
-/// в списке клиентов и приложение workspace.
-pub fn share_plan(cfg: &Config, clients: &[Client], ws: &str, apps: &[String]) -> Vec<(usize, String)> {
+/// уже входящие в `ws`, другими не дополняются. Приложения `session` —
+/// записи сессии этого workspace — окон других workspace не получают.
+/// Возвращает номер окна в списке клиентов и приложение workspace.
+pub fn share_plan(cfg: &Config, clients: &[Client], ws: &str, apps: &[String], session: &[String]) -> Vec<(usize, String)> {
     let mut out: Vec<(usize, String)> = Vec::new();
     for app in apps {
-        if !placed_windows(cfg, clients, ws, apps, app).is_empty() {
+        // Запись сессии окон других workspace не получает (изменение
+        // session-windows-transient, решение D3): она держит только окна,
+        // открытые в этом workspace, а пока их нет, приложение запускается
+        // своей командой.
+        if session.contains(app) || !placed_windows(cfg, clients, ws, apps, app).is_empty() {
             continue;
         }
         for c in app_windows_in(cfg, clients, apps, app) {
@@ -3392,6 +3454,60 @@ pub fn drop_extra_app(st: &mut State, ws: &str, app: &str, last: bool) -> Vec<St
     from
 }
 
+/// Есть ли у записи `app` в workspace `ws` окна: окна приложения (и его
+/// вариантов, которых `ws` не описывает отдельно), входящие в `ws` по тегу
+/// состава, в том числе скрытые.
+fn record_has_windows(cfg: &Config, clients: &[Client], ws: &str, app: &str) -> bool {
+    let apps: Vec<String> = cfg.workspaces.get(ws).map(|w| w.apps.keys().cloned().collect()).unwrap_or_default();
+    !placed_windows(cfg, clients, ws, &apps, app).is_empty()
+}
+
+/// Вывести из ожидания записи сессии, у которых появилось окно в своём
+/// workspace, и забыть ожидание снятых записей (изменение
+/// session-windows-transient, решение D2). Возвращает выведенные записи.
+pub fn settle_extra_wait(cfg: &Config, st: &mut State, clients: &[Client]) -> Vec<(String, String)> {
+    let released: Vec<(String, String)> = st
+        .extra_wait
+        .iter()
+        .filter(|(w, a)| !st.extra.get(w).is_some_and(|m| m.contains_key(a)) || record_has_windows(cfg, clients, w, a))
+        .cloned()
+        .collect();
+    for k in &released {
+        st.extra_wait.remove(k);
+    }
+    released
+}
+
+/// Снять записи дополнительных приложений сессии, у которых в своём
+/// workspace не осталось окон (изменение session-windows-transient,
+/// решение D1): окно, открытое по ходу работы, держит запись, пока открыто.
+/// Запись, ждущая окна из снимка (`extra_wait`), не снимается. Если окон
+/// приложения не осталось нигде, запись с командой запуска снимается и во
+/// всех остальных workspace, как при отделении последнего окна
+/// (`drop_extra_app`). Вместе с записью снимается место в раскладке.
+/// Возвращает снятые записи (workspace, приложение).
+pub fn sweep_extras(cfg: &Config, st: &mut State, clients: &[Client]) -> Vec<(String, String)> {
+    let orphans: Vec<(String, String)> = st
+        .extra
+        .iter()
+        .flat_map(|(w, m)| m.keys().map(move |a| (w.clone(), a.clone())))
+        .filter(|k| !st.extra_wait.contains(k))
+        .filter(|(w, a)| !record_has_windows(cfg, clients, w, a))
+        .collect();
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (w, a) in &orphans {
+        let gone = !clients.iter().any(|c| c.app().as_deref() == Some(a.as_str()));
+        for x in drop_extra_app(st, w, a, gone) {
+            let k = (x, a.clone());
+            if !out.contains(&k) {
+                out.push(k);
+            }
+        }
+    }
+    st.extra_wait.retain(|(w, a)| st.extra.get(w).is_some_and(|m| m.contains_key(a)));
+    out
+}
+
 /// Стол `n` принимает workspace (спецификация ws-daemon, «Поднятие workspace
 /// на столе», решение D16). Workspace числится ровно на одном столе, поэтому
 /// из списков остальных столов он убирается; на столе, где он был активным,
@@ -3635,6 +3751,22 @@ pub fn match_restore(entries: &[RestoreEntry], app: Option<&str>, ancestors: &[i
     let open: Vec<(usize, &RestoreEntry)> = entries.iter().enumerate().filter(|(_, e)| e.state == RestoreState::Waiting && e.cmd.is_empty() && e.app == app).collect();
     let by_ws = open.iter().filter(|(_, e)| workspace.is_some_and(|w| e.workspaces.iter().any(|x| x == w))).min_by_key(|(_, e)| e.instance);
     by_ws.or_else(|| open.iter().min_by_key(|(_, e)| e.instance)).map(|(i, _)| *i)
+}
+
+/// Записи снимка с командной строкой, которые запускает поднятие `ws`
+/// (решения D4, D11 изменения session-instances): ждущие запуска и входящие
+/// в `ws`. Первый список запускается до захвата и запуска приложений,
+/// второй — записи приложений сессии `session` этого workspace — после
+/// приложений конфига: workspace сначала поднимается по конфигу, затем
+/// открываются окна, запущенные в нём по ходу работы (изменение
+/// session-windows-transient, решение D4).
+pub fn instance_launches(entries: &[RestoreEntry], ws: &str, session: &[String]) -> (Vec<usize>, Vec<usize>) {
+    entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.state == RestoreState::Waiting && !e.cmd.is_empty() && e.workspaces.iter().any(|x| x == ws))
+        .map(|(i, _)| i)
+        .partition(|i| !session.contains(&entries[*i].app))
 }
 
 /// Что делает поднятие workspace для приложения без окон в нём (решение D11).
@@ -4487,13 +4619,13 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
         ];
         // У chrome-ai окна в dev-back нет: его нескрытое окно из surf становится
         // общим. У neovide окно в dev-back есть: окно work к нему не добавляется.
-        assert_eq!(share_plan(&cfg, &clients, "dev-back", &apps), vec![(0, "chrome-ai".to_string())]);
+        assert_eq!(share_plan(&cfg, &clients, "dev-back", &apps, &[]), vec![(0, "chrome-ai".to_string())]);
         // Скрытое окно workspace считается его окном: второе не добавляется.
         let hidden = vec![client("0x4", "google-chrome-ai", "ИИ", "special:hidden", &["app:chrome-ai#2", "ws:dev-back"]), clients[0].clone()];
-        assert!(share_plan(&cfg, &hidden, "dev-back", &["chrome-ai".to_string()]).is_empty());
+        assert!(share_plan(&cfg, &hidden, "dev-back", &["chrome-ai".to_string()], &[]).is_empty());
         // Свободные окна (без состава) отдаёт не этот план, а захват.
         let free = vec![client("0x5", "google-chrome-ai", "ИИ", "4", &["app:chrome-ai#1"])];
-        assert!(share_plan(&cfg, &free, "dev-back", &["chrome-ai".to_string()]).is_empty());
+        assert!(share_plan(&cfg, &free, "dev-back", &["chrome-ai".to_string()], &[]).is_empty());
     }
 
     #[test]
@@ -5938,5 +6070,108 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
         // На столе нет активного workspace.
         assert_eq!(key_route(&cfg, &d, 4, "SUPER+V", &[]), Some(AppRoute::Free { app: s("chrome-ai") }));
         assert_eq!(app_route(&cfg, &d, 4, &[s("neovide")], false, &[]).app(), "neovide");
+    }
+
+    // ---- Изменение session-windows-transient ---------------------------------
+
+    /// Записи сессии в `st.extra` и эффективный конфиг с ними.
+    fn session_state(records: &[(&str, &str, ExtraApp)]) -> (Config, State) {
+        let file = shared_cfg();
+        let mut st = State::default();
+        for (w, a, e) in records {
+            st.extra.entry(w.to_string()).or_default().insert(a.to_string(), e.clone());
+            st.cells.entry(w.to_string()).or_default().insert(a.to_string(), Place::Rect { rect: e.rect });
+        }
+        let (cfg, dropped) = merge_extra(&file, &st.extra);
+        assert!(dropped.is_empty(), "{dropped:?}");
+        (cfg, st)
+    }
+
+    fn telegram() -> ExtraApp {
+        ExtraApp { class: Some("org.telegram.desktop".into()), cmd: vec!["/usr/bin/telegram-desktop".into()], cwd: None, rect: PxRect { x: 100, y: 100, w: 800, h: 600 } }
+    }
+
+    #[test]
+    fn closing_last_window_drops_session_record() {
+        let (cfg, mut st) = session_state(&[("work", "telegram", telegram()), ("surf", "telegram", telegram())]);
+        let tg = |addr: &str, ws: &str| client(addr, "org.telegram.desktop", "Telegram", "1", &["app:telegram#1", ws]);
+        // Окна есть в обоих workspace: записи живут.
+        let both = vec![tg("0x1", "ws:work"), tg("0x2", "ws:surf")];
+        assert!(sweep_extras(&cfg, &mut st, &both).is_empty());
+        // Закрыто окно в work, окно в surf открыто: запись снята только у work.
+        let one = vec![tg("0x2", "ws:surf")];
+        assert_eq!(sweep_extras(&cfg, &mut st, &one), vec![("work".to_string(), "telegram".to_string())]);
+        assert!(!st.extra.contains_key("work") && st.extra["surf"].contains_key("telegram"));
+        assert!(!st.cells["work"].contains_key("telegram"));
+        // Закрыто последнее окно: записи нет нигде.
+        assert_eq!(sweep_extras(&cfg, &mut st, &[]), vec![("surf".to_string(), "telegram".to_string())]);
+        assert!(st.extra.is_empty());
+
+        // Запись о месте приложения конфига снимается так же.
+        let place = ExtraApp { rect: PxRect { x: 400, y: 300, w: 1400, h: 1000 }, ..ExtraApp::default() };
+        let (cfg, mut st) = session_state(&[("work", "chrome-ai", place)]);
+        let shared = client("0x3", "google-chrome-ai", "ИИ", "2", &["app:chrome-ai#1", "ws:surf"]);
+        assert_eq!(sweep_extras(&cfg, &mut st, std::slice::from_ref(&shared)), vec![("work".to_string(), "chrome-ai".to_string())]);
+    }
+
+    #[test]
+    fn waiting_record_survives_until_its_window_comes() {
+        let (cfg, mut st) = session_state(&[("work", "telegram", telegram()), ("surf", "telegram", telegram())]);
+        // Обе записи взяты из снимка и ждут окон.
+        st.extra_wait.insert(("work".into(), "telegram".into()));
+        st.extra_wait.insert(("surf".into(), "telegram".into()));
+        // Закрытие постороннего окна записи без окон не снимает.
+        assert!(sweep_extras(&cfg, &mut st, &[]).is_empty());
+        assert!(settle_extra_wait(&cfg, &mut st, &[]).is_empty());
+        // Окно появилось в work: запись work вышла из ожидания, surf ждёт.
+        let tg = client("0x1", "org.telegram.desktop", "Telegram", "1", &["app:telegram#1", "ws:work"]);
+        assert_eq!(settle_extra_wait(&cfg, &mut st, std::slice::from_ref(&tg)), vec![("work".to_string(), "telegram".to_string())]);
+        assert!(st.extra_wait.contains(&("surf".to_string(), "telegram".to_string())));
+        // Окно закрыто, других окон приложения нет нигде: программа уходит
+        // из сессии — запись work снята, а с ней и ждущая запись surf.
+        let mut dropped = sweep_extras(&cfg, &mut st, &[]);
+        dropped.sort();
+        assert_eq!(dropped, vec![("surf".to_string(), "telegram".to_string()), ("work".to_string(), "telegram".to_string())]);
+        assert!(st.extra.is_empty() && st.extra_wait.is_empty());
+    }
+
+    #[test]
+    fn session_record_does_not_borrow_windows() {
+        // Запись wezterm в surf осталась без окна; окно herdr (вариант
+        // wezterm) входит в work. Прежде поднятие surf отдавало записи
+        // окно herdr (28.09.2026).
+        let place = ExtraApp { rect: PxRect { x: 400, y: 300, w: 1400, h: 1000 }, ..ExtraApp::default() };
+        let (cfg, _) = session_state(&[("surf", "wezterm", place.clone())]);
+        let apps: Vec<String> = cfg.workspaces["surf"].apps.keys().cloned().collect();
+        let herdr = client("0x1", "wezterm-herdr", "herdr · dev-lab", "1", &["app:herdr#1", "ws:work"]);
+        let clients = vec![herdr];
+        assert_eq!(share_plan(&cfg, &clients, "surf", &apps, &[]), vec![(0, "wezterm".to_string())]);
+        assert!(share_plan(&cfg, &clients, "surf", &apps, &["wezterm".to_string()]).is_empty());
+        // Запись о месте приложения конфига общее окно тоже не получает.
+        let (cfg, _) = session_state(&[("work", "chrome-ai", place)]);
+        let apps: Vec<String> = cfg.workspaces["work"].apps.keys().cloned().collect();
+        let shared = vec![client("0x2", "google-chrome-ai", "ИИ", "2", &["app:chrome-ai#1", "ws:surf"])];
+        assert!(share_plan(&cfg, &shared, "work", &apps, &["chrome-ai".to_string()]).is_empty());
+        // Приложение, описанное в разделе файла, общее окно получает, как прежде.
+        let apps: Vec<String> = cfg.workspaces["dev-back"].apps.keys().cloned().collect();
+        assert_eq!(share_plan(&cfg, &shared, "dev-back", &apps, &[]), vec![(0, "chrome-ai".to_string())]);
+    }
+
+    #[test]
+    fn session_records_start_after_config_apps() {
+        // В разделе workspace эффективного конфига записи сессии идут после
+        // приложений файла: поднятие запускает их последними.
+        let (cfg, _) = session_state(&[("work", "telegram", telegram())]);
+        let apps: Vec<&str> = cfg.workspaces["work"].apps.keys().map(String::as_str).collect();
+        assert_eq!(apps, vec!["herdr", "chromium", "neovide", "telegram"]);
+        // Экземпляры с командной строкой: приложения конфига — до захвата
+        // и запуска приложений, записи сессии — после.
+        let entries = vec![
+            entry("neovide", 2, &["work"], &["neovide", "notes.md"]),
+            entry("telegram", 2, &["work"], &["/usr/bin/telegram-desktop", "-workdir", "/tmp/tg"]),
+            entry("chromium", 1, &["work"], &[]),
+            entry("neovide", 3, &["surf"], &["neovide", "todo.md"]),
+        ];
+        assert_eq!(instance_launches(&entries, "work", &["telegram".to_string()]), (vec![0], vec![1]));
     }
 }
