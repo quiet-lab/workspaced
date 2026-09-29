@@ -2810,20 +2810,21 @@ pub fn follow_plan(st: &mut State, cfg: &Config, clients: &[Client], n: u8, mon:
 /// свободных окон нет ни одного окна в `ws`, — все его нескрытые окна
 /// (по семейству — окна семейства, по варианту — окна варианта). Окна,
 /// уже входящие в `ws`, другими не дополняются. Приложения `session` —
-/// записи сессии этого workspace — окон других workspace не получают.
+/// записи сессии этого workspace — получают только окна своего приложения,
+/// без окон его вариантов.
 /// Возвращает номер окна в списке клиентов и приложение workspace.
 pub fn share_plan(cfg: &Config, clients: &[Client], ws: &str, apps: &[String], session: &[String]) -> Vec<(usize, String)> {
     let mut out: Vec<(usize, String)> = Vec::new();
     for app in apps {
-        // Запись сессии окон других workspace не получает (изменение
-        // session-windows-transient, решение D3): она держит только окна,
-        // открытые в этом workspace, а пока их нет, приложение запускается
-        // своей командой.
-        if session.contains(app) || !placed_windows(cfg, clients, ws, apps, app).is_empty() {
+        if !placed_windows(cfg, clients, ws, apps, app).is_empty() {
             continue;
         }
+        // Запись сессии получает только окна своего приложения, а окна
+        // вариантов по семейству — нет (изменение session-windows-transient,
+        // решение D3): так запись wezterm не забирает окно herdr.
+        let own_only = session.contains(app);
         for c in app_windows_in(cfg, clients, apps, app) {
-            if c.on_hidden() || !c.has_ws() {
+            if c.on_hidden() || !c.has_ws() || (own_only && c.app().as_deref() != Some(app.as_str())) {
                 continue;
             }
             if let Some(i) = clients.iter().position(|x| x.address == c.address)
@@ -6136,25 +6137,54 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
     }
 
     #[test]
-    fn session_record_does_not_borrow_windows() {
-        // Запись wezterm в surf осталась без окна; окно herdr (вариант
-        // wezterm) входит в work. Прежде поднятие surf отдавало записи
-        // окно herdr (28.09.2026).
+    fn session_record_shares_only_own_windows() {
+        // Запись wezterm в surf без окна; окно herdr (вариант wezterm) входит
+        // в work. Прежде поднятие surf отдавало записи окно herdr
+        // (28.09.2026): окно варианта по семейству запись не получает.
         let place = ExtraApp { rect: PxRect { x: 400, y: 300, w: 1400, h: 1000 }, ..ExtraApp::default() };
         let (cfg, _) = session_state(&[("surf", "wezterm", place.clone())]);
         let apps: Vec<String> = cfg.workspaces["surf"].apps.keys().cloned().collect();
         let herdr = client("0x1", "wezterm-herdr", "herdr · dev-lab", "1", &["app:herdr#1", "ws:work"]);
-        let clients = vec![herdr];
+        let clients = vec![herdr.clone()];
         assert_eq!(share_plan(&cfg, &clients, "surf", &apps, &[]), vec![(0, "wezterm".to_string())]);
         assert!(share_plan(&cfg, &clients, "surf", &apps, &["wezterm".to_string()]).is_empty());
-        // Запись о месте приложения конфига общее окно тоже не получает.
-        let (cfg, _) = session_state(&[("work", "chrome-ai", place)]);
+        // Общее окно самого wezterm запись получает.
+        let term = client("0x2", "org.wezfurlong.wezterm", "bash", "1", &["app:wezterm#1", "ws:work"]);
+        let clients = vec![herdr, term];
+        assert_eq!(share_plan(&cfg, &clients, "surf", &apps, &["wezterm".to_string()]), vec![(1, "wezterm".to_string())]);
+        // Запись о месте приложения конфига получает общее окно своего
+        // приложения: окно остаётся общим, второе не запускается.
+        let (cfg, _) = session_state(&[("work", "chrome-ai", place.clone())]);
         let apps: Vec<String> = cfg.workspaces["work"].apps.keys().cloned().collect();
-        let shared = vec![client("0x2", "google-chrome-ai", "ИИ", "2", &["app:chrome-ai#1", "ws:surf"])];
-        assert!(share_plan(&cfg, &shared, "work", &apps, &["chrome-ai".to_string()]).is_empty());
-        // Приложение, описанное в разделе файла, общее окно получает, как прежде.
-        let apps: Vec<String> = cfg.workspaces["dev-back"].apps.keys().cloned().collect();
-        assert_eq!(share_plan(&cfg, &shared, "dev-back", &apps, &[]), vec![(0, "chrome-ai".to_string())]);
+        let shared = vec![client("0x3", "google-chrome-ai", "ИИ", "2", &["app:chrome-ai#1", "ws:surf"])];
+        assert_eq!(share_plan(&cfg, &shared, "work", &apps, &["chrome-ai".to_string()]), vec![(0, "chrome-ai".to_string())]);
+        // Дополнительное приложение сессии тоже получает своё общее окно.
+        let (cfg, _) = session_state(&[("work", "telegram", telegram()), ("surf", "telegram", telegram())]);
+        let apps: Vec<String> = cfg.workspaces["surf"].apps.keys().cloned().collect();
+        let tg = vec![client("0x4", "org.telegram.desktop", "Telegram", "1", &["app:telegram#1", "ws:work"])];
+        assert_eq!(share_plan(&cfg, &tg, "surf", &apps, &["telegram".to_string()]), vec![(0, "telegram".to_string())]);
+    }
+
+    #[test]
+    fn shared_window_restores_as_one_instance() {
+        // Окно chrome-ai было общим для surf и work (work — запись о месте):
+        // запись экземпляра из снимка возвращает его одним окном в оба
+        // workspace, а поднятие не запускает второй экземпляр.
+        let place = ExtraApp { rect: PxRect { x: 400, y: 300, w: 1400, h: 1000 }, ..ExtraApp::default() };
+        let (cfg, _) = session_state(&[("work", "chrome-ai", place)]);
+        let e = entry("chrome-ai", 1, &["surf", "work"], &[]);
+        assert_eq!(entry_members(&cfg, &e), vec!["surf".to_string(), "work".to_string()]);
+        let entries = vec![e];
+        // Первое поднятие запускает приложение один раз и не отдаёт окон.
+        assert_eq!(raise_restore_step(&cfg, &entries, "chrome-ai", "work", false), RaiseStep::LaunchFirst);
+        // Окно пришло и получило оба тега: поднятие второго workspace
+        // находит его своим и ничего не запускает.
+        let mut done = entries.clone();
+        done[0].state = RestoreState::Done;
+        let win = client("0x1", "google-chrome-ai", "ИИ", "1", &["app:chrome-ai#1", "ws:surf", "ws:work"]);
+        let apps: Vec<String> = cfg.workspaces["surf"].apps.keys().cloned().collect();
+        assert_eq!(placed_windows(&cfg, std::slice::from_ref(&win), "surf", &apps, "chrome-ai").len(), 1);
+        assert_eq!(raise_restore_step(&cfg, &done, "chrome-ai", "surf", true), RaiseStep::Normal);
     }
 
     #[test]
