@@ -274,6 +274,29 @@ pub fn save_session(d: &mut Daemon) -> Result<(usize, usize, usize)> {
 
 // ---- Запись workspace в конфиг ----------------------------------------------
 
+/// Имя, под которым запись `app` раздела workspace `ws` уходит в файл
+/// конфига. Запись файла пишется под своим именем: она правится на месте
+/// (решение D9 изменения workspace-overrides), и окно варианта в ней
+/// считается окном семейства. Запись сессии (дополнительное приложение
+/// сессии или место, полученное вместе с общим окном) пишется по окну,
+/// которое она держит (спецификация ws-config, «Запись workspace»): если
+/// запись семейства держит в `ws` только окна одного его варианта, а сам
+/// вариант в разделе не описан, окно принадлежит варианту, и запись
+/// получает его имя. Так запись `wezterm`, оставшаяся от закрытого окна
+/// wezterm и получившая при поднятии общее окно herdr, записывается
+/// как `herdr`.
+pub fn record_name(cfg: &Config, file: &Config, ws: &str, clients: &[Client], app: &str) -> String {
+    if file.workspaces.get(ws).is_some_and(|w| w.apps.contains_key(app)) {
+        return app.to_string();
+    }
+    let apps: Vec<String> = cfg.workspaces.get(ws).map(|w| w.apps.keys().cloned().collect()).unwrap_or_default();
+    let owners: Vec<String> = daemon::placed_windows(cfg, clients, ws, &apps, app).iter().filter_map(|c| c.app()).collect();
+    match owners.first() {
+        Some(v) if v != app && cfg.family_of(v) == Some(app) && !apps.contains(v) && owners.iter().all(|o| o == v) => v.clone(),
+        _ => app.to_string(),
+    }
+}
+
 pub fn save_workspace(d: &mut Daemon) -> Result<String> {
     let n = d.current_desktop();
     let Some(ws) = d.state().desktops.get(&n).and_then(|x| x.active.clone()) else { bail!("на столе {n} нет активного workspace") };
@@ -332,12 +355,23 @@ pub fn save_workspace(d: &mut Daemon) -> Result<String> {
     let mut order: Vec<String> = cfg.workspaces.get(&ws).map(|w| w.apps.keys().cloned().collect()).unwrap_or_default();
     order.extend(cells.keys().filter(|a| !order.contains(a)).cloned().collect::<Vec<_>>());
     let mut places: Vec<(String, Item)> = Vec::new();
+    let mut main_name = main_app.clone();
     for app in &order {
         let Some(place) = cells.get(app) else { continue };
         let rect = d.state_mut().rect_for(&cfg, &ws, app, mon);
         if let Some(item) = place_item(&template, Some(place), rect) {
-            places.push((app.clone(), item));
+            let name = record_name(&cfg, d.cfg_file(), &ws, &clients, app);
+            if name != *app {
+                log::info!("сохранение: запись {app} workspace {ws} держит только окна варианта {name} и записывается под его именем");
+                if main_name.as_deref() == Some(app.as_str()) {
+                    main_name = Some(name.clone());
+                }
+            }
+            places.push((name, item));
         }
+    }
+    if let Some(m) = &main_name {
+        doc["workspaces"][&ws]["main"] = value(m.as_str());
     }
     // Посторонние окна на столе workspace становятся его приложениями: окно,
     // подходящее описанному в конфиге приложению по class и title, — под именем
@@ -523,6 +557,36 @@ mod tests {
         assert_eq!(item("chromium"), rect_item(PxRect { x: 100, y: 200, w: 800, h: 600 }).to_string().trim());
         // Без прямоугольника место пишется как есть.
         assert_eq!(place_item(&thirds(&cfg), Some(&Place::Cell("right".into())), None).unwrap().to_string().trim(), "\"right\"");
+    }
+
+    /// Случай 29.09.2026: запись сессии `wezterm` в surf осталась от закрытого
+    /// окна wezterm, при поднятии surf ей досталось общее окно herdr из work.
+    /// Запись workspace должна назвать его приложением herdr, а не семейством.
+    #[test]
+    fn session_record_of_family_saved_as_variant() {
+        let file = Config::parse(&format!(
+            "{CFG}\n[apps.wezterm]\ncmd = \"wezterm-gui\"\nclass = \"^org\\\\.wezfurlong\\\\.wezterm$\"\n[workspaces.surf]\ntemplate = \"thirds\"\nmain = \"chromium\"\napps = {{ chromium = \"left\" }}\n"
+        )
+        .replace("[apps.herdr]\ncmd", "[apps.herdr]\nfamily = \"wezterm\"\ncmd"))
+        .unwrap();
+        assert_eq!(file.family_of("herdr"), Some("wezterm"));
+        let mut extra: BTreeMap<String, BTreeMap<String, ExtraApp>> = BTreeMap::new();
+        let record = PxRect { x: 1645, y: 642, w: 880, h: 875 };
+        extra.entry("surf".into()).or_default().insert("wezterm".into(), ExtraApp { rect: record, ..ExtraApp::default() });
+        let (cfg, _) = daemon::merge_extra(&file, &extra);
+        let herdr = placed(test_client("0x1", "wezterm-herdr", "herdr", "1", &["app:herdr#1", "ws:work", "ws:surf"]), record);
+        let browser = placed(test_client("0x2", "chromium", "Почта", "1", &["app:chromium#1", "ws:surf"]), record);
+        let clients = vec![herdr.clone(), browser.clone()];
+        assert_eq!(record_name(&cfg, &file, "surf", &clients, "wezterm"), "herdr");
+        // Запись файла пишется под своим именем.
+        assert_eq!(record_name(&cfg, &file, "surf", &clients, "chromium"), "chromium");
+        // Запись сессии, держащая собственное окно семейства, остаётся семейством.
+        let plain = placed(test_client("0x3", "org.wezfurlong.wezterm", "wezterm", "1", &["app:wezterm#1", "ws:surf"]), record);
+        let mixed = vec![herdr.clone(), browser.clone(), plain.clone()];
+        assert_eq!(record_name(&cfg, &file, "surf", &mixed, "wezterm"), "wezterm");
+        // Запись без окон в workspace пишется как есть.
+        let away = vec![placed(test_client("0x1", "wezterm-herdr", "herdr", "1", &["app:herdr#1", "ws:work"]), record), browser];
+        assert_eq!(record_name(&cfg, &file, "surf", &away, "wezterm"), "wezterm");
     }
 
     const CFG: &str = r#"

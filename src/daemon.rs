@@ -2541,7 +2541,7 @@ fn app_windows_in<'a>(cfg: &Config, clients: &'a [Client], apps: &[String], app:
 /// Окна, которые расставляет запись приложения `app` в workspace `ws`
 /// с набором приложений `apps`: окна приложения, входящие в `ws` по тегу
 /// состава (изменение shared-windows, решение D1).
-fn placed_windows<'a>(cfg: &Config, clients: &'a [Client], ws: &str, apps: &[String], app: &str) -> Vec<&'a Client> {
+pub fn placed_windows<'a>(cfg: &Config, clients: &'a [Client], ws: &str, apps: &[String], app: &str) -> Vec<&'a Client> {
     app_windows_in(cfg, clients, apps, app).into_iter().filter(|c| c.in_ws(ws)).collect()
 }
 
