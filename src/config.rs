@@ -92,6 +92,39 @@ impl Rect {
     }
 }
 
+/// Место окна приложения (`rect` у `[apps.<имя>]`): прямоугольник, у которого
+/// можно не задавать `x` и `y`. Без них окно стоит по центру рабочей области
+/// (монитор без зоны панели) с размером `w`×`h`; так задаётся место
+/// окна-переключателя (изменение toggle-windows, решение D2). Задать одну
+/// координату без другой нельзя, это отклоняет проверка конфига.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct AppRect {
+    #[serde(default)]
+    pub x: Option<Coord>,
+    #[serde(default)]
+    pub y: Option<Coord>,
+    pub w: Coord,
+    pub h: Coord,
+}
+
+impl AppRect {
+    /// Прямоугольник с заданным положением; место по центру (`x` и `y`
+    /// не заданы) положения не имеет и даёт `None`.
+    pub fn fixed(&self) -> Option<Rect> {
+        Some(Rect { x: self.x.clone()?, y: self.y.clone()?, w: self.w.clone(), h: self.h.clone() })
+    }
+
+    /// Прямоугольник в пикселях: заданное положение как есть, а без него —
+    /// центр рабочей области `area`. Проценты считаются от монитора `mon`.
+    pub fn resolve_in(&self, mon: (i32, i32), area: PxRect) -> PxRect {
+        let w = self.w.resolve(mon.0);
+        let h = self.h.resolve(mon.1);
+        let x = self.x.as_ref().map_or(area.x + (area.w - w) / 2, |x| x.resolve(mon.0));
+        let y = self.y.as_ref().map_or(area.y + (area.h - h) / 2, |y| y.resolve(mon.1));
+        PxRect { x, y, w, h }
+    }
+}
+
 impl PxRect {
     /// Прямоугольник, уменьшенный на зазор с каждой стороны. Нужен командам
     /// `half`, `place` и `maximize`; ячейки и `rect` из конфига не трогает.
@@ -140,9 +173,15 @@ pub struct App {
     #[serde(default)]
     pub family: Option<String>,
     /// Положение и размер окна, когда активный workspace об этом приложении
-    /// ничего не говорит.
+    /// ничего не говорит; у окна-переключателя — его место всегда. Без `x`
+    /// и `y` — центр рабочей области (только у окна-переключателя).
     #[serde(default)]
-    pub rect: Option<Rect>,
+    pub rect: Option<AppRect>,
+    /// Окно-переключатель (изменение toggle-windows): окна приложения
+    /// не входят ни в один workspace, а клавиша приложения показывает окно
+    /// на текущем столе в его месте и прячет его повторным нажатием.
+    #[serde(default)]
+    pub toggle: bool,
     /// Заголовок диалога: окно приложения, чей заголовок подходит этому
     /// выражению, в workspace не принимается и остаётся свободным там, где
     /// его поставил композитор. Нужно потому, что собственный диалог
@@ -637,6 +676,35 @@ impl Config {
             if a.dialog_title.is_some() && a.class.is_none() {
                 bail!("приложение {aname}: поле dialog_title без class не имеет смысла: окно приложения узнаётся по class");
             }
+            if let Some(r) = &a.rect {
+                match (&r.x, &r.y) {
+                    (Some(_), Some(_)) => {}
+                    (None, None) if a.toggle => {}
+                    (None, None) => bail!("приложение {aname}: rect без x и y (окно по центру рабочей области) допустим только у окна-переключателя (toggle = true)"),
+                    _ => bail!("приложение {aname}: в rect заданы не обе координаты x и y; задайте обе либо ни одной (окно по центру рабочей области)"),
+                }
+            }
+            if a.toggle {
+                if a.class.is_none() {
+                    bail!("приложение {aname}: окну-переключателю нужен class — по нему клавиша находит окно");
+                }
+                if a.rect.is_none() {
+                    bail!("приложение {aname}: окну-переключателю нужно место — поле rect (без x и y — по центру рабочей области)");
+                }
+                if a.family.is_some() {
+                    bail!("приложение {aname}: окно-переключатель не может быть вариантом семейства (поле family)");
+                }
+                if let Some((v, _)) = self.apps.iter().find(|(_, x)| x.family.as_deref() == Some(aname.as_str())) {
+                    bail!("приложение {v}: семейство {aname:?} — окно-переключатель, у него не бывает вариантов");
+                }
+                if let Some(c) = &a.chain
+                    && let Some(other) = self.apps.iter().find(|(n, x)| *n != aname && x.chain.as_deref().is_some_and(|o| crate::keys::same_chain(o, c))).map(|(n, _)| n.clone()).or_else(|| {
+                        self.workspaces.iter().find_map(|(w, ws)| ws.apps.iter().find(|(_, e)| e.chain.as_deref().is_some_and(|o| crate::keys::same_chain(o, c))).map(|(n, _)| format!("{n} в workspace {w}")))
+                    })
+                {
+                    bail!("приложение {aname}: клавишу окна-переключателя {c:?} занимает и приложение {other}; у переключателя клавиша должна быть своя");
+                }
+            }
             a.matchers().with_context(|| format!("приложение {aname}"))?;
             a.dialog_matcher().with_context(|| format!("приложение {aname}"))?;
             // Уровней ровно два: семейство и его варианты.
@@ -673,6 +741,9 @@ impl Config {
             for (aname, entry) in &w.apps {
                 if !self.apps.contains_key(aname) {
                     bail!("workspace {wname}: приложение {aname:?} не описано в [apps]");
+                }
+                if self.is_toggle(aname) {
+                    bail!("workspace {wname}: приложение {aname} — окно-переключатель (toggle = true), оно не входит ни в один workspace");
                 }
                 if let Some(e) = entry.place_error {
                     bail!("workspace {wname}: запись приложения {aname}: {e}");
@@ -768,6 +839,14 @@ impl Config {
                 {
                     bail!("привязка {:?}: приложение {a:?} не найдено", b.chain);
                 }
+                // Окно-переключатель не входит в workspace: поднимать
+                // workspace ради него и перетаскивать его окна некуда.
+                if let Some(a) = app
+                    && self.is_toggle(a)
+                    && (workspace.is_some() || pull.is_some())
+                {
+                    bail!("привязка {:?}: приложение {a} — окно-переключатель, ключи workspace и pull с ним не сочетаются", b.chain);
+                }
             }
             _ => {}
         }
@@ -794,6 +873,11 @@ impl Config {
         let args = app.args.iter().map(|a| expand(a, &env)).collect();
         let cwd = app.cwd.as_ref().map(|c| expand(c, &env));
         Some((cmd, args, cwd, env))
+    }
+
+    /// Приложение — окно-переключатель (изменение toggle-windows).
+    pub fn is_toggle(&self, app: &str) -> bool {
+        self.apps.get(app).is_some_and(|a| a.toggle)
     }
 
     /// Семейство приложения: имя из поля `family`, если приложение — вариант.
@@ -1271,7 +1355,7 @@ calc = { rect = { x = 2600, y = 1500, w = 600, h = 400 } }
     fn app_default_rect() {
         let text = format!("{MINIMAL}\n[apps.calc]\ncmd = \"galculator\"\nrect = {{ x = 2600, y = 1500, w = 600, h = 400 }}\n");
         let cfg = Config::parse(&text).unwrap();
-        let r = cfg.apps["calc"].rect.as_ref().unwrap().resolve(3840, 2160);
+        let r = cfg.apps["calc"].rect.as_ref().unwrap().fixed().unwrap().resolve(3840, 2160);
         assert_eq!(r, PxRect { x: 2600, y: 1500, w: 600, h: 400 });
         assert!(cfg.apps["terminal"].rect.is_none());
     }
@@ -1347,5 +1431,42 @@ apps = { term = "c", plain = "c" }
         let home = std::env::var("HOME").unwrap();
         assert_eq!(expand("--user-data-dir=~/.config/x", &env), "--user-data-dir=~/.config/x");
         assert_eq!(expand("--user-data-dir=$HOME/.config/x", &env), format!("--user-data-dir={home}/.config/x"));
+    }
+
+    #[test]
+    fn toggle_app_rules() {
+        let tg = "[apps.telegram]\ntoggle = true\nchain = \"SUPER+T\"\ncmd = \"Telegram\"\nclass = 'org\\.telegram\\.desktop'\nrect = { w = 1000, h = 1000 }\n";
+        let cfg = Config::parse(&format!("{MINIMAL}\n{tg}")).unwrap();
+        assert!(cfg.is_toggle("telegram") && !cfg.is_toggle("terminal"));
+        // Место по центру рабочей области: панель 330 px слева.
+        let area = PxRect { x: 330, y: 0, w: 3510, h: 2160 };
+        assert_eq!(cfg.apps["telegram"].rect.as_ref().unwrap().resolve_in((3840, 2160), area), PxRect { x: 1585, y: 580, w: 1000, h: 1000 });
+        assert!(cfg.apps["telegram"].rect.as_ref().unwrap().fixed().is_none());
+        let err = |text: String| format!("{:#}", Config::parse(&text).unwrap_err());
+        // В workspace переключатель не входит.
+        let e = err(format!("{MINIMAL}\n{tg}").replace("apps = { terminal = \"right\" }", "apps = { terminal = \"right\", telegram = \"left\" }"));
+        assert!(e.contains("telegram") && e.contains("переключатель"), "{e}");
+        // Ни семейства, ни вариантов.
+        let e = err(format!("{MINIMAL}\n{tg}family = \"terminal\"\n"));
+        assert!(e.contains("family"), "{e}");
+        let e = err(format!("{MINIMAL}\n{tg}\n[apps.tg-media]\nfamily = \"telegram\"\nclass = \"x\"\n"));
+        assert!(e.contains("tg-media") && e.contains("вариантов"), "{e}");
+        // Без class и без места переключатель не работает.
+        let e = err(format!("{MINIMAL}\n{}", tg.replace("class = 'org\\.telegram\\.desktop'\n", "")));
+        assert!(e.contains("class"), "{e}");
+        let e = err(format!("{MINIMAL}\n{}", tg.replace("rect = { w = 1000, h = 1000 }\n", "")));
+        assert!(e.contains("rect"), "{e}");
+        // Место по центру — только у переключателя; одна координата без другой — ошибка.
+        let e = err(format!("{MINIMAL}\n[apps.calc]\ncmd = \"calc\"\nrect = {{ w = 600, h = 400 }}\n"));
+        assert!(e.contains("calc") && e.contains("toggle"), "{e}");
+        let e = err(format!("{MINIMAL}\n{}", tg.replace("rect = { w = 1000", "rect = { x = 10, w = 1000")));
+        assert!(e.contains("обе"), "{e}");
+        // Клавиша переключателя своя.
+        let e = err(format!("{MINIMAL}\n{tg}").replace("[apps.terminal]\ncmd = \"wezterm-gui\"\n", "[apps.terminal]\ncmd = \"wezterm-gui\"\nchain = \"SUPER+T\"\n"));
+        assert!(e.contains("terminal") && e.contains("своя"), "{e}");
+        // Действие с workspace или pull к переключателю неприменимо, с new — допустимо.
+        let e = err(format!("{MINIMAL}\n{tg}\n[[binds]]\nchain = \"SUPER+X\"\naction = {{ app = \"telegram\", pull = true }}\n"));
+        assert!(e.contains("pull"), "{e}");
+        Config::parse(&format!("{MINIMAL}\n{tg}\n[[binds]]\nchain = \"SUPER+X\"\naction = {{ app = \"telegram\", new = true }}\n")).unwrap();
     }
 }

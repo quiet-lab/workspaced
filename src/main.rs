@@ -250,6 +250,7 @@ fn check() -> anyhow::Result<()> {
     for (a, app) in &cfg.apps {
         match &app.family {
             Some(f) => println!("  приложение {a} (вариант семейства {f})"),
+            None if app.toggle => println!("  приложение {a} (окно-переключатель)"),
             None => println!("  приложение {a}"),
         }
     }

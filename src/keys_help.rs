@@ -182,13 +182,15 @@ fn target_desc(t: &TargetAction) -> String {
 }
 
 /// Описание клавиши приложения по её источникам: `apps.herdr` →
-/// «Приложение herdr», `workspaces.surf.apps.chrome` → «chrome в workspace surf».
-fn app_key_desc(source: &str) -> String {
+/// «Приложение herdr», `workspaces.surf.apps.chrome` → «chrome в workspace surf»;
+/// клавиша окна-переключателя — «Показать или скрыть telegram».
+fn app_key_desc(cfg: &Config, source: &str) -> String {
     source
         .split(',')
         .map(|s| {
             let parts: Vec<&str> = s.split('.').collect();
             match parts.as_slice() {
+                ["apps", a] if cfg.is_toggle(a) => format!("Показать или скрыть {a}"),
                 ["apps", a] => format!("Приложение {a}"),
                 ["workspaces", w, "apps", a] => format!("{a} в workspace {w}"),
                 _ => s.to_string(),
@@ -257,13 +259,13 @@ fn default_desc(b: &Bind, act: &Act) -> String {
 }
 
 /// Описание и группа привязки из `[keys]`, приложений и workspace.
-fn own_desc(b: &Binding) -> (String, &'static str) {
+fn own_desc(cfg: &Config, b: &Binding) -> (String, &'static str) {
     let cmd = match &b.act {
         Act::Daemon(c) => c.strip_prefix("workspaced ").unwrap_or(c).to_string(),
         _ => String::new(),
     };
     if cmd.starts_with("key ") {
-        (app_key_desc(&b.source), G_APPS)
+        (app_key_desc(cfg, &b.source), G_APPS)
     } else if let Some(w) = cmd.strip_prefix("raise ") {
         (format!("Поднять workspace {w}"), G_WORKSPACE)
     } else {
@@ -275,7 +277,7 @@ fn own_desc(b: &Binding) -> (String, &'static str) {
 /// поле `desc` (с подстановкой номера серии) либо описание действия.
 fn binding_desc(cfg: &Config, b: &Binding) -> String {
     let Some(i) = b.origin else {
-        return own_desc(b).0;
+        return own_desc(cfg, b).0;
     };
     let key = chain_key(&b.chain);
     let raw = &cfg.binds[i];
@@ -310,7 +312,7 @@ fn sticky_key_desc(cfg: &Config, nodes: &[StickyNode], node: &StickyNode, k: &St
             }
         }
         StickyGo::Act(act) => match (&k.inherited, &k.explicit, &k.binding) {
-            (Some(src), _, _) => app_key_desc(src),
+            (Some(src), _, _) => app_key_desc(cfg, src),
             (None, Some(b), _) => default_desc(b, act),
             (None, None, Some(b)) => binding_desc(cfg, b),
             (None, None, None) => act.describe(),
@@ -352,7 +354,7 @@ pub fn entries(cfg: &Config) -> Result<Vec<Entry>> {
             }
             continue;
         }
-        let (desc, group) = own_desc(b);
+        let (desc, group) = own_desc(cfg, b);
         out.push(Entry {
             chain: chain_compact(&b.chain),
             label: chain_label(&b.chain),
@@ -688,5 +690,14 @@ e = { exit = true }
         assert_eq!(raise["keys"][0], json!({ "key": "e", "label": "e", "desc": "Приложение neovide", "exit": true }));
         let root = sticky.iter().find(|s| s["submap"] == "ws-sticky:apps").unwrap();
         assert_eq!(root["keys"][0], json!({ "key": "r", "label": "r", "desc": "Поднять", "exit": false }));
+
+        // Клавиша окна-переключателя наследуется обоими состояниями
+        // (изменение toggle-windows, решение D7) и описана как переключение.
+        let with_tg = text.replace("[workspaces.surf]", "[apps.telegram]\ntoggle = true\nchain = \"SUPER+T\"\ncmd = \"Telegram\"\nclass = \"tg\"\nrect = { w = 1000, h = 1000 }\n[workspaces.surf]");
+        let cfg = Config::parse(&with_tg).unwrap();
+        let list = entries(&cfg).unwrap();
+        assert_eq!(find(&list, "SUPER+T").desc, "Показать или скрыть telegram");
+        assert_eq!(find(&list, "SUPER+S r t").desc, "Поднять · Показать или скрыть telegram");
+        assert_eq!(find(&list, "SUPER+S s t").action, "key --new SUPER+T");
     }
 }

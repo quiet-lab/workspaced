@@ -206,6 +206,12 @@ fn session_plan(cfg: &Config, file: &Config, ws: &str, taken: &mut Vec<String>, 
             daemon::Join::Free(reason) => {
                 log::info!("сохранение сессии: окно {} ({}) осталось свободным: {}", c.address, c.class, reason.text());
             }
+            // Окно-переключатель в workspace не входит (изменение
+            // toggle-windows); тег экземпляра оно получит при первом
+            // нажатии клавиши.
+            daemon::Join::Toggle(app) => {
+                log::info!("сохранение сессии: окно {} ({}) — окно-переключатель {app}, в workspace не входит", c.address, c.class);
+            }
         }
     }
     out
@@ -366,6 +372,8 @@ pub fn save_workspace(d: &mut Daemon) -> Result<String> {
     // изменения workspace-overrides), и новые встают в конец.
     let mut order: Vec<String> = cfg.workspaces.get(&ws).map(|w| w.apps.keys().cloned().collect()).unwrap_or_default();
     order.extend(cells.keys().filter(|a| !order.contains(a)).cloned().collect::<Vec<_>>());
+    // Окно-переключатель в раздел workspace не пишется (изменение toggle-windows).
+    order.retain(|a| !cfg.is_toggle(a));
     let mut places: Vec<(String, Item)> = Vec::new();
     let mut main_name = main_app.clone();
     for app in order.iter().filter(|a| !absent.contains(a)) {
@@ -412,6 +420,10 @@ pub fn save_workspace(d: &mut Daemon) -> Result<String> {
             continue;
         }
         let tagged = c.app().filter(|a| cfg.apps.contains_key(a));
+        if let Some(t) = tagged.clone().or_else(|| daemon::app_for_window(&cfg, c)).filter(|a| cfg.is_toggle(a)) {
+            log::info!("сохранение: окно {} ({}) — окно-переключатель {t}, в workspace не входит", c.address, c.class);
+            continue;
+        }
         let name = match tagged.clone().or_else(|| daemon::app_for_window(&cfg, c)) {
             Some(a) => a,
             None => {

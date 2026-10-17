@@ -191,8 +191,10 @@ impl State {
     }
 
     /// Положение и размер окна приложения по умолчанию (`rect` у `[apps.<имя>]`).
+    /// Место по центру рабочей области бывает только у окна-переключателя,
+    /// а его окно в раскладку workspace не попадает, поэтому здесь его нет.
     pub fn app_rect(cfg: &Config, app: &str, mon: (i32, i32)) -> Option<PxRect> {
-        cfg.apps.get(app)?.rect.as_ref().map(|r| r.resolve(mon.0, mon.1))
+        cfg.apps.get(app)?.rect.as_ref()?.fixed().map(|r| r.resolve(mon.0, mon.1))
     }
 
     /// Главное приложение workspace (изменение live-layout, решение D5):

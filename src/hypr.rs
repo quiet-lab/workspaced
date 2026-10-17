@@ -146,6 +146,16 @@ pub struct Monitor {
     pub reserved: Vec<i32>,
     #[serde(default)]
     pub focused: bool,
+    /// Специальный стол, открытый поверх обычного; пустое имя — не открыт.
+    #[serde(default, rename = "specialWorkspace", deserialize_with = "special_ws")]
+    pub special_workspace: Option<WsRef>,
+}
+
+/// Специальный стол монитора: композитор пишет `{ "id": 0, "name": "" }`,
+/// когда он не открыт.
+fn special_ws<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<WsRef>, D::Error> {
+    let w = Option::<WsRef>::deserialize(d)?;
+    Ok(w.filter(|w| !w.name.is_empty()))
 }
 
 impl Monitor {
@@ -329,6 +339,11 @@ pub fn d_tag(addr: &str, tag: &str) -> String {
 /// ставит, а без префикса тег переключается, поэтому снятие пишется явно.
 pub fn d_untag(addr: &str, tag: &str) -> String {
     d_tag(addr, &format!("-{tag}"))
+}
+
+/// Открыть или закрыть специальный стол `special:<name>` на активном мониторе.
+pub fn d_toggle_special(name: &str) -> String {
+    format!("hl.dsp.workspace.toggle_special(\"{name}\")")
 }
 
 pub fn d_close(addr: &str) -> String {

@@ -139,6 +139,12 @@ pub struct Daemon {
     tx: Sender<Msg>,
     /// Геометрия окон до развёртывания (ключ — адрес окна), только в памяти.
     maximized: HashMap<String, PxRect>,
+    /// Последнее окно обычного стола, получавшее фокус, кроме окон-переключателей
+    /// (событие `activewindowv2`): к нему возвращается фокус, когда
+    /// окно-переключатель прячется (изменение toggle-windows, решение D5).
+    last_plain: Option<String>,
+    /// Окно-переключатель → окно, у которого был фокус перед его показом.
+    toggle_back: HashMap<String, String>,
 }
 
 pub fn socket_path() -> Result<PathBuf> {
@@ -196,7 +202,7 @@ pub fn run() -> Result<()> {
         let path = cfg_path.clone();
         std::thread::spawn(move || watch_config(path, tx));
     }
-    let mut d = Daemon { cfg: cfg.clone(), cfg_file: cfg, cfg_text, cfg_path, expected: Vec::new(), hypr, st: State::default(), mon, current, pending: Vec::new(), subs: Vec::new(), tx: tx.clone(), maximized: HashMap::new() };
+    let mut d = Daemon { cfg: cfg.clone(), cfg_file: cfg, cfg_text, cfg_path, expected: Vec::new(), hypr, st: State::default(), mon, current, pending: Vec::new(), subs: Vec::new(), tx: tx.clone(), maximized: HashMap::new(), last_plain: None, toggle_back: HashMap::new() };
     d.startup()?;
     d.settle_wait();
     // Конфиг при старте прочитан выше, значит привязки в нём могут быть новее
@@ -403,6 +409,13 @@ impl Daemon {
             if let Some(m) = self.st.moved.get_mut(&ws) {
                 m.remove(&name);
             }
+        }
+        // Приложение, ставшее окном-переключателем, из раскладок уходит:
+        // раскладка из снимка сессии или собранная до правки конфига могла
+        // держать его место и называть его главным (изменение toggle-windows,
+        // решение D4).
+        for (ws, name) in purge_toggle_layout(&self.cfg_file, &mut self.st) {
+            log::info!("workspace {ws}: приложение {name} — окно-переключатель, его место в раскладке снято");
         }
         self.st.moved.retain(|_, m| !m.is_empty());
         self.st.extra.retain(|_, apps| !apps.is_empty());
@@ -780,6 +793,9 @@ impl Daemon {
                         }
                         None => log::warn!("workspace {w}: приложение {} нечем описать", p.app),
                     },
+                    // Окно-переключатель — окно приложения конфига,
+                    // а не постороннее.
+                    None if self.cfg.is_toggle(&p.app) => {}
                     None => {
                         let (cmd, cwd) = proc_info(c.pid);
                         self.st.foreign.insert(c.address.clone(), Foreign { rect: r, cmd, cwd });
@@ -866,12 +882,113 @@ impl Daemon {
                 log::info!("окно {} ({}) принято в workspace {w} дополнительным приложением сессии {name}", c.address, c.class);
                 self.capture_new(c, &name, clients, Some(rect), Some(&w))
             }
+            Join::Toggle(app) => {
+                self.st.foreign.remove(&c.address);
+                self.toggle_new(c, &app, clients)
+            }
             Join::Free(reason) => {
                 self.st.foreign.insert(c.address.clone(), Foreign { rect: c.rect(), cmd, cwd });
                 log::info!("окно {} ({}, «{}») свободно: {}", c.address, c.class, c.title, reason.text());
                 Ok(())
             }
         }
+    }
+
+    // ---- Окна-переключатели (изменение toggle-windows) ----------------------
+
+    /// Место окна-переключателя на мониторе: `rect` приложения, а без `x`
+    /// и `y` — центр рабочей области, прочитанной у композитора сейчас.
+    fn toggle_rect(&self, app: &str) -> Option<PxRect> {
+        let r = self.cfg.apps.get(app)?.rect.clone()?;
+        Some(r.resolve_in(self.mon, self.work_area()))
+    }
+
+    /// Окно приложения-переключателя появилось не по клавише (значок в трее,
+    /// приложение показало окно само, автозапуск): тег экземпляра без тегов
+    /// состава, место переключателя на столе, где окно появилось. Стол
+    /// и фокус демон не трогает. Место получает только первое окно
+    /// приложения: второе окно (просмотр медиа, диалог без `dialog_title`)
+    /// остаётся там, где его открыл композитор.
+    fn toggle_new(&mut self, c: &Client, app: &str, clients: &[Client]) -> Result<()> {
+        let num = free_instance(clients, app);
+        let mut ex = entry_tags(&c.address, app, num, None);
+        let first = !clients.iter().any(|x| x.address != c.address && x.app().as_deref() == Some(app));
+        let rect = if first && c.desktop().is_some() { self.toggle_rect(app) } else { None };
+        if let Some(r) = rect {
+            ex.extend(hypr::d_place(&c.address, r));
+        }
+        log::info!("новое окно {} ({}, «{}») → окно-переключатель {app}, экземпляр {num}{}", c.address, c.class, c.title, if rect.is_some() { ", на своём месте" } else { "" });
+        self.hypr.dispatch_all(&ex)
+    }
+
+    /// Клавиша окна-переключателя (спецификация ws-daemon, «Окно-переключатель»):
+    /// окно с фокусом на столе композитора прячется на `special:pool`, видимое
+    /// без фокуса получает фокус, иначе окно показывается на этом столе
+    /// в своём месте; без окон приложение запускается.
+    pub fn toggle(&mut self, app: &str) -> Result<()> {
+        let n = self.sync_current();
+        let mut clients = self.hypr.clients()?;
+        self.adopt_untagged(&mut clients, &[app.to_string()], None)?;
+        let wins: Vec<Client> = app_windows(&self.cfg, &clients, app).into_iter().cloned().collect();
+        let active = self.hypr.active_window()?;
+        let step = toggle_step(&wins, active.as_ref(), n);
+        log::info!("окно-переключатель {app} на столе {n}: {step:?}");
+        match step {
+            ToggleStep::Hide(addrs) => {
+                let mut ex: Vec<String> = addrs.iter().map(|a| hypr::d_move_to(a, "special:pool")).collect();
+                // Фокус возвращается окну, с которым пользователь работал
+                // до показа, если оно ещё на этом столе; иначе окно
+                // выбирает композитор.
+                if let Some(b) = self.toggle_back.remove(app)
+                    && clients.iter().any(|c| c.address == b && c.desktop() == Some(n) && !addrs.contains(&c.address))
+                {
+                    ex.push(hypr::d_focus_window(&b));
+                    ex.push(hypr::d_bring_to_top());
+                }
+                self.hypr.dispatch_all(&ex)
+            }
+            ToggleStep::Focus(addr) => {
+                // Окно уже на столе, но фокус у другого: это окно и станет
+                // окном возврата, когда переключатель спрячется.
+                if let Some(b) = self.last_plain.clone().filter(|b| !wins.iter().any(|c| c.address == *b)) {
+                    self.toggle_back.insert(app.to_string(), b);
+                }
+                self.hypr.dispatch_all(&[hypr::d_focus_window(&addr), hypr::d_bring_to_top()])
+            }
+            ToggleStep::Show => self.show_toggle(app, &wins, n),
+            ToggleStep::Launch => {
+                if let Some(b) = self.last_plain.clone() {
+                    self.toggle_back.insert(app.to_string(), b);
+                }
+                let rect = self.toggle_rect(app);
+                self.spawn(app, None, n, Target::Free(rect), true, false)
+            }
+        }
+    }
+
+    /// Показать окна переключателя на столе `n`: окна приезжают туда, первое
+    /// встаёт на место переключателя, поднимается наверх и получает фокус.
+    /// Специальный стол `special:pool`, открытый композитором при активации
+    /// спрятанного окна, закрывается.
+    fn show_toggle(&mut self, app: &str, wins: &[Client], n: u8) -> Result<()> {
+        let Some(first) = wins.iter().find(|c| !c.on_hidden()).or(wins.first()) else { return Ok(()) };
+        let mut ex = Vec::new();
+        if self.hypr.active_monitor().ok().and_then(|m| m.special_workspace).is_some_and(|w| w.name == "special:pool") {
+            ex.push(hypr::d_toggle_special("pool"));
+        }
+        for c in wins.iter().filter(|c| c.desktop() != Some(n)) {
+            ex.push(hypr::d_move_to(&c.address, &n.to_string()));
+        }
+        if let Some(r) = self.toggle_rect(app) {
+            ex.extend(hypr::d_place(&first.address, r));
+        }
+        ex.push(hypr::d_focus_window(&first.address));
+        ex.push(hypr::d_bring_to_top());
+        if let Some(b) = self.last_plain.clone().filter(|b| !wins.iter().any(|c| c.address == *b)) {
+            self.toggle_back.insert(app.to_string(), b);
+        }
+        log::info!("окно-переключатель {app}: окно {} показано на столе {n}", first.address);
+        self.hypr.dispatch_all(&ex)
     }
 
     /// Снять записи сессии, у которых в своём workspace не осталось окон
@@ -1351,7 +1468,23 @@ impl Daemon {
     /// выводится prev, когда цикл начинается с чужого окна.
     fn on_focus(&mut self) -> Result<()> {
         let Some(c) = self.hypr.active_window()? else { return Ok(()) };
+        // Окно-переключатель на `special:pool` получает фокус только по
+        // активации (клик по уведомлению, запрос приложения): композитор
+        // при этом открывает весь `special:pool` поверх стола. Окно
+        // показывается на текущем столе по правилам клавиши, а специальный
+        // стол закрывается (изменение toggle-windows, решение D6).
+        if let Some(app) = c.app().filter(|a| self.cfg.is_toggle(a)) {
+            if c.on_pool() {
+                let n = self.sync_current();
+                let clients = self.hypr.clients()?;
+                let wins: Vec<Client> = app_windows(&self.cfg, &clients, &app).into_iter().cloned().collect();
+                log::info!("окно-переключатель {app}: спрятанное окно {} получило фокус (активация) — показывается на столе {n}", c.address);
+                return self.show_toggle(&app, &wins, n);
+            }
+            return Ok(());
+        }
         let Some(n) = c.desktop() else { return Ok(()) };
+        self.last_plain = Some(c.address.clone());
         let Some(ws) = self.st.desktops.get(&n).and_then(|d| d.active.clone()) else { return Ok(()) };
         let ws_apps = self.ws_apps(&ws);
         if ws_app_of(&self.cfg, &ws, &ws_apps, &c).is_some() {
@@ -1367,6 +1500,10 @@ impl Daemon {
             g.remove(addr);
         }
         self.st.focus.retain(|_, a| a != addr);
+        self.toggle_back.retain(|_, a| a != addr);
+        if self.last_plain.as_deref() == Some(addr) {
+            self.last_plain = None;
+        }
         for c in self.st.cycle.values_mut() {
             if c.back.as_deref() == Some(addr) {
                 c.back = None;
@@ -1590,6 +1727,15 @@ impl Daemon {
             self.hypr.dispatch(&hypr::d_focus_desktop(n))?;
             self.current = n;
         }
+        // Окно-переключатель: ни workspace, ни перетаскивания у него нет,
+        // а новый экземпляр — то же переключение (изменение toggle-windows,
+        // решение D7).
+        if let Some(t) = apps.iter().find(|a| self.cfg.is_toggle(a)) {
+            if workspace.is_some() || pull {
+                bail!("приложение {t} — окно-переключатель: workspace и перетаскивание к нему неприменимы");
+            }
+            return self.toggle(t);
+        }
         // Поднятый этой же цепочкой workspace начинает цикл заново: поднятие
         // уже отдало фокус первому экземпляру главного приложения.
         let mut raised = false;
@@ -1625,6 +1771,13 @@ impl Daemon {
     pub fn key(&mut self, chain: &str, new: bool) -> Result<()> {
         let parsed = crate::keys::parse_chain(chain)?;
         let chain = crate::keys::chain_compact(&parsed);
+        // Клавиша окна-переключателя своя (проверка конфига не даёт делить её
+        // с другими приложениями), поэтому workspace стола её не касается;
+        // `--new` у переключателя — то же переключение (решение D7).
+        if let Some(t) = toggle_for_chain(&self.cfg, &chain) {
+            self.end_restore_wait(Some(&t), false, "клавиша приложения");
+            return self.toggle(&t);
+        }
         let n = self.current;
         let tagged = self.tagged_in_active(n)?;
         let Some(route) = key_route(&self.cfg, &self.st.desktops, n, &chain, &tagged) else {
@@ -1878,7 +2031,8 @@ impl Daemon {
         let clients = self.hypr.clients()?;
         // Порядок появления даёт номер окна у композитора: по нему выбирается
         // первое окно класса, на место которого встаёт вся стопка свободных окон.
-        let mut windows: Vec<&Client> = clients.iter().filter(|c| c.desktop() == Some(n)).collect();
+        // Окно-переключатель стоит на своём месте и в расстановку не входит.
+        let mut windows: Vec<&Client> = clients.iter().filter(|c| c.desktop() == Some(n) && !c.app().is_some_and(|a| cfg.is_toggle(&a))).collect();
         windows.sort_by_key(|c| c.stable());
         if windows.is_empty() {
             log::info!("расстановка на столе {n}: окон нет");
@@ -3111,6 +3265,7 @@ pub fn merge_extra(file: &Config, extra: &BTreeMap<String, BTreeMap<String, Extr
             let known = file.apps.contains_key(name);
             let reason = match file.workspaces.get(ws) {
                 None => Some(format!("workspace {ws} из конфига исчез")),
+                Some(_) if file.is_toggle(name) => Some("приложение — окно-переключатель, в workspace оно не входит".to_string()),
                 Some(_) if e.cmd.is_empty() && !known => Some("приложения с таким именем в конфиге больше нет".to_string()),
                 Some(_) if !e.cmd.is_empty() && known => Some("приложение с таким именем описано в конфиге, запись конфига главнее".to_string()),
                 Some(w) if w.apps.contains_key(name) => Some(format!("место приложения задано в разделе workspace {ws}")),
@@ -3130,6 +3285,62 @@ pub fn merge_extra(file: &Config, extra: &BTreeMap<String, BTreeMap<String, Extr
         }
     }
     (cfg, dropped)
+}
+
+/// Снять из раскладок workspace места приложений-переключателей файла
+/// конфига: назначение мест, изменённые места и главное приложение.
+/// Возвращает снятые записи как «workspace, приложение».
+pub fn purge_toggle_layout(file: &Config, st: &mut State) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (ws, cells) in st.cells.iter_mut() {
+        cells.retain(|a, _| {
+            let keep = !file.is_toggle(a);
+            if !keep {
+                out.push((ws.clone(), a.clone()));
+            }
+            keep
+        });
+    }
+    for m in st.moved.values_mut() {
+        m.retain(|a, _| !file.is_toggle(a));
+    }
+    st.main.retain(|_, a| !file.is_toggle(a));
+    out
+}
+
+/// Приложение-переключатель, чья собственная клавиша — цепочка `chain`.
+pub fn toggle_for_chain(cfg: &Config, chain: &str) -> Option<String> {
+    cfg.apps.iter().find(|(_, a)| a.toggle && a.chain.as_deref().is_some_and(|c| same_chain(c, chain))).map(|(n, _)| n.clone())
+}
+
+/// Что делает клавиша окна-переключателя.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToggleStep {
+    /// Окно с фокусом на столе композитора: спрятать эти окна приложения.
+    Hide(Vec<String>),
+    /// Окно видно на столе, но фокус у другого окна: дать фокус этому.
+    Focus(String),
+    /// Окна спрятаны или стоят на других столах: показать на этом столе.
+    Show,
+    /// Окон нет: запустить приложение.
+    Launch,
+}
+
+/// Решение клавиши окна-переключателя (изменение toggle-windows, решение D5):
+/// `wins` — окна приложения по номерам экземпляров, `active` — окно с фокусом,
+/// `n` — стол композитора.
+pub fn toggle_step(wins: &[Client], active: Option<&Client>, n: u8) -> ToggleStep {
+    if wins.is_empty() {
+        return ToggleStep::Launch;
+    }
+    let here: Vec<&Client> = wins.iter().filter(|c| c.desktop() == Some(n)).collect();
+    if active.is_some_and(|a| here.iter().any(|c| c.address == a.address)) {
+        return ToggleStep::Hide(here.iter().map(|c| c.address.clone()).collect());
+    }
+    match here.first() {
+        Some(c) => ToggleStep::Focus(c.address.clone()),
+        None => ToggleStep::Show,
+    }
 }
 
 /// Что делать с ожиданием запуска приложения.
@@ -3299,6 +3510,9 @@ pub enum Join {
     AppPlace(String),
     /// Новое дополнительное приложение сессии с этим именем.
     Extra(String),
+    /// Окно приложения-переключателя: тег экземпляра и место переключателя,
+    /// без тегов состава (изменение toggle-windows).
+    Toggle(String),
     /// Окно остаётся свободным.
     Free(Free),
 }
@@ -3351,6 +3565,9 @@ pub fn join_window(cfg: &Config, file: &Config, ws: Option<&str>, c: &Client, cm
     if let Some(app) = app_for_window(cfg, c) {
         if cfg.apps.get(&app).is_some_and(|a| a.is_dialog(&c.title)) {
             return Join::Free(Free::Dialog(app));
+        }
+        if cfg.is_toggle(&app) {
+            return Join::Toggle(app);
         }
         let Some(w) = ws else { return Join::App(app) };
         if ws_has_app(cfg, w, &app) {
@@ -6203,5 +6420,79 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
             entry("neovide", 3, &["surf"], &["neovide", "todo.md"]),
         ];
         assert_eq!(instance_launches(&entries, "work", &["telegram".to_string()]), (vec![0], vec![1]));
+    }
+
+    /// Конфиг с окном-переключателем `telegram` (изменение toggle-windows).
+    fn toggle_cfg() -> Config {
+        Config::parse(&format!("{CFG}\n[apps.telegram]\ntoggle = true\nchain = \"SUPER+T\"\ncmd = \"Telegram\"\nclass = '^org\\.telegram\\.desktop$'\nrect = {{ w = 1000, h = 1000 }}\n")).unwrap()
+    }
+
+    #[test]
+    fn toggle_window_never_joins_workspace() {
+        let cfg = toggle_cfg();
+        let taken: Vec<String> = cfg.apps.keys().cloned().collect();
+        let tg = client("0x1", "org.telegram.desktop", "Telegram", "1", &[]);
+        let cmd = vec!["/usr/bin/Telegram".to_string()];
+        // На столе с активным workspace и без него окно — переключатель,
+        // а не член workspace и не дополнительное приложение сессии.
+        assert_eq!(join_window(&cfg, &cfg, Some("work"), &tg, &cmd, &taken), Join::Toggle("telegram".into()));
+        assert_eq!(join_window(&cfg, &cfg, None, &tg, &cmd, &taken), Join::Toggle("telegram".into()));
+        // Тег состава, оставшийся от прежнего конфига, снимается сверкой.
+        let old = client("0x2", "org.telegram.desktop", "Telegram", "1", &["app:telegram#1", "ws:work"]);
+        assert_eq!(stale_ws_tags(&cfg, std::slice::from_ref(&old)), vec![("0x2".to_string(), "work".to_string())]);
+        // Захват при поднятии workspace его окон не берёт: в разделе их нет.
+        let ws_apps: Vec<String> = cfg.workspaces["work"].apps.keys().cloned().collect();
+        assert!(triples(adopt_plan(&cfg, std::slice::from_ref(&tg), &ws_apps, true).unwrap()).is_empty());
+        // Окну без тегов состава состав не выводится.
+        let mut st = State::default();
+        st.desktop(1).workspaces = vec!["work".into()];
+        st.desktop(1).active = Some("work".into());
+        let free = client("0x3", "org.telegram.desktop", "Telegram", "1", &["app:telegram#1"]);
+        assert!(derive_membership(&cfg, &st, std::slice::from_ref(&free)).is_empty());
+    }
+
+    #[test]
+    fn toggle_app_leaves_session_records_and_layouts() {
+        let cfg = toggle_cfg();
+        // Запись сессии о месте Telegram в work снимается: переключатель
+        // в workspace не входит.
+        let mut extra: BTreeMap<String, BTreeMap<String, ExtraApp>> = BTreeMap::new();
+        extra.entry("work".into()).or_default().insert("telegram".into(), ExtraApp { rect: PxRect { x: 1176, y: 429, w: 1818, h: 1301 }, ..ExtraApp::default() });
+        let (merged, dropped) = merge_extra(&cfg, &extra);
+        assert!(!merged.workspaces["work"].apps.contains_key("telegram"));
+        assert_eq!(dropped.len(), 1);
+        assert!(dropped[0].2.contains("переключатель"), "{dropped:?}");
+        // Раскладка из снимка теряет его место и не называет его главным.
+        let mut st = State::default();
+        st.cells.entry("work".into()).or_default().insert("telegram".into(), Place::Rect { rect: PxRect::default() });
+        st.cells.entry("work".into()).or_default().insert("herdr".into(), Place::Cell("center".into()));
+        st.moved.entry("work".into()).or_default().insert("telegram".into(), Moved { rect: PxRect::default(), owner: None });
+        st.main.insert("work".into(), "telegram".into());
+        assert_eq!(purge_toggle_layout(&cfg, &mut st), vec![("work".to_string(), "telegram".to_string())]);
+        assert!(!st.cells["work"].contains_key("telegram") && st.cells["work"].contains_key("herdr"));
+        assert!(st.moved["work"].is_empty() && !st.main.contains_key("work"));
+    }
+
+    #[test]
+    fn toggle_key_and_steps() {
+        let cfg = toggle_cfg();
+        assert_eq!(toggle_for_chain(&cfg, "SUPER+T").as_deref(), Some("telegram"));
+        assert_eq!(toggle_for_chain(&cfg, "super+t").as_deref(), Some("telegram"));
+        assert_eq!(toggle_for_chain(&cfg, "SUPER+E"), None);
+
+        let shown = client("0x1", "org.telegram.desktop", "Telegram", "1", &["app:telegram#1"]);
+        let hidden = client("0x1", "org.telegram.desktop", "Telegram", "special:pool", &["app:telegram#1"]);
+        let other = client("0x1", "org.telegram.desktop", "Telegram", "3", &["app:telegram#1"]);
+        let herdr = client("0x9", "wezterm-herdr", "herdr", "1", &["app:herdr#1", "ws:work"]);
+        // Окна нет — запуск.
+        assert_eq!(toggle_step(&[], Some(&herdr), 1), ToggleStep::Launch);
+        // Окно на этом столе с фокусом — скрыть.
+        assert_eq!(toggle_step(std::slice::from_ref(&shown), Some(&shown), 1), ToggleStep::Hide(vec!["0x1".into()]));
+        // Окно на этом столе без фокуса — дать фокус, не пряча.
+        assert_eq!(toggle_step(std::slice::from_ref(&shown), Some(&herdr), 1), ToggleStep::Focus("0x1".into()));
+        // Спрятанное окно и окно на другом столе показываются здесь.
+        assert_eq!(toggle_step(std::slice::from_ref(&hidden), Some(&herdr), 1), ToggleStep::Show);
+        assert_eq!(toggle_step(std::slice::from_ref(&other), Some(&herdr), 1), ToggleStep::Show);
+        assert_eq!(toggle_step(std::slice::from_ref(&other), Some(&other), 1), ToggleStep::Show);
     }
 }

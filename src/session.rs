@@ -41,6 +41,12 @@ pub fn snapshot(d: &Daemon) -> Result<Session> {
             None if c.on_hidden() => "hidden".to_string(),
             None => continue,
         };
+        // Окно-переключатель в снимок не пишется: в workspace оно не входит,
+        // а запускать его при восстановлении не нужно (изменение
+        // toggle-windows, решение D8).
+        if c.app().is_some_and(|a| d.cfg().is_toggle(&a)) {
+            continue;
+        }
         if c.app().is_some() {
             windows.push(instance_record(c, &clients, st, d.cfg(), &proc_info, desktop));
         } else if c.pid > 0 {
@@ -280,6 +286,10 @@ pub fn restore_plan(windows: &[SessionWindow], clients: &[Client], cfg: &Config)
             plan.dropped.push(format!("{}#{}: приложения в конфиге нет, запись пропущена", e.app, e.instance));
             continue;
         }
+        if cfg.is_toggle(&e.app) {
+            plan.dropped.push(format!("{}#{}: приложение — окно-переключатель, из снимка оно не восстанавливается", e.app, e.instance));
+            continue;
+        }
         let live = clients.iter().find(|c| c.app_instance().is_some_and(|(a, n)| a == e.app && n == e.instance));
         if let Some(c) = live {
             for (ws, r) in &e.rects {
@@ -517,6 +527,9 @@ pub fn load(d: &mut Daemon, name: &str) -> Result<()> {
         let mut apps: Vec<String> = live.keys().chain(recs.keys()).cloned().collect();
         apps.sort();
         apps.dedup();
+        // Окна-переключатели в сессию не входят: загрузка их не закрывает
+        // и не запускает (изменение toggle-windows, решение D8).
+        apps.retain(|a| !d.cfg().is_toggle(a));
         for app in apps {
             let (pairs, extra, lack) = load_pairs(live.get(&app).map(Vec::as_slice).unwrap_or(&[]), recs.get(&app).map(Vec::as_slice).unwrap_or(&[]));
             reuse.extend(pairs);
@@ -530,7 +543,7 @@ pub fn load(d: &mut Daemon, name: &str) -> Result<()> {
     for c in &clients {
         match c.app() {
             Some(app) => {
-                if !new_format && !s.windows.iter().any(|w| w.app.as_deref() == Some(&app)) {
+                if !new_format && !d.cfg().is_toggle(&app) && !s.windows.iter().any(|w| w.app.as_deref() == Some(&app)) {
                     close.push(hypr::d_close(&c.address));
                 }
             }
@@ -559,7 +572,7 @@ pub fn load(d: &mut Daemon, name: &str) -> Result<()> {
             }
             done.push(RestoreEntry { state: RestoreState::Done, ..e });
         }
-        let mut plan: Vec<RestoreEntry> = missing.iter().filter_map(|i| RestoreEntry::from_window(&s.windows[*i])).filter(|e| d.cfg().apps.contains_key(&e.app)).collect();
+        let mut plan: Vec<RestoreEntry> = missing.iter().filter_map(|i| RestoreEntry::from_window(&s.windows[*i])).filter(|e| d.cfg().apps.contains_key(&e.app) && !d.cfg().is_toggle(&e.app)).collect();
         // Запись без командной строки при живых окнах приложения не ждёт:
         // процесс уже работает и своих окон заново не откроет (как при старте).
         for e in plan.iter_mut() {
@@ -885,6 +898,17 @@ apps = { chrome-ai = "right" }
         // Первые экземпляры для запуска при загрузке.
         let firsts: Vec<String> = first_to_start(&plan.entries).iter().map(|e| format!("{}#{}", e.app, e.instance)).collect();
         assert_eq!(firsts, vec!["chromium#1", "neovide#1", "chrome-ai#1"]);
+    }
+
+    #[test]
+    fn restore_plan_drops_toggle_windows() {
+        // Снимок прежнего конфига держит окно Telegram членом work; после
+        // того как Telegram стал окном-переключателем, запись не исполняется.
+        let cfg = Config::parse(&format!("{CFG}\n[apps.telegram]\ntoggle = true\ncmd = \"Telegram\"\nclass = \"tg\"\nrect = {{ w = 1000, h = 1000 }}\n")).unwrap();
+        let windows = vec![SessionWindow { app: Some("telegram".into()), instance: Some(1), workspaces: vec!["work".into()], desktop: "1".into(), rect: R1, ..SessionWindow::default() }];
+        let plan = restore_plan(&windows, &[], &cfg);
+        assert!(plan.entries.is_empty());
+        assert!(plan.dropped[0].contains("переключатель"), "{:?}", plan.dropped);
     }
 
     #[test]
