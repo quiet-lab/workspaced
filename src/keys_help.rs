@@ -183,21 +183,36 @@ fn target_desc(t: &TargetAction) -> String {
 
 /// Описание клавиши приложения по её источникам: `apps.herdr` →
 /// «Приложение herdr», `workspaces.surf.apps.chrome` → «chrome в workspace surf»;
-/// клавиша окна-переключателя — «Показать или скрыть telegram».
+/// клавиша окна-переключателя — «Показать или скрыть telegram». Записи
+/// одного workspace с общей цепочкой (изменение shared-app-chain) сводятся
+/// в одну часть: «chrome-ai, chrome-ai2 в workspace surf».
 fn app_key_desc(cfg: &Config, source: &str) -> String {
-    source
-        .split(',')
-        .map(|s| {
-            let parts: Vec<&str> = s.split('.').collect();
-            match parts.as_slice() {
-                ["apps", a] if cfg.is_toggle(a) => format!("Показать или скрыть {a}"),
-                ["apps", a] => format!("Приложение {a}"),
-                ["workspaces", w, "apps", a] => format!("{a} в workspace {w}"),
-                _ => s.to_string(),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("; ")
+    let mut parts: Vec<String> = Vec::new();
+    // Workspace и приложения его записей в порядке источников.
+    let mut by_ws: Vec<(String, Vec<String>)> = Vec::new();
+    let mut slot: Vec<Result<String, usize>> = Vec::new();
+    for s in source.split(',') {
+        let p: Vec<&str> = s.split('.').collect();
+        match p.as_slice() {
+            ["apps", a] if cfg.is_toggle(a) => slot.push(Ok(format!("Показать или скрыть {a}"))),
+            ["apps", a] => slot.push(Ok(format!("Приложение {a}"))),
+            ["workspaces", w, "apps", a] => match by_ws.iter().position(|(x, _)| x == w) {
+                Some(i) => by_ws[i].1.push(a.to_string()),
+                None => {
+                    by_ws.push((w.to_string(), vec![a.to_string()]));
+                    slot.push(Err(by_ws.len() - 1));
+                }
+            },
+            _ => slot.push(Ok(s.to_string())),
+        }
+    }
+    for x in slot {
+        parts.push(match x {
+            Ok(text) => text,
+            Err(i) => format!("{} в workspace {}", by_ws[i].1.join(", "), by_ws[i].0),
+        });
+    }
+    parts.join("; ")
 }
 
 /// Группа записи `[[binds]]` по её действию.
@@ -679,6 +694,15 @@ e = { exit = true }
         assert_eq!(row("SUPER+S s e"), ("Super+S s e".into(), "Новое окно · Приложение neovide (выход)".into(), g.clone()));
         assert_eq!(find(&list, "SUPER+S s v").action, "key --new SUPER+V");
         assert_eq!(find(&list, "SUPER+S r v").source, "sticky.apps.raise");
+        // Две записи workspace с общей клавишей — одна строка с перечислением
+        // приложений (изменение shared-app-chain).
+        let shared = text
+            .replace("[workspaces.surf]", "[apps.chrome-ai2]\ncmd = \"chrome\"\n[workspaces.surf]")
+            .replace("chrome-ai = { cell = \"r\", chain = \"SUPER+V\" }", "chrome-ai = { cell = \"r\", chain = \"SUPER+V\" }\nchrome-ai2 = { cell = \"r\", chain = \"SUPER+V\" }");
+        let sl = entries(&Config::parse(&shared).unwrap()).unwrap();
+        assert_eq!(sl.iter().filter(|e| e.chain == "SUPER+V").count(), 1);
+        assert_eq!(find(&sl, "SUPER+V").desc, "chrome-ai, chrome-ai2 в workspace surf");
+        assert_eq!(find(&sl, "SUPER+S r v").desc, "Поднять · chrome-ai, chrome-ai2 в workspace surf");
         let names: Vec<String> = grouped(&cfg).unwrap().into_iter().map(|(n, _)| n).collect();
         let at = |n: &str| names.iter().position(|x| x == n).unwrap();
         assert_eq!(at("Цепочки с выходом"), at("Приложения") + 1, "{names:?}");

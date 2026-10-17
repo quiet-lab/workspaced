@@ -1626,9 +1626,22 @@ impl Daemon {
     /// workspace поднят (`Raised`) или приложение открыто либо перетащено
     /// в него (`Joined`), и тогда цикл начинается заново.
     fn cycle(&mut self, ws: &str, app: &str, start: Start) -> Result<()> {
+        self.cycle_group(ws, std::slice::from_ref(&app.to_string()), start)
+    }
+
+    /// Общий цикл клавиши, на которую в workspace откликаются несколько
+    /// записей (изменение shared-app-chain, решение D1): окна всех
+    /// приложений `group` идут одним рядом — по порядку записей раздела,
+    /// внутри приложения по порядку экземпляров, — а шаг выводится из
+    /// активного окна по тем же правилам. Режим цикла — режим первой записи
+    /// (у записей с общей цепочкой он один, решение D3). Окон нет ни у одного
+    /// приложения — запускается первое (решение D2). Группа из одного
+    /// приложения — обычный цикл по его экземплярам.
+    fn cycle_group(&mut self, ws: &str, group: &[String], start: Start) -> Result<()> {
+        let Some(app) = group.first().map(String::as_str) else { return Ok(()) };
         let fresh = start != Start::Continue;
         let mut clients = self.hypr.clients()?;
-        self.adopt_untagged(&mut clients, std::slice::from_ref(&app.to_string()), Some(ws))?;
+        self.adopt_untagged(&mut clients, group, Some(ws))?;
         // Раскладка снимается с экрана перед выбором шага (изменение
         // live-layout, решение D4): сдвинутое окно отдаёт свой прямоугольник
         // месту своего приложения, и обмен мест идёт уже по нему.
@@ -1640,13 +1653,15 @@ impl Daemon {
         // мест переносит запись, которая его описывает: у варианта без своей
         // записи это запись семейства (решение D6).
         let (mode, entry) = cycle_mode(&cfg, ws, app);
+        let entries: Vec<String> = group.iter().map(|a| cycle_mode(&cfg, ws, a).1).collect();
+        let label = group.join(", ");
         let swap = mode == Mode::Swap;
-        let wins = placed_windows(&cfg, &clients, ws, &ws_apps, app);
+        let wins = group_windows(&cfg, &clients, ws, &ws_apps, group);
         let order: Vec<String> = wins.iter().filter(|c| !c.on_hidden()).map(|c| c.address.clone()).collect();
         if order.is_empty() && !wins.is_empty() {
             // Все окна приложения спрятаны пользователем на `special:hidden`:
             // второй экземпляр не запускается, показывать нечего.
-            log::info!("{app}: все окна скрыты, цикл пропущен");
+            log::info!("{label}: все окна скрыты, цикл пропущен");
             return Ok(());
         }
         let active = self.hypr.active_window()?.map(|c| c.address);
@@ -1655,27 +1670,29 @@ impl Daemon {
         // цикл заново (изменение live-layout, решение D7): выбрать экземпляр —
         // значит поставить приложение на главное место. Нажатия, которое
         // открыло или перетащило приложение, правило не касается.
-        let is_main = self.st.main_app(&cfg, ws, self.mon).as_deref() == Some(entry.as_str());
+        // Приложение общей цепочки, стоящее на главном месте, делает главной
+        // всю группу: цикл идёт по её окнам, не начинаясь заново.
+        let is_main = self.st.main_app(&cfg, ws, self.mon).is_some_and(|m| entries.contains(&m));
         let restart = if swap && start != Start::Joined { swap_start(&order, active.as_deref(), is_main) } else { None };
         if fresh || !on_instance || restart.is_some() {
             // Начало цикла: запомнить окно, к которому вернёт его конец.
             let main_window = swap
                 .then(|| self.st.main_app(&cfg, ws, self.mon))
                 .flatten()
-                .filter(|m| *m != entry)
+                .filter(|m| !entries.contains(m))
                 .and_then(|m| placed_windows(&cfg, &clients, ws, &ws_apps, &m).into_iter().find(|c| !c.on_hidden()).map(|c| c.address.clone()));
             let focus = self.st.focus.get(ws).cloned();
             let back = anchor_window(&cfg, &clients, ws, main_window.as_deref(), &order, active.as_deref(), focus.as_deref());
-            self.st.cycle.insert(ws.to_string(), Cycle { app: app.to_string(), back });
+            self.st.cycle.insert(ws.to_string(), Cycle { app: label.clone(), back });
         }
         let prev = self
             .st
             .cycle
             .get(ws)
-            .filter(|c| c.app == app)
+            .filter(|c| c.app == label)
             .and_then(|c| c.back.clone())
             .filter(|a| clients.iter().any(|c| c.address == *a && !c.on_hidden()));
-        let next = next_app_window(&cfg, &clients, ws, &entry);
+        let next = next_app_window(&cfg, &clients, ws, &entries);
         let step = match restart {
             Some(addr) => CycleStep::Select(addr),
             None => cycle_step(&order, active.as_deref(), fresh, prev.as_deref(), next.as_deref()),
@@ -1695,11 +1712,11 @@ impl Daemon {
             }
             CycleStep::Select(addr) => self.select_window(ws, &addr, &clients, swap && start != Start::Joined),
             CycleStep::Back(addr) => {
-                log::info!("{ws}: цикл {app} закончен, возврат к окну {addr}");
+                log::info!("{ws}: цикл {label} закончен, возврат к окну {addr}");
                 self.select_window(ws, &addr, &clients, swap)
             }
             CycleStep::NextApp(addr) => {
-                log::info!("{ws}: цикл {app} закончен, prev нет — следующее приложение workspace, окно {addr}");
+                log::info!("{ws}: цикл {label} закончен, prev нет — следующее приложение workspace, окно {addr}");
                 self.select_window(ws, &addr, &clients, swap)
             }
         }
@@ -1750,7 +1767,8 @@ impl Daemon {
             log::info!("приложение {}: новый экземпляр, {route:?}", apps.join(", "));
             return self.spawn_new(route);
         }
-        self.follow_route(route, raised, apps)
+        let group = vec![route.app().to_string()];
+        self.follow_route(route, raised, apps, &group)
     }
 
     /// Приложения окон, входящих в активный workspace стола `n` тегом
@@ -1785,12 +1803,22 @@ impl Daemon {
             return Ok(());
         };
         log::info!("клавиша {chain}{}: {route:?}", if new { " (новый экземпляр)" } else { "" });
-        let app = route.app().to_string();
-        self.end_restore_wait(Some(&app), false, "клавиша приложения");
+        let group = key_group(&self.cfg, &route, &chain);
+        for a in &group {
+            self.end_restore_wait(Some(a), false, "клавиша приложения");
+        }
         if new {
+            // Новый экземпляр при общей цепочке — у приложения активного окна,
+            // если оно из группы, иначе у первого (решение D4).
+            let active = self.hypr.active_window()?.and_then(|c| c.app());
+            let route = match active.filter(|a| group.len() > 1 && group.contains(a)) {
+                Some(a) => route.with_app(a),
+                None => route,
+            };
             return self.spawn_new(route);
         }
-        self.follow_route(route, false, &[app])
+        let app = route.app().to_string();
+        self.follow_route(route, false, &[app], &group)
     }
 
     /// Новый экземпляр приложения по пути клавиши (спецификация ws-daemon,
@@ -1846,14 +1874,15 @@ impl Daemon {
 
     /// Выполнить путь клавиши приложения. `raised` — workspace поднят этой
     /// же командой, и цикл начинается заново; `apps` — кандидаты, чьи
-    /// свободные окна захватываются при цикле вне workspace.
-    fn follow_route(&mut self, route: AppRoute, raised: bool, apps: &[String]) -> Result<()> {
+    /// свободные окна захватываются при цикле вне workspace; `group` —
+    /// приложения общего цикла (`key_group`) для путей `Cycle` и `Raise`.
+    fn follow_route(&mut self, route: AppRoute, raised: bool, apps: &[String], group: &[String]) -> Result<()> {
         let n = self.current;
         match route {
-            AppRoute::Cycle { ws, app } => self.cycle(&ws, &app, if raised { Start::Raised } else { Start::Continue }),
-            AppRoute::Raise { ws, app, desktop } => {
+            AppRoute::Cycle { ws, .. } => self.cycle_group(&ws, group, if raised { Start::Raised } else { Start::Continue }),
+            AppRoute::Raise { ws, desktop, .. } => {
                 self.raise(&ws, desktop)?;
-                self.cycle(&ws, &app, Start::Raised)
+                self.cycle_group(&ws, group, Start::Raised)
             }
             AppRoute::Pull { ws, app } => self.bring(&ws, &app, true),
             AppRoute::Open { ws, app } => self.bring(&ws, &app, false),
@@ -3028,6 +3057,48 @@ impl AppRoute {
             AppRoute::Cycle { app, .. } | AppRoute::Raise { app, .. } | AppRoute::Pull { app, .. } | AppRoute::Open { app, .. } | AppRoute::Free { app } => app,
         }
     }
+
+    /// Тот же путь к другому приложению.
+    pub fn with_app(self, other: String) -> AppRoute {
+        match self {
+            AppRoute::Cycle { ws, .. } => AppRoute::Cycle { ws, app: other },
+            AppRoute::Raise { ws, desktop, .. } => AppRoute::Raise { ws, app: other, desktop },
+            AppRoute::Pull { ws, .. } => AppRoute::Pull { ws, app: other },
+            AppRoute::Open { ws, .. } => AppRoute::Open { ws, app: other },
+            AppRoute::Free { .. } => AppRoute::Free { app: other },
+        }
+    }
+}
+
+/// Приложения общего цикла клавиши `chain` на пути `route` (изменение
+/// shared-app-chain, решение D1): если путь ведёт к циклу в workspace
+/// (`Cycle`, `Raise`), а workspace откликается на цепочку записью этого
+/// приложения, — все записи workspace с той же цепочкой по порядку раздела.
+/// Иначе — одно приложение пути: собственная клавиша приложения,
+/// отличная от ключа его записи, ведёт цикл только по его окнам.
+pub fn key_group(cfg: &Config, route: &AppRoute, chain: &str) -> Vec<String> {
+    let app = route.app().to_string();
+    match route {
+        AppRoute::Cycle { ws, .. } | AppRoute::Raise { ws, .. } => {
+            let all = cfg.responders(ws, chain);
+            if all.contains(&app) { all } else { vec![app] }
+        }
+        _ => vec![app],
+    }
+}
+
+/// Окна общего цикла в workspace `ws`: окна каждого приложения `group`
+/// (`placed_windows`) подряд по порядку группы, без повторов.
+pub fn group_windows<'a>(cfg: &Config, clients: &'a [Client], ws: &str, ws_apps: &[String], group: &[String]) -> Vec<&'a Client> {
+    let mut out: Vec<&Client> = Vec::new();
+    for app in group {
+        for c in placed_windows(cfg, clients, ws, ws_apps, app) {
+            if !out.iter().any(|x| x.address == c.address) {
+                out.push(c);
+            }
+        }
+    }
+    out
 }
 
 /// Ожидание запуска, которое решает судьбу нового нажатия клавиши
@@ -4244,13 +4315,16 @@ pub fn anchor_window(cfg: &Config, clients: &[Client], ws: &str, main_window: Op
 }
 
 /// Первое нескрытое окно следующего приложения workspace: по порядку записи
-/// в разделе workspace, циклически после вызванного. Приложения без окон
+/// в разделе workspace, циклически после последней записи вызванной группы
+/// `group` (одно приложение или записи общей цепочки, изменение
+/// shared-app-chain); записи группы пропускаются. Приложения без окон
 /// пропускаются — конец цикла не запускает программу, которую не вызывали.
-pub fn next_app_window(cfg: &Config, clients: &[Client], ws: &str, app: &str) -> Option<String> {
+pub fn next_app_window(cfg: &Config, clients: &[Client], ws: &str, group: &[String]) -> Option<String> {
     let names: Vec<String> = cfg.workspaces.get(ws)?.apps.keys().cloned().collect();
-    let i = names.iter().position(|n| n == app)?;
+    let i = names.iter().rposition(|n| group.contains(n))?;
     (1..names.len())
         .map(|k| &names[(i + k) % names.len()])
+        .filter(|name| !group.contains(name))
         .find_map(|name| placed_windows(cfg, clients, ws, &names, name).into_iter().find(|c| !c.on_hidden()).map(|c| c.address.clone()))
 }
 
@@ -4732,7 +4806,7 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
         assert_eq!(ws_app_of(&cfg, "work", &apps, &clients[0]).as_deref(), Some("chromium"));
         assert_eq!(ws_app_of(&cfg, "work", &apps, &clients[1]), None);
         // Следующее приложение workspace — тоже по составу.
-        assert_eq!(next_app_window(&cfg, &clients, "work", "herdr").as_deref(), Some("0x1"));
+        assert_eq!(next_app_window(&cfg, &clients, "work", &["herdr".to_string()]).as_deref(), Some("0x1"));
     }
 
     #[test]
@@ -5069,6 +5143,86 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
 
     fn desk(ws: &[&str], active: Option<&str>) -> Desktop {
         Desktop { workspaces: ws.iter().map(|w| w.to_string()).collect(), active: active.map(String::from) }
+    }
+
+    /// `surf` из `overrides_text` с ещё одним профилем Chrome на клавише
+    /// chrome-ai (изменение shared-app-chain).
+    fn shared_chain_cfg() -> Config {
+        let text = overrides_text()
+            .replace("[apps.calc]", "[apps.chrome-ai2]\ncmd = \"chrome\"\nchain = \"SUPER+SHIFT+A\"\n\n[apps.calc]")
+            .replace("chrome-ai = { cell = \"right\", chain = \"SUPER+V\" }\n", "chrome-ai = { cell = \"right\", chain = \"SUPER+V\" }\nchrome-ai2 = { cell = \"right\", chain = \"SUPER+V\" }\n");
+        Config::parse(&text).unwrap()
+    }
+
+    #[test]
+    fn shared_chain_group() {
+        let cfg = shared_chain_cfg();
+        let s = |v: &str| v.to_string();
+        let mut d: BTreeMap<u8, Desktop> = BTreeMap::new();
+        d.insert(1, desk(&["work"], Some("work")));
+        d.insert(2, desk(&["surf"], Some("surf")));
+        // В surf клавиша ведёт цикл первой записи, а группа — обе записи
+        // по порядку раздела.
+        let route = key_route(&cfg, &d, 2, "SUPER+V", &[]).unwrap();
+        assert_eq!(route, AppRoute::Cycle { ws: s("surf"), app: s("chrome-ai") });
+        assert_eq!(key_group(&cfg, &route, "SUPER+V"), vec![s("chrome-ai"), s("chrome-ai2")]);
+        // С другого стола клавиша поднимает surf, и цикл тоже общий.
+        let route = key_route(&cfg, &d, 1, "SUPER+V", &[]).unwrap();
+        assert_eq!(route, AppRoute::Raise { ws: s("surf"), app: s("chrome-ai"), desktop: Some(2) });
+        assert_eq!(key_group(&cfg, &route, "SUPER+V"), vec![s("chrome-ai"), s("chrome-ai2")]);
+        // Собственная клавиша приложения ведёт цикл только по его окнам.
+        let route = key_route(&cfg, &d, 2, "SUPER+SHIFT+A", &[]).unwrap();
+        assert_eq!(route, AppRoute::Cycle { ws: s("surf"), app: s("chrome-ai2") });
+        assert_eq!(key_group(&cfg, &route, "SUPER+SHIFT+A"), vec![s("chrome-ai2")]);
+        // Перетаскивание по собственной клавише не меняется.
+        let route = key_route(&cfg, &d, 1, "SUPER+SHIFT+A", &[]).unwrap();
+        assert_eq!(route, AppRoute::Pull { ws: s("work"), app: s("chrome-ai2") });
+        assert_eq!(key_group(&cfg, &route, "SUPER+SHIFT+A"), vec![s("chrome-ai2")]);
+        // Новый экземпляр уходит тем же путём к другому приложению группы.
+        assert_eq!(AppRoute::Cycle { ws: s("surf"), app: s("chrome-ai") }.with_app(s("chrome-ai2")), AppRoute::Cycle { ws: s("surf"), app: s("chrome-ai2") });
+    }
+
+    #[test]
+    fn shared_chain_cycle_order() {
+        let cfg = shared_chain_cfg();
+        let s = |v: &str| v.to_string();
+        let group = vec![s("chrome-ai"), s("chrome-ai2")];
+        let ws_apps: Vec<String> = cfg.workspaces["surf"].apps.keys().cloned().collect();
+        // Окна идут по порядку записей раздела, а не по порядку в списке
+        // композитора; внутри приложения — по порядку экземпляров.
+        let clients = vec![
+            client("0x21", "google-chrome-ai2", "AI2 — 1", "2", &["app:chrome-ai2#1", "ws:surf"]),
+            client("0x11", "google-chrome-ai", "AI — 1", "2", &["app:chrome-ai#1", "ws:surf"]),
+            client("0x22", "google-chrome-ai2", "AI2 — 2", "2", &["app:chrome-ai2#2", "ws:surf"]),
+            client("0x12", "google-chrome-ai", "AI — 2", "2", &["app:chrome-ai#2", "ws:surf"]),
+            client("0x31", "yandex", "Яндекс", "2", &["app:yandex#1", "ws:surf"]),
+        ];
+        let order = |cs: &[Client]| group_windows(&cfg, cs, "surf", &ws_apps, &group).iter().map(|c| c.address.clone()).collect::<Vec<_>>();
+        let all = order(&clients);
+        assert_eq!(all, vec![s("0x11"), s("0x12"), s("0x21"), s("0x22")]);
+        // Два приложения по два окна: чужое окно — первое окно первого
+        // приложения, дальше по порядку через границу приложений.
+        assert_eq!(cycle_step(&all, Some("0x31"), false, Some("0x31"), None), CycleStep::Select(s("0x11")));
+        assert_eq!(cycle_step(&all, Some("0x12"), false, Some("0x31"), None), CycleStep::Select(s("0x21")));
+        assert_eq!(cycle_step(&all, Some("0x21"), false, Some("0x31"), None), CycleStep::Select(s("0x22")));
+        // За последним окном последнего приложения — возврат к prev.
+        assert_eq!(cycle_step(&all, Some("0x22"), false, Some("0x31"), None), CycleStep::Back(s("0x31")));
+        // Окна только у второго приложения: цикл идёт по ним, первое
+        // не запускается.
+        let only: Vec<Client> = clients.iter().filter(|c| c.class != "google-chrome-ai").cloned().collect();
+        let o = order(&only);
+        assert_eq!(o, vec![s("0x21"), s("0x22")]);
+        assert_eq!(cycle_step(&o, Some("0x31"), false, Some("0x31"), None), CycleStep::Select(s("0x21")));
+        // Окон нет ни у одного приложения группы — запуск (первого по порядку).
+        let none: Vec<Client> = clients.iter().filter(|c| c.class == "yandex").cloned().collect();
+        assert_eq!(cycle_step(&order(&none), Some("0x31"), false, None, None), CycleStep::Launch);
+        // Следующее приложение после группы (раздел surf: chrome, yandex,
+        // chrome-ai, chrome-ai2): записи группы пропускаются, за последней
+        // записью раздела идёт первая, приложение без окон пропускается.
+        assert_eq!(next_app_window(&cfg, &clients, "surf", &group).as_deref(), Some("0x31"));
+        let with_chrome = [clients.clone(), vec![client("0x41", "chrome", "Default", "2", &["app:chrome#1", "ws:surf"])]].concat();
+        assert_eq!(next_app_window(&cfg, &with_chrome, "surf", &group).as_deref(), Some("0x41"));
+        assert_eq!(next_app_window(&cfg, &clients, "surf", &[s("chrome-ai")]).as_deref(), Some("0x21"));
     }
 
     #[test]
@@ -5680,7 +5834,7 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
         // порядок не алфавитный, и цикл идёт именно по нему.
         let cfg = Config::parse(CFG).unwrap();
         let clients = work_clients();
-        let next = |app: &str, cs: &[Client]| next_app_window(&cfg, cs, "work", app).unwrap_or_default();
+        let next = |app: &str, cs: &[Client]| next_app_window(&cfg, cs, "work", &[app.to_string()]).unwrap_or_default();
         assert_eq!(next("herdr", &clients), "0x2");
         assert_eq!(next("chromium", &clients), "0x3");
         // За последним приложением списка снова идёт первое.

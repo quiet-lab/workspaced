@@ -339,16 +339,23 @@ pub fn collect(cfg: &Config) -> Result<Vec<Binding>> {
             }
         }
     }
-    // Две записи одного workspace с одним ключом — ошибка (решение D8):
-    // ключ записи — переопределение, а без него собственная клавиша.
+    // Записи одного workspace с одним ключом ведут общий цикл (изменение
+    // shared-app-chain, решение D1; ключ записи — переопределение, а без
+    // него собственная клавиша). Цикл идёт в одном режиме, поэтому режим
+    // клавиши у таких записей должен совпадать (решение D3).
     for (wname, w) in &cfg.workspaces {
         let mut seen: Vec<(ChainKey, &str)> = Vec::new();
         for aname in w.apps.keys() {
             let Some(k) = cfg.app_key(wname, aname) else { continue };
             let chain = parse_chain(k)?;
             let key = chain_key(&chain);
-            if let Some((_, other)) = seen.iter().find(|(x, _)| *x == key) {
-                bail!("workspace {wname}: приложения {other} и {aname} имеют одну цепочку {:?}", chain_compact(&chain));
+            if let Some((_, other)) = seen.iter().find(|(x, _)| *x == key)
+                && cfg.app_mode(wname, other) != cfg.app_mode(wname, aname)
+            {
+                bail!(
+                    "workspace {wname}: приложения {other} и {aname} имеют общую цепочку {:?}, но разные режимы клавиши; у записей с общей цепочкой режим должен быть один",
+                    chain_compact(&chain)
+                );
             }
             seen.push((key, aname.as_str()));
         }
@@ -1095,12 +1102,19 @@ apps = { firefox-chat = "c" }
     }
 
     #[test]
-    fn same_chain_in_one_workspace_is_error() {
+    fn same_chain_in_one_workspace_shares_cycle() {
+        // Две записи одного workspace с одной цепочкой допустимы: клавиша
+        // ведёт общий цикл (изменение shared-app-chain, решение D1).
         let text = base()
             .replace("[apps.firefox-back]\ncmd = \"firefox\"", "[apps.firefox-back]\ncmd = \"firefox\"\nchain = \"SUPER+A b\"")
             .replace("apps = { firefox-front = \"c\" }", "apps = { firefox-front = \"c\", firefox-back = \"l\" }");
-        let err = Config::parse(&text).unwrap_err().to_string();
-        assert!(err.contains("dev-front") && err.contains("firefox-front") && err.contains("firefox-back"), "{err}");
+        let cfg = Config::parse(&text).unwrap();
+        assert_eq!(cfg.responders("dev-front", "SUPER+A b"), vec!["firefox-front".to_string(), "firefox-back".to_string()]);
+        assert_eq!(cfg.responds("dev-front", "SUPER+A b"), Some("firefox-front".into()));
+        // Разные режимы клавиши у записей с общей цепочкой — ошибка (решение D3).
+        let mixed = text.replace("firefox-back = \"l\"", "firefox-back = { cell = \"l\", mode = \"stack\" }");
+        let err = Config::parse(&mixed).unwrap_err().to_string();
+        assert!(err.contains("dev-front") && err.contains("firefox-front") && err.contains("firefox-back") && err.contains("режим"), "{err}");
     }
 
     /// Браузеры с собственными клавишами и workspace `surf`, который
@@ -1169,10 +1183,31 @@ chrome-ai = { cell = "r", chain = "SUPER+V" }
     }
 
     #[test]
-    fn override_conflicts_in_workspace() {
+    fn override_shares_chain_in_workspace() {
+        // Ключ записи chrome-ai совпадает с собственной клавишей chrome,
+        // описанного в том же workspace: одна привязка и общий цикл
+        // по порядку записей раздела (изменение shared-app-chain).
         let text = overrides().replace("chain = \"SUPER+V\"", "chain = \"SUPER+B\"");
-        let err = Config::parse(&text).unwrap_err().to_string();
-        assert!(err.contains("surf") && err.contains("chrome") && err.contains("chrome-ai") && err.contains("SUPER+B"), "{err}");
+        let cfg = Config::parse(&text).unwrap();
+        assert_eq!(cfg.responders("surf", "SUPER+B"), vec!["chrome".to_string(), "chrome-ai".to_string()]);
+        let binds = collect(&cfg).unwrap();
+        let b: Vec<&Binding> = binds.iter().filter(|b| chain_compact(&b.chain) == "SUPER+B").collect();
+        assert_eq!(b.len(), 1, "{binds:?}");
+        assert_eq!(b[0].source, "apps.chrome,workspaces.surf.apps.chrome-ai");
+        // Два переопределения на одну клавишу — тоже одна привязка.
+        let two = overrides() + "[apps.chrome-ai2]\ncmd = \"chrome\"\n";
+        let two = two.replace("chrome-ai = { cell = \"r\", chain = \"SUPER+V\" }", "chrome-ai = { cell = \"r\", chain = \"SUPER+V\" }\nchrome-ai2 = { cell = \"r\", chain = \"SUPER+V\" }");
+        let cfg = Config::parse(&two).unwrap();
+        assert_eq!(cfg.responders("surf", "super+v"), vec!["chrome-ai".to_string(), "chrome-ai2".to_string()]);
+        let binds = collect(&cfg).unwrap();
+        let v: Vec<&Binding> = binds.iter().filter(|b| chain_compact(&b.chain) == "SUPER+V").collect();
+        assert_eq!(v.len(), 1, "{binds:?}");
+        assert_eq!(v[0].source, "workspaces.surf.apps.chrome-ai,workspaces.surf.apps.chrome-ai2");
+        luac(&to_lua(&cfg).unwrap());
+        // Клавиша окна-переключателя по-прежнему своя.
+        let tg = two.clone() + "[apps.tg]\ntoggle = true\nchain = \"SUPER+V\"\ncmd = \"tg\"\nclass = \"tg\"\nrect = { w = 10, h = 10 }\n";
+        let err = Config::parse(&tg).unwrap_err().to_string();
+        assert!(err.contains("tg") && err.contains("переключател"), "{err}");
     }
 
     #[test]

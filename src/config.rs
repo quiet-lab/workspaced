@@ -957,12 +957,19 @@ impl Config {
     }
 
     /// Приложение, которым workspace откликается на цепочку: запись, ключ
-    /// которой (`app_key`) совпадает с цепочкой. При двух откликах —
-    /// запись, стоящая раньше в разделе (решение D8): записи файла идут
-    /// раньше записей сессии.
+    /// которой (`app_key`) совпадает с цепочкой. При нескольких откликах —
+    /// запись, стоящая раньше в разделе: записи файла идут раньше записей
+    /// сессии.
     pub fn responds(&self, ws: &str, chain: &str) -> Option<String> {
-        let w = self.workspaces.get(ws)?;
-        w.apps.keys().find(|a| self.app_key(ws, a).is_some_and(|k| crate::keys::same_chain(k, chain))).cloned()
+        self.responders(ws, chain).into_iter().next()
+    }
+
+    /// Все записи workspace, ключ которых совпадает с цепочкой, по порядку
+    /// раздела (изменение shared-app-chain, решение D1): клавиша ведёт один
+    /// общий цикл по окнам всех этих приложений.
+    pub fn responders(&self, ws: &str, chain: &str) -> Vec<String> {
+        let Some(w) = self.workspaces.get(ws) else { return Vec::new() };
+        w.apps.keys().filter(|a| self.app_key(ws, a).is_some_and(|k| crate::keys::same_chain(k, chain))).cloned().collect()
     }
 
     /// Приложения, на которые может указывать цепочка (решение D16): сначала
