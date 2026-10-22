@@ -2048,9 +2048,9 @@ impl Daemon {
     }
 
     /// Расставить окна текущего стола по описанию активного workspace
-    /// (спецификация ws-daemon, «Расстановка по команде»). Назначение мест
-    /// и главное приложение команда не меняет: окна встают на исходные места,
-    /// которые назначены сейчас.
+    /// (спецификация ws-daemon, «Расстановка по команде»). Раскладка
+    /// возвращается к эффективному конфигу целиком: назначение мест и главное
+    /// приложение собираются заново, окна встают на места из описания.
     fn arrange(&mut self) -> Result<()> {
         // Расстановка тоже действует на стол, где пользователь сейчас,
         // поэтому стол берётся у композитора, а не из кэша.
@@ -2067,9 +2067,9 @@ impl Daemon {
             log::info!("расстановка на столе {n}: окон нет");
             return Ok(());
         }
-        // Расстановка возвращает раскладку к описанию (изменение live-layout,
-        // решение D10): изменённые места снимаются, запомненные прямоугольники
-        // окон заменяются местами плана; обмен мест сохраняется.
+        // Расстановка возвращает раскладку к эффективному конфигу (изменение
+        // arrange-restores-config): обмены мест отменяются, изменённые места
+        // снимаются, запомненные прямоугольники окон заменяются местами плана.
         let area = self.work_area();
         let plan = arrange_layout(&mut self.st, &cfg, ws.as_deref(), &windows, self.mon, area);
         let mut ex: Vec<String> = plan.iter().flat_map(|(addr, r)| hypr::d_place(addr, *r)).collect();
@@ -3941,15 +3941,20 @@ pub fn arrange_plan(st: &mut State, cfg: &Config, ws: Option<&str>, windows: &[&
     plan
 }
 
-/// Расстановка по команде с возвратом раскладки к описанию (изменение
-/// live-layout, решение D10): изменённые места `ws` снимаются, окна стола
-/// встают на исходные места нынешнего назначения (`arrange_plan`),
-/// а запомненные прямоугольники окон `ws` заменяются местами плана у окон
-/// этого стола и забываются у остальных. Назначение мест и главное
-/// приложение не меняются.
+/// Расстановка по команде с возвратом раскладки к эффективному конфигу
+/// (изменение arrange-restores-config, решение D1): раскладка `ws` снимается
+/// тем же `State::reset_layout`, что и при правке раздела в файле, поэтому
+/// назначение мест и главное приложение собираются заново из раздела
+/// и дополнительных приложений сессии (у них — прямоугольник записи), обмены
+/// мест и изменённые места пропадают. Окна стола встают на места плана
+/// (`arrange_plan`), а запомненные прямоугольники окон `ws` — места плана
+/// у окон этого стола, у остальных окон они забываются.
 pub fn arrange_layout(st: &mut State, cfg: &Config, ws: Option<&str>, windows: &[&Client], mon: (i32, i32), area: PxRect) -> Vec<(String, PxRect)> {
     if let Some(w) = ws {
-        st.moved.remove(w);
+        st.reset_layout(w);
+        // Главное приложение сразу записывается в раскладку, чтобы состояние
+        // для панели и `status` показывало его, а не пустое поле.
+        st.main_app(cfg, w, mon);
     }
     let plan = arrange_plan(st, cfg, ws, windows, mon, area);
     if let Some(w) = ws {
@@ -5983,35 +5988,74 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
     }
 
     #[test]
-    fn arrange_resets_moved_keeps_swap() {
-        let (cfg, mut st) = user_example();
+    fn arrange_restores_config_layout() {
+        let cfg = shared_cfg();
+        let mut st = State::default();
         let mon = (3840, 2160);
-        let record = PxRect { x: 960, y: 540, w: 1920, h: 1080 };
         let center = PxRect { x: 1125, y: 10, w: 1920, h: 2140 };
-        let r = PxRect { x: 400, y: 300, w: 1400, h: 1000 };
-        st.cells_of(&cfg, "work", mon);
-        st.moved.entry("work".into()).or_default().insert("chrome-ai".into(), Moved { rect: r, owner: Some("0xai".into()) });
-        swap_places(&mut st, "work", Some("herdr"), "chrome-ai", "center", &|_| true);
-        // Окно neovide растянуто, у chromium окно ушло на special:pool.
-        st.moved.get_mut("work").unwrap().insert("neovide".into(), Moved { rect: PxRect { x: 2000, y: 10, w: 3000, h: 2140 }, owner: Some("0x3".into()) });
-        st.geom.entry("work".into()).or_default().insert("0x2".into(), r);
+        let right = PxRect { x: 3055, y: 10, w: 1920, h: 2140 };
+        // Super+E: neovide меняется местами с главным herdr, окно herdr
+        // растянуто мышью, у chromium окно ушло на special:pool.
+        let main = st.main_app(&cfg, "work", mon);
+        swap_places(&mut st, "work", main.as_deref(), "neovide", "center", &|_| true);
+        assert_eq!(st.main_app(&cfg, "work", mon).as_deref(), Some("neovide"));
+        st.moved.entry("work".into()).or_default().insert("herdr".into(), Moved { rect: PxRect { x: 2000, y: 10, w: 3000, h: 2140 }, owner: Some("0x1".into()) });
+        st.geom.entry("work".into()).or_default().insert("0x2".into(), right);
         let clients = [
             client("0x1", "wezterm-herdr", "herdr · dev-lab", "1", &["app:herdr#1", "ws:work"]),
-            client("0xai", "google-chrome-ai", "ИИ", "1", &["app:chrome-ai#1", "ws:work"]),
             client("0x3", "neovide", "[Scratch]", "1", &["app:neovide#1", "ws:work"]),
         ];
         let windows: Vec<&Client> = clients.iter().collect();
         let plan = arrange_layout(&mut st, &cfg, Some("work"), &windows, mon, PANEL_AREA);
         let place = |addr: &str| plan.iter().find(|(a, _)| a == addr).map(|(_, r)| *r).unwrap();
-        // Исходные места нынешнего назначения: обмен сохранён.
-        assert_eq!(place("0xai"), center);
-        assert_eq!(place("0x1"), record);
-        assert_eq!(place("0x3"), PxRect { x: 3055, y: 10, w: 1920, h: 2140 });
-        assert_eq!(st.main_app(&cfg, "work", mon).as_deref(), Some("chrome-ai"));
+        // Раскладка из файла: обмен отменён, herdr снова главный в center.
+        assert_eq!(place("0x1"), center);
+        assert_eq!(place("0x3"), right);
+        assert_eq!(st.main["work"], "herdr");
+        assert_eq!(st.cells["work"]["neovide"], Place::Cell("right".into()));
+        assert_eq!(st.cells["work"]["herdr"], Place::Cell("center".into()));
         assert!(st.moved.is_empty());
         // Запомненные прямоугольники — места плана; окно не на столе забыто.
-        assert_eq!(st.geom["work"]["0x1"], record);
+        assert_eq!(st.geom["work"]["0x1"], center);
         assert!(!st.geom["work"].contains_key("0x2"));
+    }
+
+    #[test]
+    fn arrange_keeps_session_app_rect() {
+        let (cfg, mut st) = user_example();
+        let mon = (3840, 2160);
+        let record = PxRect { x: 960, y: 540, w: 1920, h: 1080 };
+        let center = PxRect { x: 1125, y: 10, w: 1920, h: 2140 };
+        // Дополнительное приложение сессии стало главным: его прямоугольник
+        // перешёл к herdr, ячейка center — к нему.
+        st.cells_of(&cfg, "work", mon);
+        let main = st.main_app(&cfg, "work", mon);
+        swap_places(&mut st, "work", main.as_deref(), "chrome-ai", "center", &|_| true);
+        assert_eq!(st.cells["work"]["herdr"], Place::Rect { rect: record });
+        let clients = [
+            client("0x1", "wezterm-herdr", "herdr · dev-lab", "1", &["app:herdr#1", "ws:work"]),
+            client("0xai", "google-chrome-ai", "ИИ", "1", &["app:chrome-ai#1", "ws:work"]),
+        ];
+        let windows: Vec<&Client> = clients.iter().collect();
+        let plan = arrange_layout(&mut st, &cfg, Some("work"), &windows, mon, PANEL_AREA);
+        let place = |addr: &str| plan.iter().find(|(a, _)| a == addr).map(|(_, r)| *r).unwrap();
+        // Место записи сессии — снова её прямоугольник, herdr — в center.
+        assert_eq!(place("0xai"), record);
+        assert_eq!(place("0x1"), center);
+        assert_eq!(st.cells["work"]["chrome-ai"], Place::Rect { rect: record });
+        assert_eq!(st.main_app(&cfg, "work", mon).as_deref(), Some("herdr"));
+
+        // Обмен с записью сессии, затем её окна закрыты и запись снята:
+        // прямоугольник записи у herdr не остаётся, расстановка ставит его
+        // в center (повод изменения arrange-restores-config).
+        swap_places(&mut st, "work", Some("herdr"), "chrome-ai", "center", &|_| true);
+        st.extra.clear();
+        let (cfg, _) = merge_extra(&shared_cfg(), &st.extra);
+        st.cells.get_mut("work").unwrap().remove("chrome-ai");
+        let windows: Vec<&Client> = clients[..1].iter().collect();
+        let plan = arrange_layout(&mut st, &cfg, Some("work"), &windows, mon, PANEL_AREA);
+        assert_eq!(plan, vec![("0x1".to_string(), center)]);
+        assert!(!st.cells["work"].values().any(|p| *p == Place::Rect { rect: record }));
     }
 
     #[test]
