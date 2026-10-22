@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{App, Config, Placement, PxRect};
+use crate::config::{App, Config, Mode, Placement, PxRect};
 
 /// Место окна в workspace: ячейка шаблона или прямоугольник в пикселях.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -142,25 +142,37 @@ impl State {
         self.desktops.entry(n).or_default()
     }
 
-    /// Назначение ячеек workspace; при первом обращении берётся из конфига.
+    /// Назначение ячеек workspace; при первом обращении берётся из конфига:
+    /// домашние места записей раздела, а в workspace режима `home` — их
+    /// раскладка по домам с главным приложением из конфига в главной ячейке
+    /// (изменение home-mode-layout, решение D5).
     pub fn cells_of(&mut self, cfg: &Config, ws: &str, mon: (i32, i32)) -> &mut BTreeMap<String, Place> {
         self.cells.entry(ws.to_string()).or_insert_with(|| {
-            cfg.workspaces
-                .get(ws)
-                .map(|w| {
-                    w.apps
-                        .iter()
-                        .map(|(a, e)| {
-                            let place = match &e.place {
-                                Placement::Cell(c) => Place::Cell(c.clone()),
-                                Placement::Rect { rect } => Place::Rect { rect: rect.resolve(mon.0, mon.1) },
-                            };
-                            (a.clone(), place)
-                        })
-                        .collect()
-                })
-                .unwrap_or_default()
+            let homes = home_places(cfg, ws, mon);
+            let home_mode = cfg.workspaces.get(ws).is_some_and(|w| w.mode() == Mode::Home);
+            match config_main(cfg, ws, &homes).filter(|_| home_mode) {
+                Some(main) => home_layout(cfg, ws, &main, mon),
+                None => homes.into_iter().collect(),
+            }
         })
+    }
+
+    /// Изменённый прямоугольник места `entry` действует: в режимах `swap`
+    /// и `stack` всегда, а у приложения режима `home` — только на его
+    /// домашнем месте; в главной ячейке и в чужой свободной ячейке окно
+    /// получает геометрию ячейки (изменение home-mode-layout, решение D4).
+    pub fn moved_applies(&mut self, cfg: &Config, ws: &str, entry: &str, mon: (i32, i32)) -> bool {
+        cfg.app_mode(ws, entry) != Mode::Home || self.at_home(cfg, ws, entry, mon)
+    }
+
+    /// Запись `entry` стоит на своём домашнем месте — месте из раздела
+    /// workspace эффективного конфига. Запись, которой в разделе нет
+    /// (место из снимка сессии), считается стоящей дома.
+    pub fn at_home(&mut self, cfg: &Config, ws: &str, entry: &str, mon: (i32, i32)) -> bool {
+        match home_place(cfg, ws, entry, mon) {
+            Some(h) => self.cells_of(cfg, ws, mon).get(entry) == Some(&h),
+            None => true,
+        }
     }
 
     /// Место окна приложения по правилу из спецификации ws-daemon
@@ -172,8 +184,10 @@ impl State {
     pub fn rect_for(&mut self, cfg: &Config, ws: &str, app: &str, mon: (i32, i32)) -> Option<PxRect> {
         let owner = if self.cells_of(cfg, ws, mon).contains_key(app) { Some(app) } else { cfg.family_of(app).filter(|f| self.cells.get(ws).is_some_and(|c| c.contains_key(*f))) };
         let Some(entry) = owner else { return Self::app_rect(cfg, app, mon) };
-        if let Some(m) = self.moved.get(ws).and_then(|m| m.get(entry)) {
-            return Some(m.rect);
+        if let Some(r) = self.moved.get(ws).and_then(|m| m.get(entry)).map(|m| m.rect)
+            && self.moved_applies(cfg, ws, entry, mon)
+        {
+            return Some(r);
         }
         self.base_rect(cfg, ws, entry, mon)
     }
@@ -228,6 +242,78 @@ impl State {
         self.main.remove(ws);
         self.geom.remove(ws);
     }
+}
+
+/// Домашние места записей раздела workspace эффективного конфига в порядке
+/// раздела: ячейка шаблона или прямоугольник записи (у дополнительного
+/// приложения сессии — прямоугольник его записи).
+pub fn home_places(cfg: &Config, ws: &str, mon: (i32, i32)) -> Vec<(String, Place)> {
+    cfg.workspaces.get(ws).map(|w| w.apps.keys().filter_map(|a| Some((a.clone(), home_place(cfg, ws, a, mon)?))).collect()).unwrap_or_default()
+}
+
+/// Домашнее место записи `entry` раздела workspace; `None` — записи нет.
+pub fn home_place(cfg: &Config, ws: &str, entry: &str, mon: (i32, i32)) -> Option<Place> {
+    Some(match &cfg.workspaces.get(ws)?.apps.get(entry)?.place {
+        Placement::Cell(c) => Place::Cell(c.clone()),
+        Placement::Rect { rect } => Place::Rect { rect: rect.resolve(mon.0, mon.1) },
+    })
+}
+
+/// Главное приложение по конфигу: поле `main` раздела, если такая запись
+/// есть, иначе первая запись, чей дом — главная ячейка шаблона.
+pub fn config_main(cfg: &Config, ws: &str, homes: &[(String, Place)]) -> Option<String> {
+    let w = cfg.workspaces.get(ws)?;
+    let main_cell = cfg.templates.get(&w.template).map(|t| t.main.clone());
+    w.main
+        .clone()
+        .filter(|m| homes.iter().any(|(a, _)| a == m))
+        .or_else(|| homes.iter().find(|(_, p)| matches!((p, &main_cell), (Place::Cell(c), Some(mc)) if c == mc)).map(|(a, _)| a.clone()))
+}
+
+/// Раскладка по домам (изменение home-mode-layout, решения D1–D3): главное
+/// приложение `main` — в главной ячейке шаблона; каждая другая запись —
+/// на своём домашнем месте, если это не главная ячейка; записи, чей дом —
+/// главная ячейка, вытеснены и по порядку раздела берут свободные ячейки:
+/// сначала дом `main`, если его не занимает ничей дом, затем остальные
+/// ячейки шаблона в порядке файла. Свободной ячейкой считается ячейка, которая
+/// не главная, не дом записи, оставшейся дома, и не занята вытесненной
+/// записью раньше. Без свободной ячейки вытесненная запись встаёт стопкой
+/// в дом `main`. Пустой результат — workspace или шаблона нет.
+pub fn home_layout(cfg: &Config, ws: &str, main: &str, mon: (i32, i32)) -> BTreeMap<String, Place> {
+    let mut out = BTreeMap::new();
+    let Some(t) = cfg.workspaces.get(ws).and_then(|w| cfg.templates.get(&w.template)) else { return out };
+    let main_cell = t.main.clone();
+    let homes = home_places(cfg, ws, mon);
+    let main_home = homes.iter().find(|(a, _)| a == main).map(|(_, p)| p.clone());
+    let mut taken: BTreeSet<String> = BTreeSet::from([main_cell.clone()]);
+    let mut displaced = Vec::new();
+    for (app, home) in homes.iter().filter(|(a, _)| a != main) {
+        match home {
+            Place::Cell(c) if *c == main_cell => displaced.push(app.clone()),
+            _ => {
+                if let Place::Cell(c) = home {
+                    taken.insert(c.clone());
+                }
+                out.insert(app.clone(), home.clone());
+            }
+        }
+    }
+    let first = match &main_home {
+        Some(Place::Cell(c)) => Some(c.clone()),
+        _ => None,
+    };
+    let mut free: Vec<String> = Vec::new();
+    for c in first.into_iter().chain(t.cells.keys().cloned()) {
+        if !taken.contains(&c) && !free.contains(&c) {
+            free.push(c);
+        }
+    }
+    for app in displaced {
+        let place = if free.is_empty() { main_home.clone().unwrap_or_else(|| Place::Cell(main_cell.clone())) } else { Place::Cell(free.remove(0)) };
+        out.insert(app, place);
+    }
+    out.insert(main.to_string(), Place::Cell(main_cell));
+    out
 }
 
 // ---- Восстановление экземпляров ----------------------------------------------

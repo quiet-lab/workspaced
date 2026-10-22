@@ -295,11 +295,16 @@ pub fn d_move_to(addr: &str, workspace: &str) -> String {
     format!("hl.dsp.window.move({{ workspace = \"{workspace}\", follow = false, {} }})", win(addr))
 }
 
-pub fn d_place(addr: &str, r: PxRect) -> [String; 2] {
-    [
-        format!("hl.dsp.window.resize({{ x = {}, y = {}, relative = false, {} }})", r.w, r.h, win(addr)),
-        format!("hl.dsp.window.move({{ x = {}, y = {}, relative = false, {} }})", r.x, r.y, win(addr)),
-    ]
+/// Поставить окно в прямоугольник `r`. Hyprland 0.56.2 меняет размер
+/// плавающего окна вокруг его центра: при нечётной разнице высот (1065 →
+/// 2140) положение становится дробным, и окно после переноса оказывается
+/// на пиксель выше заданного (2141 вместо 2140). Поэтому размер и положение
+/// задаются дважды: вторая пара снимает дробную половину пикселя, и окно
+/// встаёт ровно в `r` (изменение home-mode-layout, решение D9).
+pub fn d_place(addr: &str, r: PxRect) -> [String; 4] {
+    let resize = format!("hl.dsp.window.resize({{ x = {}, y = {}, relative = false, {} }})", r.w, r.h, win(addr));
+    let mv = format!("hl.dsp.window.move({{ x = {}, y = {}, relative = false, {} }})", r.x, r.y, win(addr));
+    [resize.clone(), mv.clone(), resize, mv]
 }
 
 /// Снять полноэкранный режим композитора с активного окна: `mode` — "fullscreen" (2)

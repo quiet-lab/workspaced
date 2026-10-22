@@ -1597,22 +1597,82 @@ impl Daemon {
         }
     }
 
+    /// Поставить приложение `app` (запись раздела) на главное место в режиме
+    /// `mode`: обменом мест (`swap`) или раскладкой по домам (`home`).
+    /// Режим `stack` места не меняет.
+    fn take_main(&mut self, ws: &str, app: &str, mode: Mode, clients: &[Client], ex: &mut Vec<String>) {
+        match mode {
+            Mode::Swap => self.swap_to_main(ws, app, clients, ex),
+            Mode::Home => self.home_to_main(ws, app, clients, ex),
+            Mode::Stack => {}
+        }
+    }
+
+    /// Раскладка по домам (изменение home-mode-layout, решения D1–D4):
+    /// вызванное приложение встаёт в главную ячейку шаблона и становится
+    /// главным, остальные — на свои домашние места, вытесненные —
+    /// в свободные ячейки (`home_to_main_plan`). Окна приложений, чьё место
+    /// изменилось, встают в прямоугольники новых мест стопкой; приложение,
+    /// вернувшееся домой, — в свой изменённый прямоугольник, если он есть.
+    /// Окна приложений, чьё место не изменилось, не двигаются. Раскладку
+    /// перед этим снимает цикл. Диспетчеры дописываются в `ex`.
+    fn home_to_main(&mut self, ws: &str, app: &str, clients: &[Client], ex: &mut Vec<String>) {
+        let cfg = self.cfg.clone();
+        let ws_apps = self.ws_apps(ws);
+        let before = self.st.main_app(&cfg, ws, self.mon);
+        let changed = home_to_main_plan(&mut self.st, &cfg, ws, app, self.mon);
+        if changed.is_empty() {
+            return;
+        }
+        let cells = self.st.cells.get(ws).cloned().unwrap_or_default();
+        let show = |p: Option<&Place>| match p {
+            Some(Place::Cell(c)) => c.clone(),
+            Some(Place::Rect { rect }) => format!("{},{} {}×{}", rect.x, rect.y, rect.w, rect.h),
+            None => "нет".to_string(),
+        };
+        log::info!(
+            "{ws}: {app} в главной ячейке (прежнее главное — {}), места: {}",
+            before.as_deref().unwrap_or("нет"),
+            changed.iter().map(|a| format!("{a} → {}", show(cells.get(a)))).collect::<Vec<_>>().join(", ")
+        );
+        let n = self.current;
+        for name in &changed {
+            let Some(r) = self.st.rect_for(&cfg, ws, name, self.mon) else { continue };
+            let wins: Vec<&Client> = placed_windows(&cfg, clients, ws, &ws_apps, name).into_iter().filter(|c| !c.on_hidden()).collect();
+            for c in &wins {
+                if c.desktop() != Some(n) {
+                    ex.push(hypr::d_move_to(&c.address, &n.to_string()));
+                }
+                ex.extend(hypr::d_place(&c.address, r));
+                self.st.geom.entry(ws.to_string()).or_default().insert(c.address.clone(), r);
+            }
+            // Приложение вернулось домой в изменённый прямоугольник: его
+            // занимает окно этого приложения (решение D9 изменения live-layout).
+            if self.st.moved_applies(&cfg, ws, name, self.mon)
+                && let (Some(m), Some(c)) = (self.st.moved.get_mut(ws).and_then(|m| m.get_mut(name.as_str())), wins.first())
+            {
+                m.owner = Some(c.address.clone());
+            }
+        }
+    }
+
     /// Выбрать окно (спецификация ws-daemon, «Цепочка приложения»): при
-    /// `swap` — режим обмена мест вызванного приложения — приложение окна
-    /// сначала занимает главное место; без него окно только поднимается
+    /// `place` — режим вызванного приложения, ставящий его на главное место
+    /// (`swap` или `home`), — приложение окна сначала занимает главное место
+    /// по правилу режима; без него окно только поднимается
     /// наверх и получает фокус. Режим задаёт вызванное приложение, а не
     /// workspace (изменение workspace-overrides, решение D7); без обмена
     /// выбирается и окно, только что открытое или перетащенное в workspace
     /// (изменение shared-windows, решение D15).
-    fn select_window(&mut self, ws: &str, addr: &str, clients: &[Client], swap: bool) -> Result<()> {
+    fn select_window(&mut self, ws: &str, addr: &str, clients: &[Client], place: Option<Mode>) -> Result<()> {
         let cfg = self.cfg.clone();
         let ws_apps = self.ws_apps(ws);
         let mut ex = Vec::new();
-        if swap
+        if let Some(mode) = place
             && let Some(c) = clients.iter().find(|c| c.address == addr)
             && let Some(app) = ws_app_of(&cfg, ws, &ws_apps, c)
         {
-            self.swap_to_main(ws, &app, clients, &mut ex);
+            self.take_main(ws, &app, mode, clients, &mut ex);
         }
         ex.push(hypr::d_focus_window(addr));
         ex.push(hypr::d_bring_to_top());
@@ -1655,7 +1715,11 @@ impl Daemon {
         let (mode, entry) = cycle_mode(&cfg, ws, app);
         let entries: Vec<String> = group.iter().map(|a| cycle_mode(&cfg, ws, a).1).collect();
         let label = group.join(", ");
-        let swap = mode == Mode::Swap;
+        // Режимы swap и home ведут цикл одинаково — выбрать экземпляр значит
+        // поставить приложение на главное место, — различается только
+        // расстановка остальных (изменение home-mode-layout, решение D1).
+        let swap = mode.takes_main();
+        let place = swap.then_some(mode);
         let wins = group_windows(&cfg, &clients, ws, &ws_apps, group);
         let order: Vec<String> = wins.iter().filter(|c| !c.on_hidden()).map(|c| c.address.clone()).collect();
         if order.is_empty() && !wins.is_empty() {
@@ -1703,21 +1767,19 @@ impl Daemon {
                 // приложение сначала занимает главное место, и окно появляется
                 // уже на нём, а прежнее главное уходит на место приложения.
                 let mut ex = Vec::new();
-                if swap {
-                    self.swap_to_main(ws, &entry, &clients, &mut ex);
-                }
+                self.take_main(ws, &entry, mode, &clients, &mut ex);
                 self.hypr.dispatch_all(&ex)?;
                 let rect = self.st.rect_for(&cfg, ws, app, self.mon);
                 self.spawn(app, Some(ws), n, rect.map(Target::Place).unwrap_or(Target::Free(None)), true, false)
             }
-            CycleStep::Select(addr) => self.select_window(ws, &addr, &clients, swap && start != Start::Joined),
+            CycleStep::Select(addr) => self.select_window(ws, &addr, &clients, place.filter(|_| start != Start::Joined)),
             CycleStep::Back(addr) => {
                 log::info!("{ws}: цикл {label} закончен, возврат к окну {addr}");
-                self.select_window(ws, &addr, &clients, swap)
+                self.select_window(ws, &addr, &clients, place)
             }
             CycleStep::NextApp(addr) => {
                 log::info!("{ws}: цикл {label} закончен, prev нет — следующее приложение workspace, окно {addr}");
-                self.select_window(ws, &addr, &clients, swap)
+                self.select_window(ws, &addr, &clients, place)
             }
         }
     }
@@ -1854,7 +1916,7 @@ impl Daemon {
     }
 
     /// Новый экземпляр приложения в workspace `ws`, активном на текущем
-    /// столе. В режиме обмена мест приложение сначала занимает главное место,
+    /// столе. В режимах `swap` и `home` приложение сначала занимает главное место,
     /// как при запуске из цикла, и окно появляется уже на нём.
     fn spawn_in(&mut self, ws: &str, app: &str) -> Result<()> {
         let n = self.current;
@@ -1864,9 +1926,7 @@ impl Daemon {
         let cfg = self.cfg.clone();
         let (mode, entry) = cycle_mode(&cfg, ws, app);
         let mut ex = Vec::new();
-        if mode == Mode::Swap {
-            self.swap_to_main(ws, &entry, &clients, &mut ex);
-        }
+        self.take_main(ws, &entry, mode, &clients, &mut ex);
         self.hypr.dispatch_all(&ex)?;
         let rect = self.st.rect_for(&cfg, ws, app, self.mon);
         self.spawn(app, Some(ws), n, rect.map(Target::Place).unwrap_or(Target::Free(None)), true, true)
@@ -2910,6 +2970,12 @@ pub fn absorb_plan(cfg: &Config, st: &mut State, ws: &str, n: u8, clients: &[Cli
     let shown = |c: &&Client| c.desktop() == Some(n) && !c.on_hidden() && c.fullscreen == 0;
     for app in &apps {
         let Some(first) = placed_windows(cfg, clients, ws, &apps, app).into_iter().find(shown) else { continue };
+        // В режиме home изменённое место принадлежит дому приложения
+        // (изменение home-mode-layout, решение D4): окно, стоящее в главной
+        // или чужой свободной ячейке, его не меняет.
+        if !st.moved_applies(cfg, ws, app, mon) {
+            continue;
+        }
         let rect = first.rect();
         let base = st.base_rect(cfg, ws, app, mon);
         out.moved.push((app.clone(), (base != Some(rect)).then(|| Moved { rect, owner: Some(first.address.clone()) })));
@@ -4371,6 +4437,33 @@ pub fn swap_places(st: &mut State, ws: &str, main: Option<&str>, app: &str, main
     }
     st.moved.retain(|_, m| !m.is_empty());
     st.main.insert(ws.to_string(), app.to_string());
+}
+
+/// Раскладка по домам в памяти (изменение home-mode-layout, решения D1–D4):
+/// назначение мест workspace собирается заново из домашних мест раздела
+/// эффективного конфига с `app` в главной ячейке (`home_layout`), и `app`
+/// становится главным. Места, которых в разделе нет (записи из снимка
+/// сессии), остаются. Изменённый прямоугольник приложения режима `home`
+/// остаётся за его домом; у приложения другого режима, чьё место изменилось,
+/// он снимается — он принадлежал прежнему месту. Возвращает записи, чьё
+/// место изменилось, в порядке имён.
+pub fn home_to_main_plan(st: &mut State, cfg: &Config, ws: &str, app: &str, mon: (i32, i32)) -> Vec<String> {
+    let mut fresh = crate::state::home_layout(cfg, ws, app, mon);
+    if fresh.is_empty() {
+        return Vec::new();
+    }
+    let old = st.cells_of(cfg, ws, mon).clone();
+    for (k, v) in &old {
+        fresh.entry(k.clone()).or_insert_with(|| v.clone());
+    }
+    let changed: Vec<String> = fresh.iter().filter(|(k, v)| old.get(*k) != Some(*v)).map(|(k, _)| k.clone()).collect();
+    if let Some(m) = st.moved.get_mut(ws) {
+        m.retain(|a, _| !changed.contains(a) || cfg.app_mode(ws, a) == Mode::Home);
+    }
+    st.moved.retain(|_, m| !m.is_empty());
+    st.cells.insert(ws.to_string(), fresh);
+    st.main.insert(ws.to_string(), app.to_string());
+    changed
 }
 
 /// Нажатие клавиши неглавного приложения в режиме обмена мест (изменение
@@ -6692,5 +6785,213 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
         assert_eq!(toggle_step(std::slice::from_ref(&hidden), Some(&herdr), 1), ToggleStep::Show);
         assert_eq!(toggle_step(std::slice::from_ref(&other), Some(&herdr), 1), ToggleStep::Show);
         assert_eq!(toggle_step(std::slice::from_ref(&other), Some(&other), 1), ToggleStep::Show);
+    }
+
+    // ---- Режим home (изменение home-mode-layout) ------------------------------
+
+    /// Раздел `work` из решения пользователя: шаблон `thirds-split`, режим
+    /// `home`, herdr главный в center.
+    fn home_cfg(apps: &str) -> Config {
+        let text = format!(
+            "{CFG}\n[apps.chrome]\ncmd = \"google-chrome\"\nclass = \"^google-chrome$\"\n\n[templates.thirds-split]\nmain = \"center\"\n[templates.thirds-split.cells]\nleft_top = {{ x = -805, y = 10, w = 1920, h = 1065 }}\nleft_bottom = {{ x = -805, y = 1085, w = 1920, h = 1065 }}\ncenter = {{ x = 1125, y = 10, w = 1920, h = 2140 }}\nright = {{ x = 3055, y = 10, w = 1920, h = 2140 }}\n\n[workspaces.home]\ntemplate = \"thirds-split\"\nmode = \"home\"\nmain = \"herdr\"\n[workspaces.home.apps]\n{apps}\n"
+        );
+        Config::parse(&text).unwrap()
+    }
+
+    const HOME_FULL: &str = "herdr = \"center\"\nchromium = \"left_top\"\nchrome = \"left_bottom\"\nneovide = \"right\"";
+    const MON: (i32, i32) = (3840, 2160);
+    const CENTER: PxRect = PxRect { x: 1125, y: 10, w: 1920, h: 2140 };
+    const LEFT_TOP: PxRect = PxRect { x: -805, y: 10, w: 1920, h: 1065 };
+    const LEFT_BOTTOM: PxRect = PxRect { x: -805, y: 1085, w: 1920, h: 1065 };
+    const RIGHT: PxRect = PxRect { x: 3055, y: 10, w: 1920, h: 2140 };
+
+    /// Назначение мест workspace `home` строками «приложение=ячейка».
+    fn home_cells(st: &State) -> Vec<String> {
+        st.cells["home"]
+            .iter()
+            .map(|(a, p)| match p {
+                Place::Cell(c) => format!("{a}={c}"),
+                Place::Rect { rect } => format!("{a}={},{}", rect.x, rect.y),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn home_mode_user_example_full() {
+        let cfg = home_cfg(HOME_FULL);
+        let mut st = State::default();
+        assert_eq!(st.main_app(&cfg, "home", MON).as_deref(), Some("herdr"));
+        // Super+C: chromium в центр, herdr вытеснен в освобождённую left_top.
+        let changed = home_to_main_plan(&mut st, &cfg, "home", "chromium", MON);
+        assert_eq!(changed, vec!["chromium", "herdr"]);
+        assert_eq!(home_cells(&st), ["chrome=left_bottom", "chromium=center", "herdr=left_top", "neovide=right"]);
+        assert_eq!(st.main["home"], "chromium");
+        // Shift+Super+B: chrome в центр, chromium домой в left_top (herdr
+        // уступает хозяину), herdr — в свободную left_bottom.
+        let changed = home_to_main_plan(&mut st, &cfg, "home", "chrome", MON);
+        assert_eq!(changed, vec!["chrome", "chromium", "herdr"]);
+        assert_eq!(home_cells(&st), ["chrome=center", "chromium=left_top", "herdr=left_bottom", "neovide=right"]);
+        // В режиме swap тот же шаг дал бы chromium в left_bottom и herdr в left_top.
+        // Super+W: всё по домам, neovide не двигается.
+        let changed = home_to_main_plan(&mut st, &cfg, "home", "herdr", MON);
+        assert_eq!(changed, vec!["chrome", "herdr"]);
+        assert_eq!(home_cells(&st), ["chrome=left_bottom", "chromium=left_top", "herdr=center", "neovide=right"]);
+        assert_eq!(st.rect_for(&cfg, "home", "chrome", MON), Some(LEFT_BOTTOM));
+        assert_eq!(st.rect_for(&cfg, "home", "herdr", MON), Some(CENTER));
+        assert_eq!(st.rect_for(&cfg, "home", "neovide", MON), Some(RIGHT));
+    }
+
+    #[test]
+    fn home_mode_without_chrome_prefers_freed_cell() {
+        let cfg = home_cfg("herdr = \"center\"\nchromium = \"left_top\"\nneovide = \"right\"");
+        let mut st = State::default();
+        // Свободны left_top (освобождена chromium) и left_bottom: herdr
+        // берёт освобождённую, хотя по порядку шаблона они равны.
+        home_to_main_plan(&mut st, &cfg, "home", "chromium", MON);
+        assert_eq!(home_cells(&st), ["chromium=center", "herdr=left_top", "neovide=right"]);
+        // Вызванное приложение с домом в последней ячейке шаблона: освобождённая
+        // right предпочтительнее left_top, которая раньше по порядку.
+        let mut st = State::default();
+        home_to_main_plan(&mut st, &cfg, "home", "neovide", MON);
+        assert_eq!(home_cells(&st), ["chromium=left_top", "herdr=right", "neovide=center"]);
+    }
+
+    #[test]
+    fn home_mode_end_of_cycle_restores_homes() {
+        let cfg = home_cfg(HOME_FULL);
+        let mut st = State::default();
+        let start = st.cells_of(&cfg, "home", MON).clone();
+        home_to_main_plan(&mut st, &cfg, "home", "chromium", MON);
+        home_to_main_plan(&mut st, &cfg, "home", "chrome", MON);
+        // Конец цикла — то же действие для приложения, главного в начале цикла.
+        home_to_main_plan(&mut st, &cfg, "home", "herdr", MON);
+        assert_eq!(st.cells["home"], start);
+        assert_eq!(st.main["home"], "herdr");
+        // Нажатие главного приложения ничего не переставляет.
+        assert!(home_to_main_plan(&mut st, &cfg, "home", "herdr", MON).is_empty());
+    }
+
+    #[test]
+    fn home_mode_stacks_several_windows() {
+        let cfg = home_cfg(HOME_FULL);
+        let mut st = State::default();
+        st.desktop(1).active = Some("home".into());
+        let mut a = client("0x1", "chromium", "Новости", "1", &["app:chromium#1", "ws:home"]);
+        let mut b = client("0x2", "chromium", "Почта", "1", &["app:chromium#2", "ws:home"]);
+        (a.at, a.size, b.at, b.size) = ((-805, 10), (1920, 1065), (-805, 10), (1920, 1065));
+        let clients = [a, b];
+        absorb_into(&cfg, &mut st, "home", 1, &clients, MON);
+        assert!(st.moved.is_empty());
+        home_to_main_plan(&mut st, &cfg, "home", "chromium", MON);
+        // Оба окна chromium — одна запись, стопкой в главной ячейке.
+        let apps: Vec<String> = cfg.workspaces["home"].apps.keys().cloned().collect();
+        assert_eq!(placed_windows(&cfg, &clients, "home", &apps, "chromium").len(), 2);
+        assert_eq!(st.rect_for(&cfg, "home", "chromium", MON), Some(CENTER));
+    }
+
+    #[test]
+    fn home_mode_displaced_without_free_cell() {
+        // Шаблон из двух ячеек: neovide делит дом center с herdr. Вызван
+        // chromium: herdr берёт освобождённую left, neovide свободной ячейки
+        // не находит и встаёт стопкой в дом chromium.
+        let text = format!("{CFG}\n[templates.duo]\nmain = \"center\"\n[templates.duo.cells]\nleft = {{ x = -805, y = 10, w = 1920, h = 2140 }}\ncenter = {{ x = 1125, y = 10, w = 1920, h = 2140 }}\n\n[workspaces.duo]\ntemplate = \"duo\"\nmode = \"home\"\nmain = \"herdr\"\n[workspaces.duo.apps]\nherdr = \"center\"\nchromium = \"left\"\nneovide = \"center\"\n");
+        let cfg = Config::parse(&text).unwrap();
+        let mut st = State::default();
+        home_to_main_plan(&mut st, &cfg, "duo", "chromium", MON);
+        let cells = &st.cells["duo"];
+        assert_eq!(cells["chromium"], Place::Cell("center".into()));
+        assert_eq!(cells["herdr"], Place::Cell("left".into()));
+        assert_eq!(cells["neovide"], Place::Cell("left".into()));
+        // Прямоугольник записи сессии — её дом, вытеснить её нельзя.
+        let mut st = State::default();
+        st.extra.entry("home".into()).or_default().insert("calc".into(), ExtraApp { rect: PxRect { x: 2600, y: 1500, w: 600, h: 400 }, ..ExtraApp::default() });
+        let (cfg, _) = merge_extra(&home_cfg(HOME_FULL), &st.extra);
+        home_to_main_plan(&mut st, &cfg, "home", "chromium", MON);
+        assert_eq!(st.cells["home"]["calc"], Place::Rect { rect: PxRect { x: 2600, y: 1500, w: 600, h: 400 } });
+        assert_eq!(st.cells["home"]["herdr"], Place::Cell("left_top".into()));
+        // Само дополнительное приложение в центре: свободных ячеек нет,
+        // и herdr встаёт в освобождённый дом записи — её прямоугольник.
+        home_to_main_plan(&mut st, &cfg, "home", "calc", MON);
+        assert_eq!(st.cells["home"]["calc"], Place::Cell("center".into()));
+        assert_eq!(st.cells["home"]["herdr"], Place::Rect { rect: PxRect { x: 2600, y: 1500, w: 600, h: 400 } });
+    }
+
+    #[test]
+    fn home_mode_moved_rect_only_at_home() {
+        let cfg = home_cfg(HOME_FULL);
+        let mut st = State::default();
+        st.desktop(1).active = Some("home".into());
+        let wide = PxRect { x: -805, y: 10, w: 2400, h: 1065 };
+        let mut c = client("0x1", "chromium", "Новости", "1", &["app:chromium#1", "ws:home"]);
+        (c.at, c.size) = ((wide.x, wide.y), (wide.w, wide.h));
+        // Окно chromium растянуто дома: изменённое место у chromium.
+        absorb_into(&cfg, &mut st, "home", 1, std::slice::from_ref(&c), MON);
+        assert_eq!(st.rect_for(&cfg, "home", "chromium", MON), Some(wide));
+        // В главной ячейке окно получает геометрию ячейки, место остаётся за домом.
+        home_to_main_plan(&mut st, &cfg, "home", "chromium", MON);
+        assert_eq!(st.rect_for(&cfg, "home", "chromium", MON), Some(CENTER));
+        assert_eq!(st.moved["home"]["chromium"].rect, wide);
+        // Сдвиг в центре изменённого места не меняет.
+        (c.at, c.size) = ((1500, 300), (1000, 800));
+        absorb_into(&cfg, &mut st, "home", 1, std::slice::from_ref(&c), MON);
+        assert_eq!(st.moved["home"]["chromium"].rect, wide);
+        // Вернулось домой — снова в свой изменённый прямоугольник.
+        home_to_main_plan(&mut st, &cfg, "home", "herdr", MON);
+        assert_eq!(st.rect_for(&cfg, "home", "chromium", MON), Some(wide));
+        // herdr, растянутый дома в center, в чужой свободной ячейке получает
+        // её геометрию.
+        let center_wide = PxRect { x: 1000, y: 10, w: 2200, h: 2140 };
+        st.moved.entry("home".into()).or_default().insert("herdr".into(), Moved { rect: center_wide, owner: Some("0xh".into()) });
+        home_to_main_plan(&mut st, &cfg, "home", "chrome", MON);
+        assert_eq!(st.rect_for(&cfg, "home", "herdr", MON), Some(LEFT_BOTTOM));
+        assert_eq!(st.rect_for(&cfg, "home", "chromium", MON), Some(wide));
+        home_to_main_plan(&mut st, &cfg, "home", "herdr", MON);
+        assert_eq!(st.rect_for(&cfg, "home", "herdr", MON), Some(center_wide));
+    }
+
+    #[test]
+    fn home_mode_initial_layout_and_arrange() {
+        // Главное приложение из файла стоит в главной ячейке уже при сборке
+        // раскладки, остальные — по домам.
+        let text = home_cfg(HOME_FULL);
+        let mut cfg = text.clone();
+        cfg.workspaces.get_mut("home").unwrap().main = Some("chromium".into());
+        let mut st = State::default();
+        assert_eq!(st.main_app(&cfg, "home", MON).as_deref(), Some("chromium"));
+        assert_eq!(home_cells(&st), ["chrome=left_bottom", "chromium=center", "herdr=left_top", "neovide=right"]);
+        // Расстановка возвращает раскладку к файлу: main = herdr в центре.
+        let cfg = text;
+        let mut st = State::default();
+        home_to_main_plan(&mut st, &cfg, "home", "chromium", MON);
+        home_to_main_plan(&mut st, &cfg, "home", "chrome", MON);
+        st.moved.entry("home".into()).or_default().insert("neovide".into(), Moved { rect: PxRect { x: 2600, y: 10, w: 2000, h: 2140 }, owner: Some("0x3".into()) });
+        let clients = [
+            client("0x1", "wezterm-herdr", "herdr", "1", &["app:herdr#1", "ws:home"]),
+            client("0x2", "chromium", "Новости", "1", &["app:chromium#1", "ws:home"]),
+            client("0x3", "neovide", "[Scratch]", "1", &["app:neovide#1", "ws:home"]),
+            client("0x4", "google-chrome", "Почта", "1", &["app:chrome#1", "ws:home"]),
+        ];
+        let windows: Vec<&Client> = clients.iter().collect();
+        let plan = arrange_layout(&mut st, &cfg, Some("home"), &windows, MON, PANEL_AREA);
+        let place = |addr: &str| plan.iter().find(|(a, _)| a == addr).map(|(_, r)| *r).unwrap();
+        assert_eq!((place("0x1"), place("0x2"), place("0x3"), place("0x4")), (CENTER, LEFT_TOP, RIGHT, LEFT_BOTTOM));
+        assert_eq!(st.main["home"], "herdr");
+        assert!(st.moved.is_empty());
+    }
+
+    #[test]
+    fn home_mode_save_writes_homes() {
+        let cfg = home_cfg(HOME_FULL);
+        let mut st = State::default();
+        let wide = PxRect { x: -805, y: 10, w: 2400, h: 1065 };
+        st.moved.entry("home".into()).or_default().insert("chromium".into(), Moved { rect: wide, owner: None });
+        home_to_main_plan(&mut st, &cfg, "home", "chrome", MON);
+        let rec = |st: &mut State, app: &str| crate::save::record_place(st, &cfg, "home", app, MON);
+        // Запись пишет домашние места, а не нынешние: chrome — left_bottom,
+        // herdr — center; изменённый прямоугольник chromium — его дом.
+        assert_eq!(rec(&mut st, "chrome"), (Some(Place::Cell("left_bottom".into())), None));
+        assert_eq!(rec(&mut st, "herdr"), (Some(Place::Cell("center".into())), None));
+        assert_eq!(rec(&mut st, "chromium"), (Some(Place::Cell("left_top".into())), Some(wide)));
+        assert_eq!(st.main_app(&cfg, "home", MON).as_deref(), Some("chrome"));
     }
 }

@@ -138,12 +138,14 @@ impl PxRect {
     }
 }
 
-/// Шаблон геометрии: именованные ячейки и главная.
+/// Шаблон геометрии: именованные ячейки и главная. Порядок ячеек сохраняется
+/// таким, как в файле: по нему в режиме `home` вытесненное приложение ищет
+/// свободную ячейку (изменение home-mode-layout, решение D3).
 #[derive(Debug, Clone, Deserialize)]
 pub struct Template {
     pub main: String,
     #[serde(default)]
-    pub cells: BTreeMap<String, Rect>,
+    pub cells: IndexMap<String, Rect>,
 }
 
 /// Приложение: команда, аргументы, каталог, окружение, цепочка и, при
@@ -303,19 +305,25 @@ impl<'de> Deserialize<'de> for WsApp {
 }
 
 /// Поведение клавиши приложения в workspace (спецификация ws-daemon,
-/// «Цепочка приложения»): обмен мест с главным приложением или подъём окна
-/// на месте. Раскладку и память окон режим не задаёт (изменение live-layout,
-/// решение D8).
+/// «Цепочка приложения»): обмен мест с главным приложением, подъём окна
+/// на месте или раскладка по домам. В режимах `swap` и `stack` раскладку
+/// и память окон режим не задаёт (изменение live-layout, решение D8);
+/// в режиме `home` изменённое место приложения действует только на его
+/// домашнем месте (изменение home-mode-layout, решение D4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     /// Окна приложения занимают главное место, прежнее главное — их место.
     Swap,
     /// Окна стоят на своих местах, меняется только порядок по глубине и фокус.
     Stack,
+    /// Окна приложения занимают главную ячейку, остальные приложения стоят
+    /// на своих домашних местах, а вытесненные — в свободных ячейках
+    /// (изменение home-mode-layout, решение D1).
+    Home,
 }
 
 /// Допустимые значения поля `mode` у workspace и у записи приложения в нём.
-pub const MODES: [&str; 2] = ["swap", "stack"];
+pub const MODES: [&str; 3] = ["swap", "stack", "home"];
 
 fn default_mode() -> String {
     MODES[0].to_string()
@@ -336,7 +344,7 @@ pub struct Workspace {
     pub chain: Option<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
-    /// Поведение клавиши приложения: `swap` (по умолчанию) или `stack`.
+    /// Поведение клавиши приложения: `swap` (по умолчанию), `stack` или `home`.
     /// Значение проверяется при чтении конфига, поэтому дальше читается как есть.
     #[serde(default = "default_mode")]
     pub mode: String,
@@ -349,7 +357,17 @@ pub struct Workspace {
 impl Mode {
     /// Режим по значению поля `mode`; значение проверено при чтении конфига.
     pub fn of(name: &str) -> Mode {
-        if name == "stack" { Mode::Stack } else { Mode::Swap }
+        match name {
+            "stack" => Mode::Stack,
+            "home" => Mode::Home,
+            _ => Mode::Swap,
+        }
+    }
+
+    /// Выбор экземпляра ставит приложение на главное место: обменом мест
+    /// (`swap`) или раскладкой по домам (`home`).
+    pub fn takes_main(self) -> bool {
+        matches!(self, Mode::Swap | Mode::Home)
     }
 }
 
@@ -1132,7 +1150,21 @@ apps = { terminal = "right" }
         // Опечатка в режиме отклоняется с указанием workspace и допустимых значений.
         let bad = text.replace("mode = \"stack\"", "mode = \"stak\"");
         let err = Config::parse(&bad).unwrap_err().to_string();
-        assert!(err.contains("work") && err.contains("stak") && err.contains("swap") && err.contains("stack"), "{err}");
+        assert!(err.contains("work") && err.contains("stak") && err.contains("swap") && err.contains("stack") && err.contains("home"), "{err}");
+
+        // Режим home (изменение home-mode-layout).
+        let home = text.replace("mode = \"stack\"", "mode = \"home\"");
+        assert_eq!(Config::parse(&home).unwrap().workspaces["work"].mode(), Mode::Home);
+        assert!(Mode::Home.takes_main() && Mode::Swap.takes_main() && !Mode::Stack.takes_main());
+    }
+
+    #[test]
+    fn template_cells_keep_file_order() {
+        // Порядок ячеек шаблона — как в файле: по нему вытесненное
+        // приложение режима home ищет свободную ячейку.
+        let text = MINIMAL.replace("[templates.halves.cells]\n", "[templates.halves.cells]\nzeta = { x = 0, y = 0, w = 10, h = 10 }\n");
+        let cfg = Config::parse(&text).unwrap();
+        assert_eq!(cfg.templates["halves"].cells.keys().next().map(String::as_str), Some("zeta"));
     }
 
     /// Приложения браузеров и workspace для проверок записи приложения
@@ -1210,7 +1242,9 @@ calc = { rect = { x = 2600, y = 1500, w = 600, h = 400 } }
             assert!(err.contains("surf") && err.contains("chrome-ai"), "{bad}: {err}");
         }
         let err = Config::parse(&OVERRIDES.replace(entry, "chrome-ai = { cell = \"right\", mode = \"stak\" }")).unwrap_err().to_string();
-        assert!(err.contains("surf") && err.contains("chrome-ai") && err.contains("stak") && err.contains("swap") && err.contains("stack"), "{err}");
+        assert!(err.contains("surf") && err.contains("chrome-ai") && err.contains("stak") && err.contains("swap") && err.contains("stack") && err.contains("home"), "{err}");
+        let home = Config::parse(&OVERRIDES.replace(entry, "chrome-ai = { cell = \"right\", mode = \"home\" }")).unwrap();
+        assert_eq!(home.app_mode("surf", "chrome-ai"), Mode::Home);
         // Ячейка проверяется и в записи-таблице.
         let err = Config::parse(&OVERRIDES.replace(entry, "chrome-ai = { cell = \"top\" }")).unwrap_err().to_string();
         assert!(err.contains("surf") && err.contains("chrome-ai") && err.contains("top"), "{err}");

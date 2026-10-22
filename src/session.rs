@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use crate::config::{Config, PxRect};
 use crate::daemon::{self, Daemon, ExpectedForeign, launchable, proc_info};
 use crate::hypr::{self, Client};
-use crate::state::{Desktop, Foreign, Moved, RestoreEntry, RestoreState, Session, SessionWindow, SessionWorkspace, State};
+use crate::state::{Desktop, Foreign, Moved, Place, RestoreEntry, RestoreState, Session, SessionWindow, SessionWorkspace, State};
 
 pub fn sessions_dir() -> PathBuf {
     dirs::state_dir().unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".local/state")).join("workspaced").join("sessions")
@@ -331,10 +331,22 @@ fn apply_lists(d: &mut Daemon, s: &Session) {
     st.geom.clear();
     st.extra.clear();
     st.extra_wait.clear();
+    let file = d.cfg_file().clone();
     for (w, sw) in &s.workspaces {
         if !cfg_ws.contains(w) {
             continue;
         }
+        if let Some(cell) = stale_cell(&file, w, &sw.cells) {
+            // Шаблон workspace сменили после снимка (изменение
+            // home-mode-layout, решение D10): раскладка снимка называет
+            // ячейку, которой в шаблоне нет, и собирается заново из конфига.
+            log::info!("снимок: раскладка workspace {w} называет ячейку {cell}, которой нет в его шаблоне, — собирается заново из конфига");
+            if !sw.extra_apps.is_empty() {
+                st_extra(d, w, sw);
+            }
+            continue;
+        }
+        let st = d.state_mut();
         if let Some(m) = &sw.main {
             st.main.insert(w.clone(), m.clone());
         }
@@ -347,16 +359,32 @@ fn apply_lists(d: &mut Daemon, s: &Session) {
             st.cells.insert(w.clone(), sw.cells.clone());
         }
         if !sw.extra_apps.is_empty() {
-            st.extra.insert(w.clone(), sw.extra_apps.clone());
-            // Записи снимка ждут окон: без окон их держит только ожидание,
-            // пока окно не появится (изменение session-windows-transient,
-            // решение D2). Окна, уже открытые в workspace (перезапуск
-            // демона), выводят запись из ожидания при первой же сверке.
-            st.extra_wait.extend(sw.extra_apps.keys().map(|a| (w.clone(), a.clone())));
+            st_extra(d, w, sw);
         }
     }
-    st.lazy.clear();
+    d.state_mut().lazy.clear();
     d.rebuild_cfg();
+}
+
+/// Дополнительные приложения workspace `w` из снимка.
+fn st_extra(d: &mut Daemon, w: &str, sw: &SessionWorkspace) {
+    let st = d.state_mut();
+    st.extra.insert(w.to_string(), sw.extra_apps.clone());
+    // Записи снимка ждут окон: без окон их держит только ожидание,
+    // пока окно не появится (изменение session-windows-transient,
+    // решение D2). Окна, уже открытые в workspace (перезапуск
+    // демона), выводят запись из ожидания при первой же сверке.
+    st.extra_wait.extend(sw.extra_apps.keys().map(|a| (w.to_string(), a.clone())));
+}
+
+/// Ячейка из раскладки снимка, которой нет в нынешнем шаблоне workspace
+/// `w` файла конфига; `None` — все ячейки на месте.
+pub fn stale_cell(file: &Config, w: &str, cells: &BTreeMap<String, Place>) -> Option<String> {
+    let t = file.workspaces.get(w).and_then(|x| file.templates.get(&x.template))?;
+    cells.values().find_map(|p| match p {
+        Place::Cell(c) if !t.cells.contains_key(c) => Some(c.clone()),
+        _ => None,
+    })
 }
 
 /// Списки столов из снимка приводятся к правилу «workspace числится ровно
@@ -728,6 +756,18 @@ mod tests {
         assert!(d[&2].workspaces.is_empty());
         assert!(d[&3].workspaces.is_empty());
         assert_eq!(d[&3].active, None);
+    }
+
+    #[test]
+    fn stale_snapshot_cell_is_found() {
+        let cfg = Config::parse(CFG).unwrap();
+        let rect = Place::Rect { rect: PxRect { x: 0, y: 0, w: 10, h: 10 } };
+        let ok = BTreeMap::from([("chromium".to_string(), Place::Cell("left".into())), ("calc".to_string(), rect.clone())]);
+        assert_eq!(stale_cell(&cfg, "work", &ok), None);
+        // Шаблон сменили после снимка: ячейки left_top в thirds нет.
+        let old = BTreeMap::from([("chromium".to_string(), Place::Cell("left_top".into())), ("calc".to_string(), rect)]);
+        assert_eq!(stale_cell(&cfg, "work", &old).as_deref(), Some("left_top"));
+        assert_eq!(stale_cell(&cfg, "nope", &old), None);
     }
 
     const CFG: &str = r#"

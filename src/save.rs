@@ -13,7 +13,7 @@ use toml_edit::{DocumentMut, InlineTable, Item, Table, TableLike, Value, value};
 use crate::config::{Config, Mode, PxRect};
 use crate::daemon::{self, Daemon};
 use crate::hypr::{self, Client};
-use crate::state::{ExtraApp, Foreign, Place};
+use crate::state::{ExtraApp, Foreign, Place, State};
 
 fn rect_table(r: PxRect) -> InlineTable {
     let mut t = InlineTable::new();
@@ -51,6 +51,24 @@ pub fn place_item(cells: &BTreeMap<String, PxRect>, base: Option<&Place>, rect: 
         Some((name, _)) => Some(value(name.as_str())),
         None => Some(Item::Value(rect_item(r))),
     }
+}
+
+/// Место записи `app` workspace `ws` для команды записи workspace: исходное
+/// место и прямоугольник, по которым `place_item` выбирает имя ячейки или
+/// `rect`. У приложения режима `home` пишется его домашнее место из раздела
+/// эффективного конфига, а изменённый прямоугольник — только тот, что
+/// принадлежит дому (изменение home-mode-layout, решение D6): нынешнее место
+/// в главной или чужой свободной ячейке в файл не попадает. У остальных —
+/// место в раскладке и прямоугольник места (решение D11 изменения
+/// live-layout).
+pub fn record_place(st: &mut State, cfg: &Config, ws: &str, app: &str, mon: (i32, i32)) -> (Option<Place>, Option<PxRect>) {
+    if cfg.app_mode(ws, app) == Mode::Home
+        && let Some(home) = crate::state::home_place(cfg, ws, app, mon)
+    {
+        let rect = st.moved.get(ws).and_then(|m| m.get(app)).map(|m| m.rect);
+        return (Some(home), rect);
+    }
+    (st.cells_of(cfg, ws, mon).get(app).cloned(), st.rect_for(cfg, ws, app, mon))
 }
 
 /// Записать место приложения `name` в таблицу `apps` раздела workspace
@@ -360,8 +378,10 @@ pub fn save_workspace(d: &mut Daemon) -> Result<String> {
     }
     // Режим задаёт только пользователь, командой он не меняется; запись нужна,
     // чтобы раздел workspace в файле описывал его целиком.
-    if cfg.workspaces.get(&ws).map(|w| w.mode()) == Some(Mode::Stack) {
-        wtab["mode"] = value("stack");
+    match cfg.workspaces.get(&ws).map(|w| w.mode()) {
+        Some(Mode::Stack) => wtab["mode"] = value("stack"),
+        Some(Mode::Home) => wtab["mode"] = value("home"),
+        _ => {}
     }
     // Места приложений по раскладке в памяти: прямоугольник места,
     // совпадающий с ячейкой шаблона, — именем ячейки, иначе rect. У приложения
@@ -377,9 +397,11 @@ pub fn save_workspace(d: &mut Daemon) -> Result<String> {
     let mut places: Vec<(String, Item)> = Vec::new();
     let mut main_name = main_app.clone();
     for app in order.iter().filter(|a| !absent.contains(a)) {
-        let Some(place) = cells.get(app) else { continue };
-        let rect = d.state_mut().rect_for(&cfg, &ws, app, mon);
-        if let Some(item) = place_item(&template, Some(place), rect) {
+        if !cells.contains_key(app) {
+            continue;
+        }
+        let (place, rect) = record_place(d.state_mut(), &cfg, &ws, app, mon);
+        if let Some(item) = place_item(&template, place.as_ref(), rect) {
             let name = record_name(&cfg, d.cfg_file(), &ws, &clients, app);
             if name != *app {
                 log::info!("сохранение: запись {app} workspace {ws} держит только окна варианта {name} и записывается под его именем");
@@ -508,10 +530,10 @@ mod tests {
         daemon::absorb_into(cfg, st, ws, 1, clients, mon);
         let cells = st.cells_of(cfg, ws, mon).clone();
         cells
-            .iter()
-            .filter_map(|(app, place)| {
-                let rect = st.rect_for(cfg, ws, app, mon);
-                place_item(&thirds(cfg), Some(place), rect).map(|i| (app.clone(), i.to_string().trim().to_string()))
+            .keys()
+            .filter_map(|app| {
+                let (place, rect) = record_place(st, cfg, ws, app, mon);
+                place_item(&thirds(cfg), place.as_ref(), rect).map(|i| (app.clone(), i.to_string().trim().to_string()))
             })
             .collect()
     }
