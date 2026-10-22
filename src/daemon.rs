@@ -145,6 +145,10 @@ pub struct Daemon {
     last_plain: Option<String>,
     /// Окно-переключатель → окно, у которого был фокус перед его показом.
     toggle_back: HashMap<String, String>,
+    /// Приложение-переключатель, окно которого получило фокус последним
+    /// и ещё не потеряло его (изменение toggle-hide-on-blur): когда фокус
+    /// уходит в обычное окно или «в никуда», окна этого приложения прячутся.
+    toggle_focused: Option<String>,
 }
 
 pub fn socket_path() -> Result<PathBuf> {
@@ -202,7 +206,7 @@ pub fn run() -> Result<()> {
         let path = cfg_path.clone();
         std::thread::spawn(move || watch_config(path, tx));
     }
-    let mut d = Daemon { cfg: cfg.clone(), cfg_file: cfg, cfg_text, cfg_path, expected: Vec::new(), hypr, st: State::default(), mon, current, pending: Vec::new(), subs: Vec::new(), tx: tx.clone(), maximized: HashMap::new(), last_plain: None, toggle_back: HashMap::new() };
+    let mut d = Daemon { cfg: cfg.clone(), cfg_file: cfg, cfg_text, cfg_path, expected: Vec::new(), hypr, st: State::default(), mon, current, pending: Vec::new(), subs: Vec::new(), tx: tx.clone(), maximized: HashMap::new(), last_plain: None, toggle_back: HashMap::new(), toggle_focused: None };
     d.startup()?;
     d.settle_wait();
     // Конфиг при старте прочитан выше, значит привязки в нём могут быть новее
@@ -935,17 +939,11 @@ impl Daemon {
         log::info!("окно-переключатель {app} на столе {n}: {step:?}");
         match step {
             ToggleStep::Hide(addrs) => {
-                let mut ex: Vec<String> = addrs.iter().map(|a| hypr::d_move_to(a, "special:pool")).collect();
                 // Фокус возвращается окну, с которым пользователь работал
                 // до показа, если оно ещё на этом столе; иначе окно
                 // выбирает композитор.
-                if let Some(b) = self.toggle_back.remove(app)
-                    && clients.iter().any(|c| c.address == b && c.desktop() == Some(n) && !addrs.contains(&c.address))
-                {
-                    ex.push(hypr::d_focus_window(&b));
-                    ex.push(hypr::d_bring_to_top());
-                }
-                self.hypr.dispatch_all(&ex)
+                let back = self.toggle_back.remove(app).filter(|b| clients.iter().any(|c| c.address == *b && c.desktop() == Some(n) && !addrs.contains(&c.address)));
+                self.hide_toggle(&addrs, back.as_deref())
             }
             ToggleStep::Focus(addr) => {
                 // Окно уже на столе, но фокус у другого: это окно и станет
@@ -964,6 +962,36 @@ impl Daemon {
                 self.spawn(app, None, n, Target::Free(rect), true, false)
             }
         }
+    }
+
+    /// Спрятать окна переключателя на `special:pool`; `back` — окно, которому
+    /// вернуть фокус (у клавиши), у потери фокуса его нет: фокус уже ушёл.
+    fn hide_toggle(&mut self, addrs: &[String], back: Option<&str>) -> Result<()> {
+        let mut ex: Vec<String> = addrs.iter().map(|a| hypr::d_move_to(a, "special:pool")).collect();
+        if let Some(b) = back {
+            ex.push(hypr::d_focus_window(b));
+            ex.push(hypr::d_bring_to_top());
+        }
+        self.hypr.dispatch_all(&ex)
+    }
+
+    /// Потеря фокуса окном-переключателем (изменение toggle-hide-on-blur):
+    /// решение `blur_step` по окну, у которого фокус сейчас. Окна
+    /// приложения, потерявшего фокус, стоящие на обычных столах, прячутся
+    /// на `special:pool` тем же путём, что и по клавише, без возврата фокуса.
+    fn toggle_blur(&mut self, active: Option<&Client>) -> Result<()> {
+        let (hide, next) = blur_step(&self.cfg, self.toggle_focused.as_deref(), active);
+        self.toggle_focused = next;
+        let Some(app) = hide else { return Ok(()) };
+        self.toggle_back.remove(&app);
+        let clients = self.hypr.clients()?;
+        let addrs: Vec<String> = app_windows(&self.cfg, &clients, &app).into_iter().filter(|c| c.desktop().is_some()).map(|c| c.address.clone()).collect();
+        if addrs.is_empty() {
+            return Ok(());
+        }
+        let to = active.map_or_else(|| "фокуса нет ни у одного окна".to_string(), |c| format!("фокус у {} ({})", c.address, c.class));
+        log::info!("окно-переключатель {app}: потеря фокуса ({to}) — спрятано");
+        self.hide_toggle(&addrs, None)
     }
 
     /// Показать окна переключателя на столе `n`: окна приезжают туда, первое
@@ -1467,7 +1495,13 @@ impl Daemon {
     /// `activewindow`: опроса нет, сведение приходит от композитора. Из него
     /// выводится prev, когда цикл начинается с чужого окна.
     fn on_focus(&mut self) -> Result<()> {
-        let Some(c) = self.hypr.active_window()? else { return Ok(()) };
+        let active = self.hypr.active_window()?;
+        // Окно с фокусом спрашивается у композитора, а не берётся из события:
+        // событие, пришедшее раньше показа переключателя (пустой адрес между
+        // переносом окна на стол и фокусом), к этому моменту устарело
+        // и окно не спрячет (изменение toggle-hide-on-blur, решение D4).
+        self.toggle_blur(active.as_ref())?;
+        let Some(c) = active else { return Ok(()) };
         // Окно-переключатель на `special:pool` получает фокус только по
         // активации (клик по уведомлению, запрос приложения): композитор
         // при этом открывает весь `special:pool` поверх стола. Окно
@@ -3478,6 +3512,32 @@ pub fn toggle_step(wins: &[Client], active: Option<&Client>, n: u8) -> ToggleSte
         Some(c) => ToggleStep::Focus(c.address.clone()),
         None => ToggleStep::Show,
     }
+}
+
+/// Приложение-переключатель, которому принадлежит окно: по тегу экземпляра,
+/// а у окна без тега (диалог, окно, ещё не принятое демоном) — по `class`
+/// и `title` приложений конфига.
+fn toggle_app_of(cfg: &Config, c: &Client) -> Option<String> {
+    c.app().or_else(|| app_for_window(cfg, c)).filter(|a| cfg.is_toggle(a))
+}
+
+/// Решение о потере фокуса окном-переключателем (изменение
+/// toggle-hide-on-blur): `focused` — приложение-переключатель, окно которого
+/// держало фокус, `active` — окно с фокусом сейчас (`None` — фокус «в никуда»).
+/// Возвращает приложение, окна которого надо спрятать, и приложение,
+/// которое держит фокус теперь. Окно без класса и окно класса из
+/// `ignore_classes` (портал выбора файла, запрос пароля) потерей фокуса
+/// не считаются: переключатель остаётся показанным и ждёт, куда фокус
+/// уйдёт дальше. Окно того же приложения — тоже не потеря.
+pub fn blur_step(cfg: &Config, focused: Option<&str>, active: Option<&Client>) -> (Option<String>, Option<String>) {
+    let Some(c) = active else { return (focused.map(str::to_string), None) };
+    if let Some(app) = toggle_app_of(cfg, c) {
+        return (focused.filter(|f| *f != app).map(str::to_string), Some(app));
+    }
+    if classless(c) || cfg.ignored_class(&c.class) {
+        return (None, focused.map(str::to_string));
+    }
+    (focused.map(str::to_string), None)
 }
 
 /// Что делать с ожиданием запуска приложения.
@@ -6785,6 +6845,43 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
         assert_eq!(toggle_step(std::slice::from_ref(&hidden), Some(&herdr), 1), ToggleStep::Show);
         assert_eq!(toggle_step(std::slice::from_ref(&other), Some(&herdr), 1), ToggleStep::Show);
         assert_eq!(toggle_step(std::slice::from_ref(&other), Some(&other), 1), ToggleStep::Show);
+    }
+
+    #[test]
+    fn toggle_hides_on_blur() {
+        // Изменение toggle-hide-on-blur: потеря фокуса окном-переключателем.
+        let text = format!("ignore_classes = [\"termfilechooser\", \"pinentry.*\"]\n{CFG}\n[apps.telegram]\ntoggle = true\nchain = \"SUPER+T\"\ncmd = \"Telegram\"\nclass = '^org\\.telegram\\.desktop$'\nrect = {{ w = 1000, h = 1000 }}\n");
+        let cfg = Config::parse(&text).unwrap();
+        let tg = client("0x1", "org.telegram.desktop", "Telegram", "1", &["app:telegram#1"]);
+        let media = client("0x2", "org.telegram.desktop", "Просмотр медиа", "1", &["app:telegram#2"]);
+        let untagged = client("0x3", "org.telegram.desktop", "Выбор чата", "1", &[]);
+        let herdr = client("0x9", "wezterm-herdr", "herdr", "1", &["app:herdr#1", "ws:work"]);
+        let portal = client("0x7", "termfilechooser", "Выбор файла", "1", &[]);
+        let pin = client("0x8", "pinentry-qt", "Пароль", "1", &[]);
+        let noclass = client("0x6", "", "Диспетчер задач", "1", &[]);
+        let tg_s = Some("telegram");
+        let some = |a: &str| Some(a.to_string());
+        // Фокус пришёл в окно переключателя — его приложение держит фокус.
+        assert_eq!(blur_step(&cfg, None, Some(&tg)), (None, some("telegram")));
+        // Фокус ушёл в обычное окно или «в никуда» — спрятать.
+        assert_eq!(blur_step(&cfg, tg_s, Some(&herdr)), (some("telegram"), None));
+        assert_eq!(blur_step(&cfg, tg_s, None), (some("telegram"), None));
+        // Другое окно того же приложения, в том числе ещё без тега, — не потеря.
+        assert_eq!(blur_step(&cfg, tg_s, Some(&media)), (None, some("telegram")));
+        assert_eq!(blur_step(&cfg, tg_s, Some(&untagged)), (None, some("telegram")));
+        // Портал, запрос пароля, окно без класса — не потеря; переключатель
+        // ждёт, куда фокус уйдёт дальше.
+        for w in [&portal, &pin, &noclass] {
+            assert_eq!(blur_step(&cfg, tg_s, Some(w)), (None, some("telegram")), "{}", w.class);
+        }
+        // Из портала фокус вернулся в окно переключателя — ничего не прячется;
+        // ушёл в обычное окно — прячется.
+        assert_eq!(blur_step(&cfg, tg_s, Some(&tg)), (None, some("telegram")));
+        assert_eq!(blur_step(&cfg, tg_s, Some(&herdr)), (some("telegram"), None));
+        // Переключатель фокуса не держал — прятать нечего.
+        assert_eq!(blur_step(&cfg, None, Some(&herdr)), (None, None));
+        assert_eq!(blur_step(&cfg, None, None), (None, None));
+        assert_eq!(blur_step(&cfg, None, Some(&portal)), (None, None));
     }
 
     // ---- Режим home (изменение home-mode-layout) ------------------------------
