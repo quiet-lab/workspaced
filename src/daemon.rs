@@ -566,7 +566,7 @@ impl Daemon {
             Event::MoveWindow { .. } => self.broadcast(),
             Event::Workspace { name } => {
                 if let Ok(n) = name.parse::<u8>()
-                    && (1..=8).contains(&n)
+                    && self.cfg.is_desktop(n)
                 {
                     self.current = n;
                     if let Some(ws) = self.st.lazy.remove(&n) {
@@ -2084,7 +2084,7 @@ impl Daemon {
     /// Специальный стол (`special:*`) номера не имеет, и кэш тогда остаётся
     /// прежним.
     fn sync_current(&mut self) -> u8 {
-        let live = self.hypr.active_workspace().ok().and_then(|w| w.parse::<u8>().ok()).filter(|n| (1..=8).contains(n));
+        let live = self.hypr.active_workspace().ok().and_then(|w| w.parse::<u8>().ok()).filter(|n| self.cfg.is_desktop(*n));
         if let Some(n) = live
             && n != self.current
         {
@@ -2102,9 +2102,7 @@ impl Daemon {
     /// преемник (`successor`): его окна возвращаются на тот стол, а композитор
     /// остаётся на столе `n`.
     pub fn move_desktop(&mut self, n: u8) -> Result<()> {
-        if !(1..=8).contains(&n) {
-            bail!("стол должен быть от 1 до 8, получено {n}");
-        }
+        self.cfg.check_desktop(n)?;
         let cur = self.sync_current();
         let active = self.st.desktops.get(&cur).and_then(|d| d.active.clone());
         match move_step(cur, n, active.as_deref()) {
@@ -2541,7 +2539,15 @@ impl Daemon {
         };
         let cmd = req.get("cmd").and_then(|c| c.as_str()).unwrap_or("");
         let s = |k: &str| req.get(k).and_then(|v| v.as_str()).map(String::from);
-        let desktop = req.get("desktop").and_then(|v| v.as_u64()).map(|v| v as u8);
+        let desktop = req.get("desktop").and_then(|v| v.as_u64()).map(|v| u8::try_from(v).unwrap_or(u8::MAX));
+        // Стол вне 1…desktops отклоняется у любой команды со столом
+        // (изменение four-desktops).
+        if let Some(n) = desktop
+            && let Err(e) = self.cfg.check_desktop(n)
+        {
+            log::warn!("{cmd}: {e:#}");
+            return err_json(format!("{e:#}"));
+        }
         // Новый экземпляр вместо цикла по окнам (`key --new`, `app --new`).
         let new = req.get("new").and_then(|v| v.as_bool()).unwrap_or(false);
         let r = match cmd {
@@ -2615,7 +2621,8 @@ impl Daemon {
     fn state_json(&self) -> Value {
         let clients = self.hypr.clients().unwrap_or_default();
         let mut desktops = serde_json::Map::new();
-        for n in 1..=8u8 {
+        // Только столы сессии 1…desktops (изменение four-desktops).
+        for n in 1..=self.cfg.desktop_count() {
             let d = self.st.desktops.get(&n).cloned().unwrap_or_default();
             let list: Vec<Value> = d
                 .workspaces
@@ -4143,7 +4150,7 @@ pub fn restore_place(st: &mut State, cfg: &Config, e: &RestoreEntry, actives: &B
     let members = entry_members(cfg, e);
     if members.is_empty() {
         return match e.desktop.parse::<u8>() {
-            Ok(n) if (1..=8).contains(&n) => (Home::Desktop(n), Some(e.rect)),
+            Ok(n) if cfg.is_desktop(n) => (Home::Desktop(n), Some(e.rect)),
             _ if e.desktop == "pool" => (Home::Pool, None),
             _ => (Home::Desktop(current), Some(e.rect)),
         };

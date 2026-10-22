@@ -436,9 +436,9 @@ impl Desk {
             Desk::Str(s) => s.clone(),
         }
     }
-    /// Номер стола 1…8; `None` — не число или вне диапазона.
-    pub fn number(&self) -> Option<u8> {
-        self.text().trim().parse::<u8>().ok().filter(|n| (1..=8).contains(n))
+    /// Номер стола 1…`last`; `None` — не число или вне диапазона.
+    pub fn number(&self, last: u8) -> Option<u8> {
+        self.text().trim().parse::<u8>().ok().filter(|n| (1..=last).contains(n))
     }
 }
 
@@ -625,6 +625,11 @@ pub struct Config {
     /// приложений передаются композитору как записаны.
     #[serde(default)]
     pub gap: i32,
+    /// Число столов сессии, от 1 до [`MAX_DESKTOPS`]; без ключа — восемь
+    /// (изменение four-desktops). Им проверяются стол в `[startup]`, `desktop`
+    /// и `move` в `[[binds]]` и команды со столом.
+    #[serde(default)]
+    pub desktops: Option<i64>,
     #[serde(default)]
     pub templates: BTreeMap<String, Template>,
     #[serde(default)]
@@ -647,6 +652,10 @@ pub struct Config {
 
 /// Запуск приложения: программа, аргументы, рабочий каталог и сложенное окружение.
 pub type AppCommand = (String, Vec<String>, Option<String>, BTreeMap<String, String>);
+
+/// Наибольшее число столов: столько номеров у обычных столов Hyprland,
+/// которые демон считает столами сессии.
+pub const MAX_DESKTOPS: u8 = 8;
 
 /// Имя сущности, безопасное для командной строки и имени тега. Двоеточие и `#`
 /// недопустимы: ими демон отделяет части тега экземпляра `app:<имя>#<номер>`.
@@ -672,8 +681,33 @@ impl Config {
         Ok(cfg)
     }
 
+    /// Число столов сессии: ключ `desktops` или восемь без него. Значение
+    /// вне 1…[`MAX_DESKTOPS`] отклоняет `validate`.
+    pub fn desktop_count(&self) -> u8 {
+        self.desktops.and_then(|n| u8::try_from(n).ok()).filter(|n| (1..=MAX_DESKTOPS).contains(n)).unwrap_or(MAX_DESKTOPS)
+    }
+
+    /// Номер `n` — стол сессии (1…`desktops`).
+    pub fn is_desktop(&self, n: u8) -> bool {
+        (1..=self.desktop_count()).contains(&n)
+    }
+
+    /// Проверка номера стола команды: ошибка с допустимым диапазоном.
+    pub fn check_desktop(&self, n: u8) -> Result<()> {
+        if !self.is_desktop(n) {
+            bail!("стол должен быть от 1 до {}, получено {n}", self.desktop_count());
+        }
+        Ok(())
+    }
+
     /// Структурные проверки: имена, ссылки на шаблоны, ячейки и приложения, цепочки.
     pub fn validate(&self) -> Result<()> {
+        if let Some(n) = self.desktops
+            && !(1..=i64::from(MAX_DESKTOPS)).contains(&n)
+        {
+            bail!("desktops: число столов должно быть от 1 до {MAX_DESKTOPS}, получено {n}");
+        }
+        let last = self.desktop_count();
         for name in self.templates.keys().chain(self.apps.keys()).chain(self.workspaces.keys()) {
             if !valid_name(name) {
                 bail!("недопустимое имя {name:?}: разрешены буквы, цифры, «_», «-», «.»; двоеточие и «#» отделяют части тега экземпляра");
@@ -745,8 +779,8 @@ impl Config {
             if !self.workspaces.contains_key(&st.workspace) {
                 bail!("startup: workspace {:?} не описан в [workspaces]", st.workspace);
             }
-            if !(1..=8).contains(&st.desktop) {
-                bail!("startup: стол должен быть 1…8, получено {}", st.desktop);
+            if !(1..=last).contains(&st.desktop) {
+                bail!("startup: стол должен быть 1…{last}, получено {}", st.desktop);
             }
         }
         for (wname, w) in &self.workspaces {
@@ -801,6 +835,10 @@ impl Config {
                 if !b.chain.contains("$n") {
                     bail!("привязка {:?}: range задан, но в chain нет подстановки $n", b.chain);
                 }
+                // Серия переноса на стол: каждый номер серии — стол сессии.
+                if matches!(&b.action, Some(Action::Move(_))) && (from < 1 || to > i64::from(last)) {
+                    bail!("привязка {:?}: range = [{from}, {to}] выходит за столы 1…{last} (ключ desktops)", b.chain);
+                }
             }
             if let Some(Dispatch::Many(v)) = &b.dispatch
                 && v.is_empty()
@@ -843,9 +881,9 @@ impl Config {
                     bail!("привязка {:?}: в action нужен workspace или app", b.chain);
                 }
                 if let Some(d) = desktop
-                    && !(1..=8).contains(d)
+                    && !self.is_desktop(*d)
                 {
-                    bail!("привязка {:?}: desktop должен быть от 1 до 8", b.chain);
+                    bail!("привязка {:?}: desktop должен быть от 1 до {}, получено {d}", b.chain, self.desktop_count());
                 }
                 if let Some(w) = workspace
                     && !self.workspaces.contains_key(w)
@@ -1126,6 +1164,35 @@ apps = { terminal = "right" }
         assert!(Config::parse(&bad_ws).unwrap_err().to_string().contains("nope"));
         let bad_desk = format!("{MINIMAL}\n[startup]\nworkspace = \"work\"\ndesktop = 9\n");
         assert!(Config::parse(&bad_desk).unwrap_err().to_string().contains("1…8"));
+    }
+
+    #[test]
+    fn desktops_key_limits_desktop_numbers() {
+        // Изменение four-desktops: без ключа столов восемь, ключ задаёт 1…8.
+        assert_eq!(Config::parse(MINIMAL).unwrap().desktop_count(), 8);
+        let four = format!("desktops = 4\n{MINIMAL}");
+        let cfg = Config::parse(&four).unwrap();
+        assert_eq!(cfg.desktop_count(), 4);
+        assert!(cfg.is_desktop(4) && !cfg.is_desktop(5) && !cfg.is_desktop(0));
+        assert!(cfg.check_desktop(5).unwrap_err().to_string().contains("от 1 до 4, получено 5"));
+        for bad in ["0", "9", "300", "-1"] {
+            let err = Config::parse(&format!("desktops = {bad}\n{MINIMAL}")).unwrap_err().to_string();
+            assert!(err.contains("desktops") && err.contains(bad), "{err}");
+        }
+        // Стол в [startup] и в действии привязки — в пределах столов сессии.
+        let startup = format!("{four}\n[startup]\nworkspace = \"work\"\ndesktop = 5\n");
+        assert!(Config::parse(&startup).unwrap_err().to_string().contains("1…4, получено 5"));
+        let target = format!("{four}\n[[binds]]\nchain = \"SUPER+F5\"\naction = {{ desktop = 5, workspace = \"work\" }}\n");
+        assert!(Config::parse(&target).unwrap_err().to_string().contains("от 1 до 4, получено 5"));
+        // Серия переноса на стол не выходит за столы сессии.
+        let series = |to: u8| format!("{four}\n[[binds]]\nchain = \"CTRL+SUPER+$n\"\nrange = [1, {to}]\naction = {{ move = \"$n\" }}\n");
+        Config::parse(&series(4)).unwrap();
+        let err = Config::parse(&series(8)).unwrap_err().to_string();
+        assert!(err.contains("range = [1, 8]") && err.contains("1…4"), "{err}");
+        // Перенос на стол одним номером проверяется при сборке клавиш.
+        let one = format!("{four}\n[[binds]]\nchain = \"CTRL+SUPER+F6\"\naction = {{ move = 6 }}\n");
+        let err = Config::parse(&one).unwrap_err().to_string();
+        assert!(err.contains("от 1 до 4") && err.contains("6"), "{err}");
     }
 
     #[test]

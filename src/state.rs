@@ -338,7 +338,7 @@ pub struct RestoreEntry {
     pub app: String,
     pub instance: u32,
     pub workspaces: Vec<String>,
-    /// «1»…«8», «pool» или «hidden» на момент снимка.
+    /// «1»…«N» (N — ключ desktops), «pool» или «hidden» на момент снимка.
     pub desktop: String,
     pub rect: PxRect,
     pub rects: BTreeMap<String, PxRect>,
@@ -415,7 +415,7 @@ pub struct SessionWindow {
     /// совместимости, не учитывается и не записывается.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
-    /// «1»…«8», «pool» или «hidden».
+    /// «1»…«N» (N — ключ desktops), «pool» или «hidden».
     pub desktop: String,
     pub rect: PxRect,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

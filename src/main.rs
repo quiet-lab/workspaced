@@ -92,9 +92,9 @@ enum Command {
     },
     /// Поднять следующий workspace из списка текущего стола
     Next,
-    /// Перенести активный workspace текущего стола на стол 1…8 и перейти туда
+    /// Перенести активный workspace текущего стола на стол 1…N (ключ desktops) и перейти туда
     MoveDesktop {
-        /// Номер стола 1…8
+        /// Номер стола 1…N, N — ключ desktops конфига (по умолчанию 8)
         desktop: u8,
     },
     /// Расставить окна текущего стола по описанию активного workspace
@@ -243,7 +243,7 @@ fn check() -> anyhow::Result<()> {
     let cfg = config::Config::load(&path)?;
     let binds = keys::collect(&cfg)?;
     println!("{}: конфиг корректен", path.display());
-    println!("шаблонов: {}, приложений: {}, workspace: {}, привязок: {}", cfg.templates.len(), cfg.apps.len(), cfg.workspaces.len(), binds.len());
+    println!("столов: {}, шаблонов: {}, приложений: {}, workspace: {}, привязок: {}", cfg.desktop_count(), cfg.templates.len(), cfg.apps.len(), cfg.workspaces.len(), binds.len());
     for w in cfg.workspaces.keys() {
         println!("  workspace {w}");
     }

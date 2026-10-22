@@ -213,7 +213,7 @@ pub(crate) fn substitute(b: &Bind, n: &str) -> Bind {
     e.exec = b.exec.as_ref().map(sub);
     e.desc = b.desc.as_ref().map(sub);
     // Номер стола в действии `move` подставляется так же, как в цепочке:
-    // одна запись разворачивается в серию Ctrl+Super+1…8.
+    // одна запись разворачивается в серию Ctrl+Super+1…4.
     e.action = b.action.as_ref().map(|a| match a {
         Action::Move(m) => Action::Move(MoveAction { desktop: Desk::Str(sub(&m.desktop.text())) }),
         other => other.clone(),
@@ -233,10 +233,10 @@ pub(crate) fn expand_range(b: &Bind) -> Vec<Bind> {
     (from..=to).map(|n| substitute(b, &n.to_string())).collect()
 }
 
-/// Действие записи `[[binds]]`. `strict` — номер стола в `move` обязан быть
-/// числом; без него (подпись серии «1…8» в подсказке клавиш) текст номера
-/// попадает в команду как есть.
-pub(crate) fn bind_act(b: &Bind, strict: bool) -> Result<Act> {
+/// Действие записи `[[binds]]`. `last` — номер последнего стола сессии:
+/// номер стола в `move` обязан быть числом 1…`last`; без него (подпись серии
+/// «1…4» в подсказке клавиш) текст номера попадает в команду как есть.
+pub(crate) fn bind_act(b: &Bind, last: Option<u8>) -> Result<Act> {
     let act = if let Some(a) = &b.action {
         Act::Daemon(match a {
             Action::Named(n) => match n.as_str() {
@@ -254,10 +254,12 @@ pub(crate) fn bind_act(b: &Bind, strict: bool) -> Result<Act> {
             // Номер стола проверяется здесь, а не при разборе конфига:
             // в записи с `range` на его месте стоит `$n`, и число
             // появляется только после разворачивания серии.
-            Action::Move(MoveAction { desktop }) => match desktop.number() {
-                Some(n) => format!("workspaced move-desktop {n}"),
-                None if !strict => format!("workspaced move-desktop {}", desktop.text()),
-                None => bail!("привязка {:?}: move должен быть номером стола от 1 до 8, получено {:?}", b.chain, desktop.text()),
+            Action::Move(MoveAction { desktop }) => match last {
+                None => format!("workspaced move-desktop {}", desktop.text()),
+                Some(last) => match desktop.number(last) {
+                    Some(n) => format!("workspaced move-desktop {n}"),
+                    None => bail!("привязка {:?}: move должен быть номером стола от 1 до {last}, получено {:?}", b.chain, desktop.text()),
+                },
             },
             Action::Target(TargetAction { desktop, workspace, app, pull, new }) => {
                 let mut cmd = match (workspace, app) {
@@ -373,7 +375,7 @@ pub fn collect(cfg: &Config) -> Result<Vec<Binding>> {
     for (i, raw) in cfg.binds.iter().enumerate() {
         for b in expand_range(raw) {
             let source = format!("binds[{i}] {:?}", b.chain);
-            let act = bind_act(&b, true)?;
+            let act = bind_act(&b, Some(cfg.desktop_count()))?;
             let flags = Flags { locked: b.locked, repeating: b.repeating, mouse: b.mouse, release: b.release };
             out.push(Binding { chain: parse_chain(&b.chain)?, source, act, flags, origin: Some(i) });
         }
@@ -713,7 +715,7 @@ fn sticky_state(
         } else {
             let b = v.as_bind(&path);
             cfg.check_action(&b)?;
-            let act = bind_act(&b, true)?;
+            let act = bind_act(&b, Some(cfg.desktop_count()))?;
             rest.retain(|k| k.key != lower);
             node.keys.push(StickyBind {
                 key: key.clone(),

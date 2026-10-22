@@ -158,6 +158,52 @@ fn read(name: &str) -> Result<Session> {
     toml::from_str(&text).with_context(|| format!("сессия {name}: ошибка разбора"))
 }
 
+/// Снимок для загрузки: прочитан и приведён к столам сессии.
+fn read_for_load(d: &Daemon, name: &str) -> Result<Session> {
+    let mut s = read(name)?;
+    for why in limit_desktops(&mut s, d.cfg().desktop_count()) {
+        log::warn!("сессия {name}: {why}");
+    }
+    Ok(s)
+}
+
+/// Записи снимка со столом выше `last` (ключ `desktops`) отбрасываются
+/// (изменение four-desktops, решение D2): список стола, окно без workspace,
+/// приписанное к такому столу, и посторонние окна этого стола; о пустом
+/// списке стола предупреждения нет. Окна,
+/// которые уже открыты, остаются там, где стоят. Стол снимка у окна
+/// с workspace не учитывается при восстановлении, поэтому такие записи
+/// остаются. Активный стол выше `last` заменяется первым столом.
+/// Возвращает причины для журнала.
+pub fn limit_desktops(s: &mut Session, last: u8) -> Vec<String> {
+    let beyond = |t: &str| t.parse::<u8>().is_ok_and(|n| n > last);
+    let mut why = Vec::new();
+    s.desktops.retain(|n, dsk| {
+        if beyond(n) {
+            // Пустой список ничего не несёт: снимки прежних версий
+            // записывали все восемь столов.
+            if !dsk.workspaces.is_empty() || dsk.active.is_some() {
+                why.push(format!("стол {n} вне столов 1…{last}: список {:?} отброшен", dsk.workspaces));
+            }
+            return false;
+        }
+        true
+    });
+    s.windows.retain(|w| {
+        if w.workspaces.is_empty() && beyond(&w.desktop) {
+            let what = w.app.clone().unwrap_or_else(|| w.cmd.join(" "));
+            why.push(format!("окно {what} на столе {} вне столов 1…{last}: запись отброшена", w.desktop));
+            return false;
+        }
+        true
+    });
+    if s.active_desktop > last {
+        why.push(format!("активный стол {} вне столов 1…{last}: активным станет стол 1", s.active_desktop));
+        s.active_desktop = 1;
+    }
+    why
+}
+
 pub fn save_default(d: &Daemon) -> Result<()> {
     write("default", &snapshot(d)?)
 }
@@ -207,7 +253,7 @@ pub fn list(_d: &Daemon) -> Result<Vec<Value>> {
 
 /// Восстановление при старте демона: списки целиком, окна лениво.
 pub fn restore_default(d: &mut Daemon) -> Result<()> {
-    let s = match read("default") {
+    let s = match read_for_load(d, "default") {
         Ok(s) => s,
         Err(e) => {
             log::info!("сессия default не загружена, пустое состояние: {e:#}");
@@ -526,7 +572,7 @@ pub fn load_pairs(live: &[(String, u32)], entries: &[(u32, usize)]) -> (Vec<(Str
 
 /// Загрузка сессии посреди работы: сверка, закрытие лишнего, запуск недостающего.
 pub fn load(d: &mut Daemon, name: &str) -> Result<()> {
-    let s = read(name)?;
+    let s = read_for_load(d, name)?;
     absorb_all(d)?;
     save_default(d)?;
     // Ожидания прежнего восстановления снимаются до сверки (решение D10).
@@ -721,6 +767,31 @@ mod tests {
 
     fn desk(ws: &[&str], active: Option<&str>) -> Desktop {
         Desktop { workspaces: ws.iter().map(|w| w.to_string()).collect(), active: active.map(String::from) }
+    }
+
+    #[test]
+    fn snapshot_desktops_beyond_limit_are_dropped() {
+        // Решение D2 изменения four-desktops: столы выше ключа desktops
+        // отбрасываются вместе со свободными окнами этих столов, окно
+        // с workspace остаётся (стол снимка для него не учитывается).
+        let mut s = Session { active_desktop: 6, ..Session::default() };
+        s.desktops.insert("2".into(), Desktop { workspaces: vec!["surf".into()], active: Some("surf".into()) });
+        s.desktops.insert("5".into(), Desktop { workspaces: vec!["dev".into()], active: Some("dev".into()) });
+        s.desktops.insert("6".into(), Desktop::default());
+        let mut member = win(Some("chrome"), "5");
+        member.workspaces = vec!["surf".into()];
+        s.windows = vec![win(None, "4"), win(None, "7"), win(Some("firefox"), "6"), member, win(Some("telegram"), "pool")];
+        let why = limit_desktops(&mut s, 4);
+        assert_eq!(s.desktops.keys().collect::<Vec<_>>(), vec!["2"]);
+        let left: Vec<&str> = s.windows.iter().map(|w| w.desktop.as_str()).collect();
+        assert_eq!(left, vec!["4", "5", "pool"]);
+        assert_eq!(s.active_desktop, 1);
+        assert_eq!(why.len(), 4, "{why:?}");
+        // В пределах столов снимок не меняется.
+        let mut same = Session { active_desktop: 3, ..Session::default() };
+        same.windows = vec![win(None, "4")];
+        assert!(limit_desktops(&mut same, 4).is_empty());
+        assert_eq!(same.windows.len(), 1);
     }
 
     #[test]

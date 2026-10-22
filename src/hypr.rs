@@ -114,9 +114,11 @@ impl Client {
     pub fn rect(&self) -> PxRect {
         PxRect { x: self.at.0, y: self.at.1, w: self.size.0, h: self.size.1 }
     }
-    /// Номер стола 1…8, если окно на обычном столе.
+    /// Номер стола 1…[`MAX_DESKTOPS`], если окно на обычном столе. Предел
+    /// ключа `desktops` здесь не действует: окно, оказавшееся на столе за ним,
+    /// всё равно учитывается на своём столе.
     pub fn desktop(&self) -> Option<u8> {
-        self.workspace.name.parse::<u8>().ok().filter(|n| (1..=8).contains(n))
+        self.workspace.name.parse::<u8>().ok().filter(|n| (1..=crate::config::MAX_DESKTOPS).contains(n))
     }
     pub fn on_hidden(&self) -> bool {
         self.workspace.name == "special:hidden"
