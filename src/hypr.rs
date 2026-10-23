@@ -51,6 +51,14 @@ pub struct Client {
     /// Полноэкранный режим композитора: 0 — нет, 1 — maximized, 2 — fullscreen.
     #[serde(default)]
     pub fullscreen: i32,
+    /// Рисуется ли окно поверх полноэкранного окна своего стола: композитор
+    /// ставит признак окну, получившему фокус поверх полноэкранного, и снимает
+    /// только при смене полноэкранного режима или опускании окна.
+    #[serde(default, rename = "allowedOverFullscreen")]
+    pub allowed_over_fullscreen: bool,
+    /// Закреплённое окно (`pin`) композитор рисует поверх полноэкранного всегда.
+    #[serde(default)]
+    pub pinned: bool,
     /// Номер окна у композитора: чем он меньше, тем раньше окно появилось.
     #[serde(default, rename = "stableId")]
     pub stable_id: String,
@@ -334,6 +342,36 @@ pub fn d_raise(addr: &str) -> String {
     format!("hl.dsp.window.alter_zorder({{ mode = \"top\", {} }})", win(addr))
 }
 
+/// Опустить названное окно вниз стопки, не меняя фокус. Заодно композитор
+/// снимает с окна признак «поверх полноэкранного» и прячет его под
+/// полноэкранным окном стола (`CWindowState::moveToZ` в Hyprland 0.56.2).
+pub fn d_lower(addr: &str) -> String {
+    format!("hl.dsp.window.alter_zorder({{ mode = \"bottom\", {} }})", win(addr))
+}
+
+/// Диспетчеры, после которых полноэкранное окно `addr` рисуется поверх
+/// остальных окон своего стола (изменение fullscreen-raise). Окно, получившее
+/// фокус поверх полноэкранного, Hyprland 0.56.2 помечает признаком
+/// `allowedOverFullscreen` и рисует отдельным проходом после полноэкранного;
+/// фокус и подъём полноэкранного окна признак не снимают, поэтому такое окно
+/// остаётся видимым над ним. Признак снимает опускание окна: все окна стола,
+/// кроме полноэкранного и закреплённых, опускаются сверху вниз, и порядок
+/// окон между собой сохраняется. Полноэкранный режим не трогается: снятие
+/// и повторная установка вывели бы браузер из полноэкранного видео.
+/// Пустой список — окно не в режиме fullscreen или над ним ничего нет.
+pub fn d_cover_fullscreen(clients: &[Client], addr: &str) -> Vec<String> {
+    let Some(fs) = clients.iter().find(|c| c.address == addr) else { return Vec::new() };
+    if fs.fullscreen != 2 {
+        return Vec::new();
+    }
+    let peer = |c: &&Client| c.address != fs.address && c.workspace.id == fs.workspace.id && !c.pinned;
+    if !clients.iter().filter(peer).any(|c| c.allowed_over_fullscreen) {
+        return Vec::new();
+    }
+    // Список композитора идёт снизу вверх по стопке; опускаются сверху вниз.
+    clients.iter().rev().filter(peer).map(|c| d_lower(&c.address)).collect()
+}
+
 pub fn d_focus_desktop(n: u8) -> String {
     format!("hl.dsp.focus({{ workspace = {n} }})")
 }
@@ -389,6 +427,36 @@ mod tests {
         // Тег без номера — экземпляр 1.
         let old = test_client("0x2", "neovide", "[Scratch]", "1", &["app:neovide"]);
         assert_eq!(old.app_instance(), Some(("neovide".to_string(), 1)));
+    }
+
+    #[test]
+    fn cover_fullscreen_lowers_windows_over_it() {
+        // Порядок списка — снизу вверх по стопке, как у `j/clients`.
+        let ai = test_client("0x1", "google-chrome-ai", "", "1", &[]);
+        let mut chrome = test_client("0x2", "google-chrome", "", "1", &[]);
+        let mut ya = test_client("0x3", "yandex-browser", "", "1", &[]);
+        let mut pin = test_client("0x4", "mpv", "", "1", &[]);
+        let mut other = test_client("0x5", "neovide", "", "2", &[]);
+        ya.fullscreen = 2;
+        chrome.allowed_over_fullscreen = true;
+        pin.pinned = true;
+        pin.allowed_over_fullscreen = true;
+        other.workspace.id = 2;
+        other.allowed_over_fullscreen = true;
+        let all = |chrome: &Client, ya: &Client| vec![ai.clone(), chrome.clone(), ya.clone(), pin.clone(), other.clone()];
+        // Сверху вниз: сначала Chrome, затем окно под ним; закреплённое окно
+        // и окно другого стола не трогаются.
+        assert_eq!(d_cover_fullscreen(&all(&chrome, &ya), "0x3"), vec![d_lower("0x2"), d_lower("0x1")]);
+        // Над полноэкранным окном ничего нет — диспетчеров нет.
+        let mut below = chrome.clone();
+        below.allowed_over_fullscreen = false;
+        assert!(d_cover_fullscreen(&all(&below, &ya), "0x3").is_empty());
+        // Выбрано окно не в режиме fullscreen, окно в режиме maximized или
+        // окна нет в списке — соседи не трогаются.
+        assert!(d_cover_fullscreen(&all(&chrome, &ya), "0x2").is_empty());
+        assert!(d_cover_fullscreen(&all(&chrome, &ya), "0x9").is_empty());
+        ya.fullscreen = 1;
+        assert!(d_cover_fullscreen(&all(&chrome, &ya), "0x3").is_empty());
     }
 
     #[test]

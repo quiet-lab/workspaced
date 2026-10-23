@@ -2532,6 +2532,20 @@ impl Daemon {
 
     // ---- Запросы и панель -------------------------------------------------------
 
+    /// Поднять активное полноэкранное окно над окнами своего стола, которые
+    /// композитор рисует поверх него ([`hypr::d_cover_fullscreen`]).
+    fn cover_fullscreen(&self) -> Result<()> {
+        let Some(active) = self.hypr.active_window()? else { return Ok(()) };
+        if active.fullscreen != 2 {
+            return Ok(());
+        }
+        let ex = hypr::d_cover_fullscreen(&self.hypr.clients()?, &active.address);
+        if !ex.is_empty() {
+            log::info!("полноэкранное окно {}: опущено окон над ним: {}", active.address, ex.len());
+        }
+        self.hypr.dispatch_all(&ex)
+    }
+
     fn handle_request(&mut self, line: &str) -> Value {
         let req: Value = match serde_json::from_str(line) {
             Ok(v) => v,
@@ -2609,6 +2623,17 @@ impl Daemon {
             "status" => Ok(self.status_json()),
             other => Err(anyhow::anyhow!("неизвестная команда {other:?}")),
         };
+        // Команды, выбирающие окно клавишей (приложение, workspace, перенос на
+        // стол), могут отдать фокус полноэкранному окну, над которым остались
+        // окна, выбранные раньше; после них оно поднимается над ними
+        // (изменение fullscreen-raise). Ошибка команды этому не мешает:
+        // диспетчеры набора выполняются все, даже когда композитор отвечает
+        // предупреждением на один из них.
+        if matches!(cmd, "raise" | "app" | "key" | "next" | "move-desktop")
+            && let Err(e) = self.cover_fullscreen()
+        {
+            log::warn!("{cmd}: полноэкранное окно: {e:#}");
+        }
         match r {
             Ok(v) => v,
             Err(e) => {
