@@ -76,13 +76,18 @@ pub fn snapshot(d: &Daemon) -> Result<Session> {
 /// live-layout, решение D13). Вместе с назначением мест пишется геометрия
 /// ячеек шаблона по файлу конфига `file` на мониторе `mon`: по ней загрузка
 /// узнаёт раскладку, снятую при другой геометрии (изменение
-/// snapshot-stale-rects).
+/// snapshot-stale-rects), — и домашние места записей раздела с главным
+/// приложением раздела: по ним загрузка узнаёт раскладку, снятую
+/// по прежнему разделу (изменение snapshot-stale-section).
 pub fn session_workspaces(st: &State, file: &Config, mon: (i32, i32)) -> BTreeMap<String, SessionWorkspace> {
     let mut workspaces: BTreeMap<String, SessionWorkspace> = BTreeMap::new();
     for (w, cells) in &st.cells {
         let sw = workspaces.entry(w.clone()).or_default();
         sw.cells = cells.clone();
         sw.grid = template_grid(file, w, mon).unwrap_or_default();
+        let homes = crate::state::home_places(file, w, mon);
+        sw.homes_main = crate::state::config_main(file, w, &homes);
+        sw.homes = homes.into_iter().collect();
     }
     for (w, m) in &st.main {
         workspaces.entry(w.clone()).or_default().main = Some(m.clone());
@@ -436,7 +441,9 @@ pub fn template_grid(file: &Config, w: &str, mon: (i32, i32)) -> Option<BTreeMap
 /// snapshot-stale-rects), если ячейка из таблицы `grid` снимка исчезла или
 /// стоит теперь в другом прямоугольнике. Одних имён мало: ячейка `center`
 /// может остаться в шаблоне с другими числами, и окна встали бы туда, где
-/// она была при снимке. Добавленная ячейка раскладку не портит.
+/// она была при снимке. Добавленная ячейка раскладку не портит. Раздел
+/// workspace правили после снимка (изменение snapshot-stale-section) —
+/// `stale_section`.
 pub fn stale_layout(file: &Config, w: &str, sw: &SessionWorkspace, mon: (i32, i32)) -> Option<String> {
     let grid = template_grid(file, w, mon)?;
     let named = sw.cells.values().find_map(|p| match p {
@@ -446,18 +453,59 @@ pub fn stale_layout(file: &Config, w: &str, sw: &SessionWorkspace, mon: (i32, i3
     if let Some(c) = named {
         return Some(format!("раскладка workspace {w} называет ячейку {c}, которой нет в его шаблоне"));
     }
-    sw.grid.iter().find(|(c, r)| grid.get(*c) != Some(*r)).map(|(c, r)| match grid.get(c) {
+    let moved = sw.grid.iter().find(|(c, r)| grid.get(*c) != Some(*r)).map(|(c, r)| match grid.get(c) {
         Some(now) => format!("ячейка {c} шаблона workspace {w} при снимке была {}, а сейчас {}", show(r), show(now)),
         None => format!("ячейки {c} из снимка в шаблоне workspace {w} больше нет"),
-    })
+    });
+    moved.or_else(|| stale_section(file, w, sw, mon))
+}
+
+/// Почему раскладка снимка `sw` снята по прежнему разделу workspace `w`
+/// файла конфига (изменение snapshot-stale-section); `None` — раздел
+/// с тех пор не менялся. Снимок нового формата хранит домашние места
+/// записей раздела (`homes`) и главное приложение раздела (`homes_main`):
+/// раскладка устарела, если набор записей, их места или главное приложение
+/// раздела теперь другие. Снимок прежнего формата сверяется по набору
+/// приложений: запись раздела, которой нет в назначениях мест снимка, —
+/// признак правки раздела после снимка. Записи дополнительных приложений
+/// сессии в разделе файла не числятся и сверке не подлежат. Пустая таблица
+/// назначений ничего не утверждает и устаревшей не считается.
+fn stale_section(file: &Config, w: &str, sw: &SessionWorkspace, mon: (i32, i32)) -> Option<String> {
+    if sw.cells.is_empty() {
+        return None;
+    }
+    let homes = crate::state::home_places(file, w, mon);
+    if sw.homes.is_empty() {
+        let (a, _) = homes.iter().find(|(a, _)| !sw.cells.contains_key(a))?;
+        return Some(format!("приложения {a} раздела workspace {w} в раскладке снимка нет"));
+    }
+    let now: BTreeMap<String, Place> = homes.iter().cloned().collect();
+    if let Some(a) = now.keys().find(|a| !sw.homes.contains_key(*a)) {
+        return Some(format!("приложение {a} добавлено в раздел workspace {w} после снимка"));
+    }
+    if let Some(a) = sw.homes.keys().find(|a| !now.contains_key(*a)) {
+        return Some(format!("приложения {a} из снимка в разделе workspace {w} больше нет"));
+    }
+    if let Some((a, p)) = now.iter().find(|(a, p)| sw.homes.get(*a) != Some(*p)) {
+        return Some(format!("место приложения {a} в разделе workspace {w} при снимке было {}, а сейчас {}", show_place(&sw.homes[a]), show_place(p)));
+    }
+    let main = crate::state::config_main(file, w, &homes);
+    (main != sw.homes_main).then(|| format!("главное приложение раздела workspace {w} при снимке было {}, а сейчас {}", sw.homes_main.as_deref().unwrap_or("не задано"), main.as_deref().unwrap_or("не задано")))
+}
+
+fn show_place(p: &Place) -> String {
+    match p {
+        Place::Cell(c) => format!("ячейка {c}"),
+        Place::Rect { rect } => show(rect),
+    }
 }
 
 fn show(r: &PxRect) -> String {
     format!("{},{} {}×{}", r.x, r.y, r.w, r.h)
 }
 
-/// Раскладки снимка, снятые не по нынешнему шаблону (`stale_layout`),
-/// отбрасываются вместе с прямоугольниками окон для этих workspace
+/// Раскладки снимка, снятые не по нынешнему шаблону или по прежнему
+/// разделу workspace (`stale_layout`), отбрасываются вместе с прямоугольниками окон для этих workspace
 /// (изменение snapshot-stale-rects): назначения мест, главное приложение
 /// и изменённые места соберутся из конфига, а окна встанут на места новой
 /// раскладки, а не туда, где стояли по старой. Прямоугольники окон для
@@ -474,6 +522,8 @@ pub fn forget_stale_layouts(s: &mut Session, file: &Config, mon: (i32, i32)) -> 
             sw.main = None;
             sw.cells.clear();
             sw.grid.clear();
+            sw.homes.clear();
+            sw.homes_main = None;
             sw.moved.clear();
             stale.push(w.clone());
         }
@@ -886,7 +936,7 @@ mod tests {
         let mon = (3840, 2160);
         let rect = Place::Rect { rect: PxRect { x: 0, y: 0, w: 10, h: 10 } };
         let sw = |cells: BTreeMap<String, Place>, grid: BTreeMap<String, PxRect>| SessionWorkspace { cells, grid, ..SessionWorkspace::default() };
-        let ok = BTreeMap::from([("chromium".to_string(), Place::Cell("left".into())), ("calc".to_string(), rect.clone())]);
+        let ok = BTreeMap::from([("chromium".to_string(), Place::Cell("left".into())), ("neovide".to_string(), Place::Cell("right".into())), ("chrome-ai".to_string(), Place::Cell("center".into())), ("calc".to_string(), rect.clone())]);
         assert_eq!(stale_layout(&cfg, "work", &sw(ok.clone(), BTreeMap::new()), mon), None);
         // Снимок с геометрией нынешнего шаблона годится.
         let grid = template_grid(&cfg, "work", mon).unwrap();
@@ -903,6 +953,45 @@ mod tests {
         let mut gone = grid;
         gone.insert("wide".into(), R1);
         assert!(stale_layout(&cfg, "work", &sw(ok, gone), mon).is_some_and(|w| w.contains("wide")));
+    }
+
+    #[test]
+    fn stale_section_is_found() {
+        let cfg = Config::parse(CFG).unwrap();
+        let mon = (3840, 2160);
+        let st = State::default();
+        // Снимок, записанный по нынешнему разделу, годится и после обмена
+        // мест: обмен меняет назначения, а не раздел.
+        let mut sw = session_workspaces(&{
+            let mut st = st;
+            st.cells_of(&cfg, "work", mon);
+            let main = st.main_app(&cfg, "work", mon);
+            daemon::swap_places(&mut st, "work", main.as_deref(), "neovide", "center", &|_| true);
+            st
+        }, &cfg, mon)["work"].clone();
+        assert_eq!(sw.cells["neovide"], Place::Cell("center".into()));
+        assert_eq!(sw.homes_main.as_deref(), Some("chrome-ai"));
+        assert_eq!(sw.homes["neovide"], Place::Cell("right".into()));
+        assert_eq!(stale_layout(&cfg, "work", &sw, mon), None);
+        // Место записи в разделе сменили после снимка.
+        let moved = Config::parse(&CFG.replace("neovide = \"right\", chrome-ai", "neovide = \"left\", chrome-ai")).unwrap();
+        assert!(stale_layout(&moved, "work", &sw, mon).is_some_and(|w| w.contains("neovide")));
+        // В раздел добавили запись.
+        let added = Config::parse(&CFG.replace("chrome-ai = \"center\" }", "chrome-ai = \"center\", calc = { rect = { x = 0, y = 0, w = 10, h = 10 } } }").replace("[apps.chrome-ai]", "[apps.calc]\ncmd = \"calc\"\n\n[apps.chrome-ai]")).unwrap();
+        assert!(stale_layout(&added, "work", &sw, mon).is_some_and(|w| w.contains("calc")));
+        // Главное приложение раздела сменили.
+        let main = Config::parse(&CFG.replace("template = \"thirds\"\napps = { chromium", "template = \"thirds\"\nmain = \"neovide\"\napps = { chromium")).unwrap();
+        assert!(stale_layout(&main, "work", &sw, mon).is_some_and(|w| w.contains("главное")));
+        // Запись убрали из раздела.
+        sw.homes.insert("gone".into(), Place::Cell("left".into()));
+        assert!(stale_layout(&cfg, "work", &sw, mon).is_some_and(|w| w.contains("gone")));
+        // Снимок прежнего формата: без таблицы домов сверяется набор
+        // приложений раздела с назначениями мест снимка.
+        let legacy = |cells: &[(&str, &str)]| SessionWorkspace { cells: cells.iter().map(|(a, c)| (a.to_string(), Place::Cell(c.to_string()))).collect(), ..SessionWorkspace::default() };
+        assert_eq!(stale_layout(&cfg, "work", &legacy(&[("chromium", "right"), ("neovide", "left"), ("chrome-ai", "center"), ("calc", "center")]), mon), None);
+        assert!(stale_layout(&cfg, "work", &legacy(&[("chromium", "left"), ("neovide", "right")]), mon).is_some_and(|w| w.contains("chrome-ai")));
+        // Пустая таблица назначений ничего не утверждает.
+        assert_eq!(stale_layout(&cfg, "work", &legacy(&[]), mon), None);
     }
 
     #[test]

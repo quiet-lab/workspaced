@@ -382,6 +382,12 @@ pub struct SessionWorkspace {
     /// чтобы вложенные таблицы шли после простых полей.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub main: Option<String>,
+    /// Главное приложение раздела workspace в файле конфига на момент
+    /// снимка (поле `main` раздела, без него — приложение главной ячейки
+    /// шаблона): вместе с `homes` по нему загрузка узнаёт, что раздел
+    /// правили после снимка (изменение snapshot-stale-section).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub homes_main: Option<String>,
     #[serde(default)]
     pub cells: BTreeMap<String, Place>,
     /// Ячейки шаблона workspace с их прямоугольниками на момент снимка:
@@ -390,6 +396,14 @@ pub struct SessionWorkspace {
     /// таблицы не содержит и сверяется только по именам ячеек.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub grid: BTreeMap<String, PxRect>,
+    /// Домашние места записей раздела workspace в файле конфига на момент
+    /// снимка: ячейка шаблона или прямоугольник в пикселях (изменение
+    /// snapshot-stale-section). Раскладка снимка устарела, если набор
+    /// записей раздела или их места с тех пор изменились. Снимок прежнего
+    /// формата этой таблицы не содержит и сверяется по набору приложений
+    /// в `cells`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub homes: BTreeMap<String, Place>,
     /// Изменённые места: приложение → прямоугольник. Владелец места (адрес
     /// окна) в снимок не пишется: адрес не переживает перезагрузку.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]

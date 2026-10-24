@@ -433,6 +433,15 @@ impl Daemon {
                 cells.entry(name.clone()).or_insert(Place::Rect { rect: e.rect });
             }
         }
+        // Запись раздела, о которой собранная раскладка молчит, получает
+        // своё домашнее место (спецификация ws-daemon, «Расстановка окон»):
+        // иначе её окно встало бы в центр рабочей области, а не туда, где
+        // его ждёт раздел.
+        let mon = self.mon();
+        for (ws, name, place) in missing_homes(&cfg, &self.st, mon) {
+            log::info!("workspace {ws}: у приложения {name} нет места в раскладке — домашнее место из раздела");
+            self.st.cells.entry(ws).or_default().insert(name, place);
+        }
         self.cfg = cfg;
     }
 
@@ -3600,6 +3609,17 @@ pub fn pending_step(exited: bool, window: bool, key: bool) -> PendingStep {
     }
 }
 
+/// Записи разделов workspace эффективного конфига `cfg`, которых нет
+/// в уже собранных назначениях мест `st.cells`, с их домашними местами:
+/// (workspace, запись, место). Раскладка, ещё не собранная, соберётся
+/// из раздела целиком и здесь не участвует.
+pub fn missing_homes(cfg: &Config, st: &State, mon: (i32, i32)) -> Vec<(String, String, Place)> {
+    st.cells
+        .iter()
+        .flat_map(|(ws, cells)| crate::state::home_places(cfg, ws, mon).into_iter().filter(|(a, _)| !cells.contains_key(a)).map(|(a, p)| (ws.clone(), a, p)))
+        .collect()
+}
+
 /// Раскладки, переживающие перечитывание конфига (спецификация ws-config,
 /// «Слежение за конфигом»; изменение live-layout, решение D12): у workspace,
 /// чей раздел в файле изменился или исчез, снимаются назначение мест, главное
@@ -5889,6 +5909,38 @@ apps = { herdr = "center", chromium = "left", neovide = "right" }
         let (eff, dropped) = merge_extra(&cfg, &extra);
         assert_eq!(dropped.len(), 1);
         assert_eq!(eff.workspaces["work"].apps["herdr"].place, Placement::Cell("center".into()));
+    }
+
+    #[test]
+    fn missing_homes_fill_collected_layout() {
+        // Раскладка surf собрана без chrome-ai2 (снимок прежнего раздела):
+        // запись раздела получает своё домашнее место, раскладка, ещё
+        // не собранная, не трогается.
+        let cfg = Config::parse(r#"
+[templates.overlay]
+main = "center"
+[templates.overlay.cells]
+left = { x = 340, y = 10, w = 1920, h = 2140 }
+center = { x = 1125, y = 10, w = 1920, h = 2140 }
+right = { x = 1910, y = 10, w = 1920, h = 2140 }
+
+[apps.chrome-ai]
+cmd = "a"
+[apps.chrome-ai2]
+cmd = "b"
+
+[workspaces.surf]
+template = "overlay"
+mode = "stack"
+apps = { chrome-ai = "left", chrome-ai2 = "right" }
+
+[workspaces.other]
+template = "overlay"
+apps = { chrome-ai = "left" }
+"#).unwrap();
+        let mut st = State::default();
+        st.cells.insert("surf".into(), BTreeMap::from([("chrome-ai".to_string(), Place::Cell("right".into()))]));
+        assert_eq!(missing_homes(&cfg, &st, (3840, 2160)), vec![("surf".to_string(), "chrome-ai2".to_string(), Place::Cell("right".into()))]);
     }
 
     #[test]
