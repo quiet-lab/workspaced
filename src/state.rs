@@ -384,6 +384,12 @@ pub struct SessionWorkspace {
     pub main: Option<String>,
     #[serde(default)]
     pub cells: BTreeMap<String, Place>,
+    /// Ячейки шаблона workspace с их прямоугольниками на момент снимка:
+    /// по ним загрузка узнаёт, что геометрию шаблона изменили после снимка
+    /// (изменение snapshot-stale-rects). Снимок прежнего формата этой
+    /// таблицы не содержит и сверяется только по именам ячеек.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub grid: BTreeMap<String, PxRect>,
     /// Изменённые места: приложение → прямоугольник. Владелец места (адрес
     /// окна) в снимок не пишется: адрес не переживает перезагрузку.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]

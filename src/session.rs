@@ -65,7 +65,7 @@ pub fn snapshot(d: &Daemon) -> Result<Session> {
         saved: chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         active_desktop: d.current_desktop(),
         desktops: st.desktops.iter().map(|(n, d)| (n.to_string(), d.clone())).collect(),
-        workspaces: session_workspaces(st),
+        workspaces: session_workspaces(st, d.cfg_file(), d.mon()),
         windows,
     })
 }
@@ -73,11 +73,16 @@ pub fn snapshot(d: &Daemon) -> Result<Session> {
 /// Workspace в снимке. Раскладка — исходные места, главное приложение,
 /// изменённые места — и дополнительные приложения сессии — сведения об одном
 /// и том же workspace, поэтому в снимке они лежат рядом (изменение
-/// live-layout, решение D13).
-pub fn session_workspaces(st: &State) -> BTreeMap<String, SessionWorkspace> {
+/// live-layout, решение D13). Вместе с назначением мест пишется геометрия
+/// ячеек шаблона по файлу конфига `file` на мониторе `mon`: по ней загрузка
+/// узнаёт раскладку, снятую при другой геометрии (изменение
+/// snapshot-stale-rects).
+pub fn session_workspaces(st: &State, file: &Config, mon: (i32, i32)) -> BTreeMap<String, SessionWorkspace> {
     let mut workspaces: BTreeMap<String, SessionWorkspace> = BTreeMap::new();
     for (w, cells) in &st.cells {
-        workspaces.entry(w.clone()).or_default().cells = cells.clone();
+        let sw = workspaces.entry(w.clone()).or_default();
+        sw.cells = cells.clone();
+        sw.grid = template_grid(file, w, mon).unwrap_or_default();
     }
     for (w, m) in &st.main {
         workspaces.entry(w.clone()).or_default().main = Some(m.clone());
@@ -163,6 +168,9 @@ fn read_for_load(d: &Daemon, name: &str) -> Result<Session> {
     let mut s = read(name)?;
     for why in limit_desktops(&mut s, d.cfg().desktop_count()) {
         log::warn!("сессия {name}: {why}");
+    }
+    for why in forget_stale_layouts(&mut s, d.cfg_file(), d.mon()) {
+        log::info!("сессия {name}: {why}");
     }
     Ok(s)
 }
@@ -377,21 +385,12 @@ fn apply_lists(d: &mut Daemon, s: &Session) {
     st.geom.clear();
     st.extra.clear();
     st.extra_wait.clear();
-    let file = d.cfg_file().clone();
     for (w, sw) in &s.workspaces {
         if !cfg_ws.contains(w) {
             continue;
         }
-        if let Some(cell) = stale_cell(&file, w, &sw.cells) {
-            // Шаблон workspace сменили после снимка (изменение
-            // home-mode-layout, решение D10): раскладка снимка называет
-            // ячейку, которой в шаблоне нет, и собирается заново из конфига.
-            log::info!("снимок: раскладка workspace {w} называет ячейку {cell}, которой нет в его шаблоне, — собирается заново из конфига");
-            if !sw.extra_apps.is_empty() {
-                st_extra(d, w, sw);
-            }
-            continue;
-        }
+        // Раскладка, снятая по другому шаблону, сюда приходит уже пустой
+        // (`forget_stale_layouts`) и собирается из конфига.
         let st = d.state_mut();
         if let Some(m) = &sw.main {
             st.main.insert(w.clone(), m.clone());
@@ -423,14 +422,66 @@ fn st_extra(d: &mut Daemon, w: &str, sw: &SessionWorkspace) {
     st.extra_wait.extend(sw.extra_apps.keys().map(|a| (w.to_string(), a.clone())));
 }
 
-/// Ячейка из раскладки снимка, которой нет в нынешнем шаблоне workspace
-/// `w` файла конфига; `None` — все ячейки на месте.
-pub fn stale_cell(file: &Config, w: &str, cells: &BTreeMap<String, Place>) -> Option<String> {
+/// Ячейки шаблона workspace `w` файла конфига с прямоугольниками
+/// на мониторе `mon`; `None` — workspace или шаблона в конфиге нет.
+pub fn template_grid(file: &Config, w: &str, mon: (i32, i32)) -> Option<BTreeMap<String, PxRect>> {
     let t = file.workspaces.get(w).and_then(|x| file.templates.get(&x.template))?;
-    cells.values().find_map(|p| match p {
-        Place::Cell(c) if !t.cells.contains_key(c) => Some(c.clone()),
+    Some(t.cells.iter().map(|(n, c)| (n.clone(), c.resolve(mon.0, mon.1))).collect())
+}
+
+/// Почему раскладка снимка `sw` workspace `w` снята не по нынешнему шаблону
+/// файла конфига; `None` — раскладка годится. Шаблон сменили после снимка
+/// (изменение home-mode-layout, решение D10), если раскладка называет
+/// ячейку, которой в шаблоне нет; геометрию шаблона изменили (изменение
+/// snapshot-stale-rects), если ячейка из таблицы `grid` снимка исчезла или
+/// стоит теперь в другом прямоугольнике. Одних имён мало: ячейка `center`
+/// может остаться в шаблоне с другими числами, и окна встали бы туда, где
+/// она была при снимке. Добавленная ячейка раскладку не портит.
+pub fn stale_layout(file: &Config, w: &str, sw: &SessionWorkspace, mon: (i32, i32)) -> Option<String> {
+    let grid = template_grid(file, w, mon)?;
+    let named = sw.cells.values().find_map(|p| match p {
+        Place::Cell(c) if !grid.contains_key(c) => Some(c.clone()),
         _ => None,
+    });
+    if let Some(c) = named {
+        return Some(format!("раскладка workspace {w} называет ячейку {c}, которой нет в его шаблоне"));
+    }
+    sw.grid.iter().find(|(c, r)| grid.get(*c) != Some(*r)).map(|(c, r)| match grid.get(c) {
+        Some(now) => format!("ячейка {c} шаблона workspace {w} при снимке была {}, а сейчас {}", show(r), show(now)),
+        None => format!("ячейки {c} из снимка в шаблоне workspace {w} больше нет"),
     })
+}
+
+fn show(r: &PxRect) -> String {
+    format!("{},{} {}×{}", r.x, r.y, r.w, r.h)
+}
+
+/// Раскладки снимка, снятые не по нынешнему шаблону (`stale_layout`),
+/// отбрасываются вместе с прямоугольниками окон для этих workspace
+/// (изменение snapshot-stale-rects): назначения мест, главное приложение
+/// и изменённые места соберутся из конфига, а окна встанут на места новой
+/// раскладки, а не туда, где стояли по старой. Прямоугольники окон для
+/// остальных workspace и записи дополнительных приложений сессии остаются.
+/// Сверять прямоугольники окон с ячейками нельзя: второй экземпляр,
+/// сдвинутый мышью, законно стоит вне ячейки и вне изменённого места
+/// своего приложения. Возвращает строки для журнала.
+pub fn forget_stale_layouts(s: &mut Session, file: &Config, mon: (i32, i32)) -> Vec<String> {
+    let mut why = Vec::new();
+    let mut stale = Vec::new();
+    for (w, sw) in s.workspaces.iter_mut() {
+        if let Some(reason) = stale_layout(file, w, sw, mon) {
+            why.push(format!("{reason} — раскладка собирается заново из конфига, прямоугольники окон для {w} из снимка не действуют"));
+            sw.main = None;
+            sw.cells.clear();
+            sw.grid.clear();
+            sw.moved.clear();
+            stale.push(w.clone());
+        }
+    }
+    for win in &mut s.windows {
+        win.rects.retain(|w, _| !stale.contains(w));
+    }
+    why
 }
 
 /// Списки столов из снимка приводятся к правилу «workspace числится ровно
@@ -832,13 +883,56 @@ mod tests {
     #[test]
     fn stale_snapshot_cell_is_found() {
         let cfg = Config::parse(CFG).unwrap();
+        let mon = (3840, 2160);
         let rect = Place::Rect { rect: PxRect { x: 0, y: 0, w: 10, h: 10 } };
+        let sw = |cells: BTreeMap<String, Place>, grid: BTreeMap<String, PxRect>| SessionWorkspace { cells, grid, ..SessionWorkspace::default() };
         let ok = BTreeMap::from([("chromium".to_string(), Place::Cell("left".into())), ("calc".to_string(), rect.clone())]);
-        assert_eq!(stale_cell(&cfg, "work", &ok), None);
+        assert_eq!(stale_layout(&cfg, "work", &sw(ok.clone(), BTreeMap::new()), mon), None);
+        // Снимок с геометрией нынешнего шаблона годится.
+        let grid = template_grid(&cfg, "work", mon).unwrap();
+        assert_eq!(stale_layout(&cfg, "work", &sw(ok.clone(), grid.clone()), mon), None);
         // Шаблон сменили после снимка: ячейки left_top в thirds нет.
         let old = BTreeMap::from([("chromium".to_string(), Place::Cell("left_top".into())), ("calc".to_string(), rect)]);
-        assert_eq!(stale_cell(&cfg, "work", &old).as_deref(), Some("left_top"));
-        assert_eq!(stale_cell(&cfg, "nope", &old), None);
+        assert!(stale_layout(&cfg, "work", &sw(old.clone(), BTreeMap::new()), mon).is_some_and(|w| w.contains("left_top")));
+        assert_eq!(stale_layout(&cfg, "nope", &sw(old, BTreeMap::new()), mon), None);
+        // Имя ячейки то же, а геометрия при снимке другая.
+        let mut moved = grid.clone();
+        moved.insert("center".into(), PxRect { x: 1130, y: 10, w: 1910, h: 2140 });
+        assert!(stale_layout(&cfg, "work", &sw(ok.clone(), moved), mon).is_some_and(|w| w.contains("center")));
+        // Ячейка из таблицы снимка исчезла из шаблона.
+        let mut gone = grid;
+        gone.insert("wide".into(), R1);
+        assert!(stale_layout(&cfg, "work", &sw(ok, gone), mon).is_some_and(|w| w.contains("wide")));
+    }
+
+    #[test]
+    fn stale_layout_drops_window_rects() {
+        // Снимок по шаблону thirds-split, а в конфиге work — thirds: у окон
+        // снимаются прямоугольники для work, прямоугольники для surf
+        // и записи дополнительных приложений остаются.
+        let cfg = Config::parse(CFG).unwrap();
+        let mon = (3840, 2160);
+        let mut s = Session::default();
+        let work = s.workspaces.entry("work".into()).or_default();
+        work.cells = BTreeMap::from([("chromium".to_string(), Place::Cell("left_top".into())), ("neovide".to_string(), Place::Cell("right".into()))]);
+        work.main = Some("neovide".into());
+        work.moved.insert("neovide".into(), R2);
+        work.extra_apps.insert("calc".into(), crate::state::ExtraApp { rect: RS, ..Default::default() });
+        let surf = s.workspaces.entry("surf".into()).or_default();
+        surf.cells = BTreeMap::from([("chrome-ai".to_string(), Place::Cell("right".into()))]);
+        surf.grid = template_grid(&cfg, "surf", mon).unwrap();
+        let win = |app: &str, rects: &[(&str, PxRect)]| SessionWindow { app: Some(app.into()), instance: Some(1), workspaces: rects.iter().map(|(w, _)| w.to_string()).collect(), desktop: "1".into(), rect: R1, rects: rects.iter().map(|(w, r)| (w.to_string(), *r)).collect(), ..SessionWindow::default() };
+        s.windows = vec![win("chromium", &[("work", R1)]), win("chrome-ai", &[("surf", RS), ("work", R2)])];
+        let why = forget_stale_layouts(&mut s, &cfg, mon);
+        assert_eq!(why.len(), 1, "{why:?}");
+        let work = &s.workspaces["work"];
+        assert!(work.cells.is_empty() && work.main.is_none() && work.moved.is_empty());
+        assert_eq!(work.extra_apps["calc"].rect, RS);
+        assert_eq!(s.workspaces["surf"].cells.len(), 1);
+        assert!(s.windows[0].rects.is_empty());
+        assert_eq!(s.windows[1].rects, BTreeMap::from([("surf".to_string(), RS)]));
+        // Состав окон не меняется: окна по-прежнему входят в work.
+        assert_eq!(s.windows[1].workspaces, vec!["surf".to_string(), "work".to_string()]);
     }
 
     const CFG: &str = r#"
@@ -941,7 +1035,7 @@ apps = { chrome-ai = "right" }
         st.moved.entry("work".into()).or_default().insert("chrome-ai".into(), Moved { rect: r, owner: Some("0xai".into()) });
         let main = st.main_app(&cfg, "work", mon);
         daemon::swap_places(&mut st, "work", main.as_deref(), "chrome-ai", "center", &|_| true);
-        let ws = session_workspaces(&st);
+        let ws = session_workspaces(&st, &cfg, mon);
         let work = &ws["work"];
         assert_eq!(work.main.as_deref(), Some("chrome-ai"));
         assert_eq!(work.cells["chrome-ai"], crate::state::Place::Cell("center".into()));
@@ -955,6 +1049,10 @@ apps = { chrome-ai = "right" }
         let back: Session = toml::from_str(&text).unwrap();
         assert_eq!(back.workspaces["work"].main.as_deref(), Some("chrome-ai"));
         assert_eq!(back.workspaces["work"].moved["herdr"], r);
+        // С раскладкой пишется геометрия ячеек шаблона, и снимок,
+        // прочитанный обратно, нынешнему шаблону соответствует.
+        assert_eq!(back.workspaces["work"].grid["left"], R1);
+        assert_eq!(stale_layout(&cfg, "work", &back.workspaces["work"], mon), None);
     }
 
     #[test]
