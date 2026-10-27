@@ -127,7 +127,7 @@ impl AppRect {
 
 impl PxRect {
     /// Прямоугольник, уменьшенный на зазор с каждой стороны. Нужен командам
-    /// `half`, `place` и `maximize`; ячейки и `rect` из конфига не трогает.
+    /// `half`, `place`, `maximize` и `fit`; ячейки и `rect` из конфига не трогает.
     pub fn inset(self, gap: i32) -> PxRect {
         PxRect { x: self.x + gap, y: self.y + gap, w: (self.w - 2 * gap).max(1), h: (self.h - 2 * gap).max(1) }
     }
@@ -417,6 +417,34 @@ pub struct PlaceAction {
     pub place: String,
 }
 
+/// Окно заданного размера по центру рабочей области: `{ fit = "1920x1080" }`.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct FitAction {
+    pub fit: String,
+}
+
+/// Размер `<W>x<H>` действия и команды `fit`: оба числа — положительные
+/// целые из одних цифр, без знака и без лишних частей.
+pub fn parse_fit(s: &str) -> Option<(i32, i32)> {
+    let (w, h) = s.split_once('x')?;
+    let num = |t: &str| -> Option<i32> {
+        if t.is_empty() || !t.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        t.parse::<i32>().ok().filter(|n| *n > 0)
+    };
+    Some((num(w)?, num(h)?))
+}
+
+/// [`parse_fit`] с ошибкой для команды `fit`.
+pub fn fit_size(s: &str) -> Result<(i32, i32)> {
+    parse_fit(s).ok_or_else(|| anyhow::anyhow!("fit: {FIT_FORMAT}, получено {s:?}"))
+}
+
+/// Требование к размеру `fit` для сообщений об ошибке.
+const FIT_FORMAT: &str = "размер должен иметь вид <ширина>x<высота> с положительными целыми";
+
 /// Допустимые позиции действия `place`.
 pub const PLACES: [&str; 8] = ["top-left", "top-center", "top-right", "bottom-left", "bottom-center", "bottom-right", "center", "full"];
 
@@ -479,6 +507,7 @@ pub enum Action {
     Named(String),
     Half(HalfAction),
     Place(PlaceAction),
+    Fit(FitAction),
     Move(MoveAction),
     Target(TargetAction),
 }
@@ -621,7 +650,7 @@ pub struct Config {
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub keys: Keys,
-    /// Зазор для команд `half`, `place` и `maximize`; ячейки шаблонов и `rect`
+    /// Зазор для команд `half`, `place`, `maximize` и `fit`; ячейки шаблонов и `rect`
     /// приложений передаются композитору как записаны.
     #[serde(default)]
     pub gap: i32,
@@ -863,6 +892,9 @@ impl Config {
             }
             Some(Action::Place(PlaceAction { place })) if !PLACES.contains(&place.as_str()) => {
                 bail!("привязка {:?}: place должен быть одним из {}, получено {place:?}", b.chain, PLACES.join(", "))
+            }
+            Some(Action::Fit(FitAction { fit })) if parse_fit(fit).is_none() => {
+                bail!("привязка {:?}: fit — {FIT_FORMAT}, получено {fit:?}", b.chain)
             }
             Some(Action::Target(TargetAction { desktop, workspace, app, pull, new })) => {
                 // Перетаскивание идёт в активный workspace текущего стола,
@@ -1130,6 +1162,27 @@ apps = { terminal = "right" }
         let bad = format!("{MINIMAL}\n[[binds]]\nchain = \"SUPER+X\"\naction = \"maximise\"\n");
         let err = Config::parse(&bad).unwrap_err().to_string();
         assert!(err.contains("SUPER+X") && err.contains("maximise"), "{err}");
+    }
+
+    #[test]
+    fn fit_action_in_binds() {
+        let ok = format!("{MINIMAL}\n[[binds]]\nchain = \"ALT+SUPER+Return\"\naction = {{ fit = \"1920x1080\" }}\n");
+        let cfg = Config::parse(&ok).unwrap();
+        assert_eq!(cfg.binds[0].action, Some(Action::Fit(FitAction { fit: "1920x1080".into() })));
+        for v in ["0x5", "1920", "ax1", "-1x2", "1920x1080x1", "x1080", "1920x", "+5x5", "99999999999x1"] {
+            let bad = format!("{MINIMAL}\n[[binds]]\nchain = \"ALT+SUPER+Return\"\naction = {{ fit = \"{v}\" }}\n");
+            let err = Config::parse(&bad).unwrap_err().to_string();
+            assert!(err.contains("ALT+SUPER+Return") && err.contains(v), "{v}: {err}");
+        }
+    }
+
+    #[test]
+    fn parse_fit_sizes() {
+        assert_eq!(parse_fit("1920x1080"), Some((1920, 1080)));
+        assert_eq!(parse_fit("1x1"), Some((1, 1)));
+        for v in ["0x5", "5x0", "1920", "ax1", "-1x2", "1920x1080x1", "", "x", "1920X1080", " 1x1"] {
+            assert_eq!(parse_fit(v), None, "{v}");
+        }
     }
 
     #[test]

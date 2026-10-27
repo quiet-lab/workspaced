@@ -136,6 +136,7 @@ fn daemon_desc(cmd: &str) -> Option<String> {
         ("sessions", _) => "Окно выбора сессии".to_string(),
         ("next", _) => "Следующий workspace стола".to_string(),
         ("maximize", _) => "Развернуть окно; повторно — вернуть прежнюю геометрию".to_string(),
+        ("fit", size) => format!("Окно {size} по центру; повторно — вернуть прежнюю геометрию"),
         ("arrange", _) => "Расставить окна стола по активному workspace".to_string(),
         ("detach", _) => "Отделить окно от workspace и закрыть".to_string(),
         ("move-desktop", n) => format!("Перенести workspace на стол {n} и перейти туда"),
@@ -222,7 +223,7 @@ fn default_group(b: &Bind, act: &Act) -> &'static str {
             let cmd = cmd.strip_prefix("workspaced ").unwrap_or(cmd);
             let head = cmd.split_whitespace().next().unwrap_or("");
             match head {
-                "half" | "place" | "maximize" | "detach" => G_WINDOWS,
+                "half" | "place" | "maximize" | "fit" | "detach" => G_WINDOWS,
                 "move-desktop" => G_DESKTOPS,
                 "app" => G_APPS,
                 _ => G_WORKSPACE,

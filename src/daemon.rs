@@ -137,8 +137,9 @@ pub struct Daemon {
     subs: Vec<UnixStream>,
     /// Отправитель сообщений демону: нужен потокам, ждущим выхода процессов.
     tx: Sender<Msg>,
-    /// Геометрия окон до развёртывания (ключ — адрес окна), только в памяти.
-    maximized: HashMap<String, PxRect>,
+    /// Геометрия окон до `maximize` и `fit` (ключ — адрес окна), общая для обеих
+    /// команд, только в памяти ([`geometry_step`]).
+    remembered_geometry: HashMap<String, Remembered>,
     /// Последнее окно обычного стола, получавшее фокус, кроме окон-переключателей
     /// (событие `activewindowv2`): к нему возвращается фокус, когда
     /// окно-переключатель прячется (изменение toggle-windows, решение D5).
@@ -206,7 +207,7 @@ pub fn run() -> Result<()> {
         let path = cfg_path.clone();
         std::thread::spawn(move || watch_config(path, tx));
     }
-    let mut d = Daemon { cfg: cfg.clone(), cfg_file: cfg, cfg_text, cfg_path, expected: Vec::new(), hypr, st: State::default(), mon, current, pending: Vec::new(), subs: Vec::new(), tx: tx.clone(), maximized: HashMap::new(), last_plain: None, toggle_back: HashMap::new(), toggle_focused: None };
+    let mut d = Daemon { cfg: cfg.clone(), cfg_file: cfg, cfg_text, cfg_path, expected: Vec::new(), hypr, st: State::default(), mon, current, pending: Vec::new(), subs: Vec::new(), tx: tx.clone(), remembered_geometry: HashMap::new(), last_plain: None, toggle_back: HashMap::new(), toggle_focused: None };
     d.startup()?;
     d.settle_wait();
     // Конфиг при старте прочитан выше, значит привязки в нём могут быть новее
@@ -2089,7 +2090,7 @@ impl Daemon {
     /// очереди, поэтому событие, отставшее от команды, может вернуть в кэш
     /// стол, с которого демон уже ушёл. Команда, которая действует на «стол,
     /// где пользователь сейчас», MUST отталкиваться от композитора, как
-    /// `half`, `place` и `maximize` отталкиваются от активного окна.
+    /// `half`, `place`, `maximize` и `fit` отталкиваются от активного окна.
     /// Специальный стол (`special:*`) номера не имеет, и кэш тогда остаётся
     /// прежним.
     fn sync_current(&mut self) -> u8 {
@@ -2485,7 +2486,7 @@ impl Daemon {
         Ok(())
     }
 
-    // ---- Развёртывание окна -------------------------------------------------------
+    // ---- Развёртывание окна и окно заданного размера ----------------------------
 
     /// Активное окно на всю рабочую область с отступом 2·gap от каждого края, как у
     /// половин и ячеек. Повторный вызов на развёрнутом окне возвращает геометрию,
@@ -2493,8 +2494,24 @@ impl Daemon {
     /// Полноэкранное окно сначала выводится из полноэкранного режима и всегда
     /// оказывается развёрнутым: возврат прежней геометрии — следующим вызовом.
     fn maximize(&mut self) -> Result<()> {
+        let gap = self.cfg.gap;
+        self.toggle_geometry("maximize", |area| maximize_rect(area, gap))
+    }
+
+    /// Активное окно размера `size` (`<W>x<H>`) по центру рабочей области;
+    /// переключатель с той же запомненной геометрией, что у `maximize`.
+    fn fit(&mut self, size: &str) -> Result<()> {
+        let (w, h) = crate::config::fit_size(size)?;
+        let gap = self.cfg.gap;
+        self.toggle_geometry("fit", |area| fit_rect(area, gap, w, h))
+    }
+
+    /// Общий ход `maximize` и `fit`: окно встаёт в `target(рабочая область)`,
+    /// а повторный вызов на окне, стоящем там, возвращает запомненную
+    /// геометрию ([`geometry_step`]).
+    fn toggle_geometry(&mut self, name: &str, target: impl Fn(PxRect) -> PxRect) -> Result<()> {
         let Some(mut win) = self.hypr.active_window()? else {
-            log::info!("maximize: активного окна нет");
+            log::info!("{name}: активного окна нет");
             return Ok(());
         };
         let mut from_fullscreen = false;
@@ -2507,35 +2524,35 @@ impl Daemon {
             win = match self.hypr.active_window()? {
                 Some(w) if w.address == win.address => w,
                 _ => {
-                    log::info!("maximize: окно {} пропало после выхода из полноэкранного режима", win.address);
+                    log::info!("{name}: окно {} пропало после выхода из полноэкранного режима", win.address);
                     return Ok(());
                 }
             };
             from_fullscreen = true;
         }
         // Забыть окна, которых уже нет.
-        let alive: Vec<String> = self.hypr.clients()?.into_iter().map(|c| c.address).collect();
-        self.maximized.retain(|a, _| alive.contains(a));
-
-        let target = maximize_rect(self.hypr.active_monitor()?.work_area(), self.cfg.gap);
-        let cur = win.rect();
-        if cur == target {
-            if from_fullscreen {
-                log::info!("maximize: {} вышло из полноэкранного режима, уже развёрнуто", win.address);
-                return Ok(());
-            }
-            match self.maximized.remove(&win.address) {
-                Some(prev) => {
-                    self.place_floating(&win.address, prev)?;
-                    log::info!("maximize: {} возвращено → {},{} {}×{}", win.address, prev.x, prev.y, prev.w, prev.h);
-                }
-                None => log::info!("maximize: окно {} уже развёрнуто, прежняя геометрия неизвестна", win.address),
-            }
-            return Ok(());
+        if !self.remembered_geometry.is_empty() {
+            let alive: std::collections::HashSet<String> = self.hypr.clients()?.into_iter().map(|c| c.address).collect();
+            self.remembered_geometry.retain(|a, _| alive.contains(a));
         }
-        self.maximized.insert(win.address.clone(), cur);
-        self.place_floating(&win.address, target)?;
-        log::info!("maximize: {} → {},{} {}×{}", win.address, target.x, target.y, target.w, target.h);
+
+        let target = target(self.hypr.active_monitor()?.work_area());
+        let cur = win.rect();
+        let mut mem = self.remembered_geometry.remove(&win.address);
+        let place = geometry_step(cur, target, &mut mem, from_fullscreen);
+        if let Some(m) = mem {
+            self.remembered_geometry.insert(win.address.clone(), m);
+        }
+        match place {
+            Some(r) => {
+                self.place_floating(&win.address, r)?;
+                // Окно уже в целевой геометрии — значит, это возврат прежней.
+                let what = if cur == target { "возвращено →" } else { "→" };
+                log::info!("{name}: {} {what} {},{} {}×{}", win.address, r.x, r.y, r.w, r.h);
+            }
+            None if from_fullscreen => log::info!("{name}: {} вышло из полноэкранного режима, уже на месте", win.address),
+            None => log::info!("{name}: окно {} уже на месте, прежняя геометрия неизвестна", win.address),
+        }
         Ok(())
     }
 
@@ -2604,6 +2621,10 @@ impl Daemon {
                 None => Err(anyhow::anyhow!("нет side")),
             },
             "maximize" => self.maximize().map(|_| json!({"ok": true})),
+            "fit" => match s("size") {
+                Some(size) => self.fit(&size).map(|_| json!({"ok": true})),
+                None => Err(anyhow::anyhow!("нет size")),
+            },
             "place" => match s("position") {
                 Some(position) => self.place(&position).map(|_| json!({"ok": true})),
                 None => Err(anyhow::anyhow!("нет position")),
@@ -2892,6 +2913,51 @@ pub fn set_lazy(d: &mut Daemon, map: BTreeMap<u8, String>) {
 /// складываются, и расстояние до краёв то же.
 fn maximize_rect(work_area: PxRect, gap: i32) -> PxRect {
     work_area.inset(2 * gap)
+}
+
+/// Окно `w`×`h` по центру рабочей области. Размер больше развёрнутой
+/// области ([`maximize_rect`]) урезается до неё: окно не заходит под панель
+/// и за края экрана и сохраняет отступ 2·gap. Симметричный отступ центра
+/// не сдвигает.
+fn fit_rect(work_area: PxRect, gap: i32, w: i32, h: i32) -> PxRect {
+    let max = maximize_rect(work_area, gap);
+    let w = w.min(max.w);
+    let h = h.min(max.h);
+    PxRect { x: work_area.x + (work_area.w - w) / 2, y: work_area.y + (work_area.h - h) / 2, w, h }
+}
+
+/// Запомненная геометрия окна для `maximize` и `fit`: `prev` — куда вернуть
+/// окно, `placed` — куда его последним поставила одна из этих команд.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Remembered {
+    prev: PxRect,
+    placed: PxRect,
+}
+
+/// Шаг переключателя `maximize`/`fit` без вызовов композитора: возвращает
+/// прямоугольник, куда поставить окно (`None` — ничего не делать), и правит
+/// запомненную геометрию `mem`.
+///
+/// Окно уже в `target` — возврат `prev` и забывание; без запомненной — без
+/// действия; после выхода из полноэкранного режима окно остаётся на месте.
+/// Иначе окно встаёт в `target`; `prev` сохраняется, если окно стоит ровно
+/// там, куда его поставила прошлая команда (`placed`: целевая геометрия
+/// другой команды или `fit` другого размера), и перезаписывается нынешней
+/// геометрией, если окно сдвинуто или растянуто вручную. Поэтому
+/// «исходное → fit A → fit B → fit B» тоже возвращает исходное, а не A.
+fn geometry_step(cur: PxRect, target: PxRect, mem: &mut Option<Remembered>, from_fullscreen: bool) -> Option<PxRect> {
+    if cur == target {
+        if from_fullscreen {
+            return None;
+        }
+        return mem.take().map(|m| m.prev);
+    }
+    let prev = match *mem {
+        Some(m) if m.placed == cur => m.prev,
+        _ => cur,
+    };
+    *mem = Some(Remembered { prev, placed: target });
+    Some(target)
 }
 
 /// Окна приложения по возрастанию номера экземпляра. Окно варианта входит
@@ -4652,6 +4718,62 @@ mod tests {
         // Монитор 3840×2160, панель резервирует 330 px слева, gap = 5.
         let area = PxRect { x: 330, y: 0, w: 3510, h: 2160 };
         assert_eq!(maximize_rect(area, 5), PxRect { x: 340, y: 10, w: 3490, h: 2140 });
+    }
+
+    #[test]
+    fn fit_rect_centered_in_work_area() {
+        // Панель 330 px слева: центр рабочей области 2085, как у ячейки center.
+        let panel = PxRect { x: 330, y: 0, w: 3510, h: 2160 };
+        assert_eq!(fit_rect(panel, 5, 1920, 1080), PxRect { x: 1125, y: 540, w: 1920, h: 1080 });
+        let full = PxRect { x: 0, y: 0, w: 3840, h: 2160 };
+        assert_eq!(fit_rect(full, 5, 1920, 1080), PxRect { x: 960, y: 540, w: 1920, h: 1080 });
+        // Больше развёрнутой области — урезается до неё с отступом 10 px.
+        assert_eq!(fit_rect(panel, 5, 5000, 3000), maximize_rect(panel, 5));
+        assert_eq!(fit_rect(panel, 5, 5000, 1080), PxRect { x: 340, y: 540, w: 3490, h: 1080 });
+    }
+
+    #[test]
+    fn toggle_shared_between_maximize_and_fit() {
+        let panel = PxRect { x: 330, y: 0, w: 3510, h: 2160 };
+        let orig = PxRect { x: 400, y: 100, w: 800, h: 600 };
+        let max = maximize_rect(panel, 5);
+        let fit = fit_rect(panel, 5, 1920, 1080);
+        // Исходное → maximize → fit → fit: возврат исходного.
+        let mut mem = None;
+        assert_eq!(geometry_step(orig, max, &mut mem, false), Some(max));
+        assert_eq!(geometry_step(max, fit, &mut mem, false), Some(fit));
+        assert_eq!(geometry_step(fit, fit, &mut mem, false), Some(orig));
+        assert_eq!(mem, None);
+        // Исходное → fit → maximize → maximize.
+        assert_eq!(geometry_step(orig, fit, &mut mem, false), Some(fit));
+        assert_eq!(geometry_step(fit, max, &mut mem, false), Some(max));
+        assert_eq!(geometry_step(max, max, &mut mem, false), Some(orig));
+        // Запомненной нет — без действия.
+        assert_eq!(geometry_step(fit, fit, &mut mem, false), None);
+        // fit другого размера тоже не перезаписывает запомненную.
+        let big = fit_rect(panel, 5, 2560, 1440);
+        assert_eq!(geometry_step(orig, fit, &mut mem, false), Some(fit));
+        assert_eq!(geometry_step(fit, big, &mut mem, false), Some(big));
+        assert_eq!(geometry_step(big, big, &mut mem, false), Some(orig));
+    }
+
+    #[test]
+    fn toggle_moved_window_overwrites_remembered() {
+        let panel = PxRect { x: 330, y: 0, w: 3510, h: 2160 };
+        let orig = PxRect { x: 400, y: 100, w: 800, h: 600 };
+        let fit = fit_rect(panel, 5, 1920, 1080);
+        let max = maximize_rect(panel, 5);
+        let mut mem = None;
+        geometry_step(orig, fit, &mut mem, false);
+        // Окно сдвинуто мышью: запоминается сдвинутое положение.
+        let moved = PxRect { x: fit.x + 100, ..fit };
+        assert_eq!(geometry_step(moved, max, &mut mem, false), Some(max));
+        assert_eq!(geometry_step(max, max, &mut mem, false), Some(moved));
+        // После выхода из полноэкранного режима окно в целевой геометрии
+        // остаётся на месте, запомненная сохраняется.
+        geometry_step(orig, fit, &mut mem, false);
+        assert_eq!(geometry_step(fit, fit, &mut mem, true), None);
+        assert_eq!(geometry_step(fit, fit, &mut mem, false), Some(orig));
     }
 
     #[test]

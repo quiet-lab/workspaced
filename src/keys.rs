@@ -22,7 +22,7 @@ use std::fmt::Write;
 
 use anyhow::{Result, bail};
 
-use crate::config::{Action, Bind, Config, Desk, Dispatch, HalfAction, MoveAction, PlaceAction, STICKY_APPS, StickyState, TargetAction};
+use crate::config::{Action, Bind, Config, Desk, Dispatch, FitAction, HalfAction, MoveAction, PlaceAction, STICKY_APPS, StickyState, TargetAction};
 
 /// Одно сочетание в каноническом виде: модификаторы по фиксированному порядку,
 /// клавиша как написана.
@@ -251,6 +251,7 @@ pub(crate) fn bind_act(b: &Bind, last: Option<u8>) -> Result<Act> {
             },
             Action::Half(HalfAction { half }) => format!("workspaced half {half}"),
             Action::Place(PlaceAction { place }) => format!("workspaced place {place}"),
+            Action::Fit(FitAction { fit }) => format!("workspaced fit {fit}"),
             // Номер стола проверяется здесь, а не при разборе конфига:
             // в записи с `range` на его месте стоит `$n`, и число
             // появляется только после разворачивания серии.
@@ -1373,6 +1374,9 @@ action = "maximize"
 chain = "ALT+SUPER+Home"
 action = { place = "top-left" }
 [[binds]]
+chain = "ALT+SUPER+Return"
+action = { fit = "1920x1080" }
+[[binds]]
 chain = "SUPER+SHIFT+C"
 lua = """
 local soft = hl.get_config("cursor.no_hardware_cursors")
@@ -1398,6 +1402,7 @@ dispatch = "exit()"
         assert!(a.contains("hl.bind(\"SUPER + SHIFT + left\", hl.dsp.exec_cmd(\"workspaced half left\"))"), "{a}");
         assert!(a.contains("hl.bind(\"SUPER + X\", hl.dsp.exec_cmd(\"workspaced maximize\"))"), "{a}");
         assert!(a.contains("Home\", hl.dsp.exec_cmd(\"workspaced place top-left\"))"), "{a}");
+        assert!(a.contains("hl.bind(\"SUPER + ALT + Return\", hl.dsp.exec_cmd(\"workspaced fit 1920x1080\"))"), "{a}");
         assert!(a.contains("hl.bind(\"SUPER + SHIFT + C\", function()\n  local ok, err = pcall(function()\n    local soft"), "{a}");
         // Цепочка из трёх звеньев — режим с вложенным состоянием.
         let w = sticky_block(&a, "ws-sticky:SUPER+W");
@@ -1419,6 +1424,7 @@ dispatch = "exit()"
         assert!(list.contains("locked,repeating"), "{list}");
         assert!(list.contains("SUPER+X") && list.contains("maximize"), "{list}");
         assert!(list.contains("Home") && list.contains("place top-left"), "{list}");
+        assert!(list.contains("SUPER+ALT+Return") && list.contains("fit 1920x1080"), "{list}");
     }
 
     /// Приложения сессии: собственные клавиши herdr, Chromium и neovide,
