@@ -161,11 +161,20 @@ pub struct Monitor {
     pub special_workspace: Option<WsRef>,
 }
 
-/// Специальный стол монитора: композитор пишет `{ "id": 0, "name": "" }`,
-/// когда он не открыт.
+/// Специальный стол монитора. Пока он не открыт, композитор пишет либо
+/// `{ "id": 0, "name": "" }`, либо объект без `id` и, возможно, без `name`;
+/// пустое имя значит «не открыт». Поля читаются мягко только здесь: у окон
+/// `id` стола обязателен.
 fn special_ws<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<WsRef>, D::Error> {
-    let w = Option::<WsRef>::deserialize(d)?;
-    Ok(w.filter(|w| !w.name.is_empty()))
+    #[derive(Deserialize)]
+    struct Raw {
+        #[serde(default)]
+        id: i64,
+        #[serde(default)]
+        name: String,
+    }
+    let w = Option::<Raw>::deserialize(d)?;
+    Ok(w.filter(|w| !w.name.is_empty()).map(|w| WsRef { id: w.id, name: w.name }))
 }
 
 impl Monitor {
@@ -477,5 +486,31 @@ mod tests {
         assert_eq!(c.app_instance(), Some(("chrome-ai".to_string(), 1)));
         let free = test_client("0x2", "chromium", "Новости", "4", &["app:chromium#2"]);
         assert!(free.workspaces().is_empty() && !free.has_ws());
+    }
+
+    #[test]
+    fn monitor_closed_special_workspace_forms() {
+        // Hyprland 0.57: у закрытого специального стола нет поля `id`.
+        let new = r#"[{"name":"DP-2","width":3840,"height":2160,"focused":true,"reserved":[330,0,0,0],
+            "specialWorkspace":{"address":"","type":"","name":""}}]"#;
+        let m: Vec<Monitor> = serde_json::from_str(new).unwrap();
+        assert!(m[0].special_workspace.is_none());
+        // Hyprland 0.56: `id` есть.
+        let old = r#"[{"name":"DP-2","width":3840,"height":2160,
+            "specialWorkspace":{"id":0,"name":""}}]"#;
+        let m: Vec<Monitor> = serde_json::from_str(old).unwrap();
+        assert!(m[0].special_workspace.is_none());
+        // Ключа нет, null, пустой объект: стол не открыт.
+        for j in [r#"[{"name":"A","width":1,"height":1}]"#, r#"[{"name":"A","width":1,"height":1,"specialWorkspace":null}]"#, r#"[{"name":"A","width":1,"height":1,"specialWorkspace":{}}]"#] {
+            let m: Vec<Monitor> = serde_json::from_str(j).unwrap();
+            assert!(m[0].special_workspace.is_none());
+        }
+        // У окна id стола по-прежнему обязателен.
+        assert!(serde_json::from_str::<Client>(r#"{"address":"0x1","workspace":{"name":"1"}}"#).is_err());
+        // Открытый стол остаётся виден по имени.
+        let open = r#"[{"name":"DP-2","width":1,"height":1,
+            "specialWorkspace":{"address":"x","type":"special","id":-98,"name":"special:pool"}}]"#;
+        let m: Vec<Monitor> = serde_json::from_str(open).unwrap();
+        assert_eq!(m[0].special_workspace.as_ref().unwrap().name, "special:pool");
     }
 }
