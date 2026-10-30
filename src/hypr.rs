@@ -23,7 +23,12 @@ pub struct Hypr {
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 pub struct WsRef {
+    // Hyprland 0.57 пишет `workspace` без `id` (и, возможно, без `name`) у части
+    // окон; иначе один такой объект валит разбор всего списка `j/clients`.
+    // Без полей окно считается стоящим вне стола: id 0, пустое имя.
+    #[serde(default)]
     pub id: i64,
+    #[serde(default)]
     pub name: String,
 }
 
@@ -163,8 +168,8 @@ pub struct Monitor {
 
 /// Специальный стол монитора. Пока он не открыт, композитор пишет либо
 /// `{ "id": 0, "name": "" }`, либо объект без `id` и, возможно, без `name`;
-/// пустое имя значит «не открыт». Поля читаются мягко только здесь: у окон
-/// `id` стола обязателен.
+/// пустое имя значит «не открыт». Поля читаются мягко и у окон (`WsRef`), но
+/// здесь пустое имя дополнительно превращает стол в `None`.
 fn special_ws<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<WsRef>, D::Error> {
     #[derive(Deserialize)]
     struct Raw {
@@ -373,7 +378,7 @@ pub fn d_cover_fullscreen(clients: &[Client], addr: &str) -> Vec<String> {
     if fs.fullscreen != 2 {
         return Vec::new();
     }
-    let peer = |c: &&Client| c.address != fs.address && c.workspace.id == fs.workspace.id && !c.pinned;
+    let peer = |c: &&Client| c.address != fs.address && c.workspace.id == fs.workspace.id && c.workspace.name == fs.workspace.name && !c.pinned;
     if !clients.iter().filter(peer).any(|c| c.allowed_over_fullscreen) {
         return Vec::new();
     }
@@ -505,12 +510,28 @@ mod tests {
             let m: Vec<Monitor> = serde_json::from_str(j).unwrap();
             assert!(m[0].special_workspace.is_none());
         }
-        // У окна id стола по-прежнему обязателен.
-        assert!(serde_json::from_str::<Client>(r#"{"address":"0x1","workspace":{"name":"1"}}"#).is_err());
         // Открытый стол остаётся виден по имени.
         let open = r#"[{"name":"DP-2","width":1,"height":1,
             "specialWorkspace":{"address":"x","type":"special","id":-98,"name":"special:pool"}}]"#;
         let m: Vec<Monitor> = serde_json::from_str(open).unwrap();
         assert_eq!(m[0].special_workspace.as_ref().unwrap().name, "special:pool");
+    }
+
+    #[test]
+    fn clients_workspace_without_id_parses() {
+        // Hyprland 0.57: у части окон `workspace` без `id`; остальные окна читаются верно.
+        let j = r#"[
+            {"address":"0x1","class":"a","workspace":{"address":"1","id":1,"type":"normal","name":"1"}},
+            {"address":"0x2","class":"b","workspace":{"address":"","type":"","name":""}},
+            {"address":"0x3","class":"c","workspace":{}},
+            {"address":"0x4","class":"d","workspace":{"id":-98,"name":"special:pool"}}
+        ]"#;
+        let c: Vec<Client> = serde_json::from_str(j).unwrap();
+        assert_eq!(c.len(), 4);
+        assert_eq!((c[0].workspace.id, c[0].desktop()), (1, Some(1)));
+        for w in [&c[1], &c[2]] {
+            assert!(w.desktop().is_none() && !w.on_pool() && !w.on_hidden());
+        }
+        assert!(c[3].on_pool());
     }
 }
