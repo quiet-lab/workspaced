@@ -677,6 +677,52 @@ pub struct Config {
     /// Цепочки с выходом в порядке файла (изменение sticky-chains).
     #[serde(default)]
     pub sticky: IndexMap<String, StickyState>,
+    /// Сторож внимания: вопрос агента в herdr (изменение ws-attention).
+    #[serde(default)]
+    pub attention: Attention,
+}
+
+/// Раздел `[attention]`: что делает сторож внимания, когда агент в herdr
+/// ждёт ответа (панель в статусе `blocked`). Без раздела сторож выключен.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Attention {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Приложение конфига, окно которого получает фокус при вопросе.
+    #[serde(default = "default_attention_app")]
+    pub app: String,
+    /// Ставить на паузу плееры MPRIS, которые играли, и возобновлять их при отбое.
+    #[serde(default = "default_true")]
+    pub media_pause: bool,
+    /// Останавливать (`SIGSTOP`) процесс полноэкранного окна с его потомками.
+    #[serde(default = "default_true")]
+    pub freeze_fullscreen: bool,
+    /// Классы окон, процессы которых не останавливаются никогда: выражения
+    /// сопоставляются с классом целиком, как `ignore_classes`.
+    #[serde(default)]
+    pub freeze_exclude_classes: Vec<String>,
+}
+
+impl Default for Attention {
+    fn default() -> Self {
+        Attention { enabled: false, app: default_attention_app(), media_pause: true, freeze_fullscreen: true, freeze_exclude_classes: Vec::new() }
+    }
+}
+
+fn default_attention_app() -> String {
+    "herdr".to_string()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Attention {
+    /// Класс окна в списке `freeze_exclude_classes`.
+    pub fn freeze_excluded(&self, class: &str) -> bool {
+        self.freeze_exclude_classes.iter().any(|c| regex::Regex::new(&format!("^(?:{c})$")).is_ok_and(|re| re.is_match(class)))
+    }
 }
 
 /// Запуск приложения: программа, аргументы, рабочий каталог и сложенное окружение.
@@ -803,6 +849,12 @@ impl Config {
         }
         for c in &self.ignore_classes {
             regex::Regex::new(&format!("^(?:{c})$")).with_context(|| format!("ignore_classes: выражение {c:?}"))?;
+        }
+        for c in &self.attention.freeze_exclude_classes {
+            regex::Regex::new(&format!("^(?:{c})$")).with_context(|| format!("attention.freeze_exclude_classes: выражение {c:?}"))?;
+        }
+        if self.attention.enabled && !self.apps.contains_key(&self.attention.app) {
+            bail!("attention: приложение {:?} не описано в [apps]", self.attention.app);
         }
         if let Some(st) = &self.startup {
             if !self.workspaces.contains_key(&st.workspace) {

@@ -119,6 +119,8 @@ enum Msg {
     ConfigChanged,
     /// Запущенный демоном процесс завершился.
     ChildExited { pid: u32 },
+    /// Событие сторожа внимания от сервера herdr.
+    Attention(crate::attention::Input),
 }
 
 pub struct Daemon {
@@ -150,6 +152,8 @@ pub struct Daemon {
     /// и ещё не потеряло его (изменение toggle-hide-on-blur): когда фокус
     /// уходит в обычное окно или «в никуда», окна этого приложения прячутся.
     toggle_focused: Option<String>,
+    /// Сторож внимания (изменение ws-attention).
+    attention: crate::attention::Watch,
 }
 
 pub fn socket_path() -> Result<PathBuf> {
@@ -158,6 +162,10 @@ pub fn socket_path() -> Result<PathBuf> {
 }
 
 pub fn run() -> Result<()> {
+    // Процессы, остановленные сторожем внимания до падения демона,
+    // продолжают работу; дальше SIGCONT гарантируют сигнал и паника.
+    crate::attention::thaw_persisted();
+    crate::attention::install_guards()?;
     let cfg_path = config_path();
     let cfg = Config::load(&cfg_path)?;
     let cfg_text = std::fs::read_to_string(&cfg_path)?;
@@ -184,6 +192,7 @@ pub fn run() -> Result<()> {
                 }
             }
             log::error!("поток событий Hyprland завершился, выход");
+            crate::attention::thaw_persisted();
             std::process::exit(1);
         });
     }
@@ -207,7 +216,12 @@ pub fn run() -> Result<()> {
         let path = cfg_path.clone();
         std::thread::spawn(move || watch_config(path, tx));
     }
-    let mut d = Daemon { cfg: cfg.clone(), cfg_file: cfg, cfg_text, cfg_path, expected: Vec::new(), hypr, st: State::default(), mon, current, pending: Vec::new(), subs: Vec::new(), tx: tx.clone(), remembered_geometry: HashMap::new(), last_plain: None, toggle_back: HashMap::new(), toggle_focused: None };
+    // Сторож внимания: статусы панелей сервера herdr.
+    {
+        let tx = tx.clone();
+        std::thread::spawn(move || crate::attention::watch_herdr(move |i| tx.send(Msg::Attention(i)).is_ok()));
+    }
+    let mut d = Daemon { cfg: cfg.clone(), cfg_file: cfg, cfg_text, cfg_path, expected: Vec::new(), hypr, st: State::default(), mon, current, pending: Vec::new(), subs: Vec::new(), tx: tx.clone(), remembered_geometry: HashMap::new(), last_plain: None, toggle_back: HashMap::new(), toggle_focused: None, attention: Default::default() };
     d.startup()?;
     d.settle_wait();
     // Конфиг при старте прочитан выше, значит привязки в нём могут быть новее
@@ -238,6 +252,7 @@ pub fn run() -> Result<()> {
                     log::warn!("выход процесса {pid}: {e:#}");
                 }
             }
+            Msg::Attention(i) => d.attention_feed(i),
         }
         d.settle_wait();
     }
@@ -593,7 +608,8 @@ impl Daemon {
                     self.broadcast();
                 }
             }
-            Event::ActiveWindow { .. } => {
+            Event::ActiveWindow { addr } => {
+                self.attention_feed(crate::attention::Input::Focus { addr });
                 // Последнее окно workspace, получавшее фокус: из него берётся
                 // prev, когда цикл начинается с чужого окна.
                 if let Err(e) = self.on_focus() {
@@ -2752,6 +2768,73 @@ impl Daemon {
 }
 
 // ---- /proc ------------------------------------------------------------------
+
+// ---- Сторож внимания ----------------------------------------------------------
+
+impl Daemon {
+    /// Событие сторожа внимания: решает [`crate::attention::Watch`], действует [`AttentionFx`].
+    fn attention_feed(&mut self, input: crate::attention::Input) {
+        let mut watch = std::mem::take(&mut self.attention);
+        let cfg = self.cfg.attention.clone();
+        watch.feed(input, &cfg, &mut AttentionFx { d: self });
+        self.attention = watch;
+    }
+}
+
+/// Действия сторожа внимания через механизмы демона.
+struct AttentionFx<'a> {
+    d: &'a mut Daemon,
+}
+
+impl crate::attention::Effects for AttentionFx<'_> {
+    fn active(&mut self) -> Option<crate::attention::Win> {
+        let c = match self.d.hypr.active_window() {
+            Ok(c) => c?,
+            Err(e) => {
+                log::warn!("внимание: активное окно: {e:#}");
+                return None;
+            }
+        };
+        let app = self.d.cfg.attention.app.clone();
+        let herdr = c.app().is_some_and(|a| a == app) || self.d.hypr.clients().is_ok_and(|cl| app_windows(&self.d.cfg, &cl, &app).iter().any(|w| w.address == c.address));
+        Some(crate::attention::Win { addr: c.address.clone(), class: c.class.clone(), pid: c.pid, fullscreen: c.fullscreen == 2, herdr })
+    }
+    fn playing(&mut self) -> Vec<String> {
+        crate::attention::playing_players()
+    }
+    fn pause(&mut self, players: &[String]) {
+        crate::attention::player_cmd(players, "pause");
+    }
+    fn play(&mut self, players: &[String]) {
+        crate::attention::player_cmd(players, "play");
+    }
+    fn freeze(&mut self, pid: i32) -> Vec<i32> {
+        crate::attention::freeze_tree(pid)
+    }
+    fn thaw(&mut self, pids: &[i32]) {
+        crate::attention::thaw(pids);
+    }
+    fn focus_app(&mut self) -> Result<()> {
+        // Как по клавише приложения: переход на стол с его окном, поднятие
+        // workspace или перетаскивание окна в активный.
+        let app = self.d.cfg.attention.app.clone();
+        self.d.app(&[app], None, None, false, false)
+    }
+    fn window_exists(&mut self, addr: &str) -> bool {
+        self.d.hypr.clients().is_ok_and(|cl| cl.iter().any(|c| c.address == addr))
+    }
+    fn focus(&mut self, addr: &str) -> Result<()> {
+        let clients = self.d.hypr.clients()?;
+        let mut ex = Vec::new();
+        if let Some(n) = clients.iter().find(|c| c.address == addr).and_then(Client::desktop) {
+            ex.push(hypr::d_focus_desktop(n));
+            self.d.current = n;
+        }
+        ex.push(hypr::d_focus_window(addr));
+        ex.extend(hypr::d_cover_fullscreen(&clients, addr));
+        self.d.hypr.dispatch_all(&ex)
+    }
+}
 
 /// pid и все его предки.
 fn ancestors(pid: i32) -> Vec<i32> {
