@@ -477,7 +477,9 @@ pub fn parse_line(line: &str) -> StreamLine {
                 _ => StreamLine::Other,
             }
         }
-        Some(e) if LAYOUT_EVENTS.contains(&e) => StreamLine::Layout,
+        // Имя события состава сервер пишет через подчёркивание (`pane_created`),
+        // хотя подписка называет его через точку (`pane.created`).
+        Some(e) if LAYOUT_EVENTS.iter().any(|l| l.replace('.', "_") == e.replace('.', "_")) => StreamLine::Layout,
         _ => StreamLine::Other,
     }
 }
@@ -778,9 +780,12 @@ mod tests {
     fn stream_lines() {
         assert_eq!(parse_line(r#"{"data":{"agent":"claude","agent_status":"blocked","pane_id":"w2C:p1","workspace_id":"w2C"},"event":"pane.agent_status_changed"}"#), StreamLine::Status { pane: "w2C:p1".into(), blocked: true });
         assert_eq!(parse_line(r#"{"data":{"agent_status":"idle","pane_id":"w1:p1"},"event":"pane.agent_status_changed"}"#), StreamLine::Status { pane: "w1:p1".into(), blocked: false });
-        assert_eq!(parse_line(r#"{"data":{"type":"pane_created","pane":{}},"event":"pane.created"}"#), StreamLine::Layout);
+        assert_eq!(parse_line(r#"{"data":{"type":"pane_created","pane":{}},"event":"pane_created"}"#), StreamLine::Layout);
+        assert_eq!(parse_line(r#"{"data":{"tab_id":"w2E:t9","type":"tab_closed","workspace_id":"w2E"},"event":"tab_closed"}"#), StreamLine::Layout);
+        assert_eq!(parse_line(r#"{"data":{"type":"tab_created"},"event":"tab_created"}"#), StreamLine::Other);
         assert_eq!(parse_line(r#"{"id":"s","result":{"type":"subscription_started"}}"#), StreamLine::Other);
         let r: Value = serde_json::from_str(r#"{"panes":[{"pane_id":"a","agent_status":"blocked"},{"pane_id":"b","agent_status":"idle"}]}"#).unwrap();
         assert_eq!(blocked_of(&parse_panes(&r)), BTreeSet::from(["a".to_string()]));
     }
 }
+
