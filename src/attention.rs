@@ -53,15 +53,19 @@ pub enum Input {
     Disconnected,
     /// Фокус перешёл на окно `addr` (событие композитора).
     Focus { addr: String },
+    /// Плееры, поставленные на паузу по запросу [`Effects::pause_playing`].
+    Paused { players: Vec<String> },
 }
 
 /// Действия сторожа на станции.
 pub trait Effects {
     /// Окно с фокусом; `None` — фокуса нет.
     fn active(&mut self) -> Option<Win>;
-    /// Плееры MPRIS в состоянии `Playing`.
-    fn playing(&mut self) -> Vec<String>;
-    fn pause(&mut self, players: &[String]);
+    /// Поставить на паузу плееры MPRIS в состоянии `Playing`; список
+    /// приходит позже событием [`Input::Paused`]. Плеер, который не отвечает
+    /// по D-Bus, не должен задерживать демон, поэтому вызов не ждёт.
+    fn pause_playing(&mut self);
+    /// Возобновить плееры; вызов не ждёт.
     fn play(&mut self, players: &[String]);
     /// Остановить процесс `pid` и его потомков; возвращает остановленные pid.
     /// Список записывается в файл состояния до первого `SIGSTOP`.
@@ -99,13 +103,15 @@ impl Watch {
             Input::Snapshot { blocked, fresh } => {
                 let entered: Vec<String> = if fresh { Vec::new() } else { blocked.difference(&self.blocked).cloned().collect() };
                 self.blocked = blocked;
+                // Сначала новые панели, затем ушедшие: панель, сменившая
+                // идентификатор (`pane.moved`), не даёт отбоя с новым сигналом.
+                for p in entered {
+                    self.entered(p, cfg, fx);
+                }
                 if let Some(e) = &mut self.engaged {
                     e.panes.retain(|p| self.blocked.contains(p));
                 }
                 self.settle(cfg, fx);
-                for p in entered {
-                    self.entered(p, cfg, fx);
-                }
             }
             Input::Status { pane, blocked } => {
                 if blocked {
@@ -121,12 +127,18 @@ impl Watch {
                 }
             }
             Input::Disconnected => {
+                // Сигнал переживает обрыв (подмена сервера `live-handoff`):
+                // первый снимок нового соединения оставит в нём панели, всё
+                // ещё ждущие ответа, и при их отсутствии даст отбой. Пока
+                // сервера нет, остановленное окно отпускает возврат в него.
                 self.blocked.clear();
-                if let Some(e) = &mut self.engaged {
-                    e.panes.clear();
-                }
-                self.settle(cfg, fx);
             }
+            Input::Paused { players } => match &mut self.engaged {
+                Some(e) => e.players.extend(players),
+                // Отбой случился раньше, чем пауза закончилась.
+                None if !players.is_empty() => fx.play(&players),
+                None => {}
+            },
             Input::Focus { addr } => {
                 // Пользователь сам вернулся в остановленное окно: процесс
                 // продолжает работу сразу, не дожидаясь отбоя.
@@ -156,23 +168,17 @@ impl Watch {
             log::info!("внимание: панель {pane} ждёт ответа, окно herdr уже с фокусом");
             return;
         }
-        let players = if cfg.media_pause {
-            let p = fx.playing();
-            if !p.is_empty() {
-                fx.pause(&p);
-            }
-            p
-        } else {
-            Vec::new()
-        };
+        if cfg.media_pause {
+            fx.pause_playing();
+        }
         let frozen = match &active {
             Some(w) if cfg.freeze_fullscreen && w.fullscreen && w.pid > 1 && !cfg.freeze_excluded(&w.class) => fx.freeze(w.pid),
             _ => Vec::new(),
         };
-        log::info!("внимание: панель {pane} ждёт ответа; прежнее окно {:?}, пауза {players:?}, остановлены {frozen:?}", active.as_ref().map(|w| (&w.addr, &w.class)));
+        log::info!("внимание: панель {pane} ждёт ответа; прежнее окно {:?}, остановлены {frozen:?}", active.as_ref().map(|w| (&w.addr, &w.class)));
         // Даже без фокуса на herdr состояние запоминается: отбой обязан
         // вернуть остановленные процессы и плееры.
-        self.engaged = Some(Engaged { panes: BTreeSet::from([pane]), prev: active, players, frozen });
+        self.engaged = Some(Engaged { panes: BTreeSet::from([pane]), prev: active, players: Vec::new(), frozen });
         if let Err(e) = fx.focus_app() {
             log::warn!("внимание: фокус на herdr: {e:#}");
         }
@@ -356,21 +362,24 @@ pub fn thaw_persisted() {
 
 static TERM_PIPE: AtomicI32 = AtomicI32::new(-1);
 
-extern "C" fn on_terminate(_: nix::libc::c_int) {
+extern "C" fn on_terminate(sig: nix::libc::c_int) {
     let fd = TERM_PIPE.load(Ordering::Relaxed);
     if fd >= 0 {
         // write — безопасная для обработчика сигнала функция.
+        let b = sig as u8;
         unsafe {
-            nix::libc::write(fd, b"x".as_ptr().cast(), 1);
+            nix::libc::write(fd, (&b as *const u8).cast(), 1);
         }
     }
 }
 
 /// Гарантия `SIGCONT` при завершении демона: SIGTERM и SIGINT будят поток,
 /// который возвращает остановленные процессы и завершает демон; паника
-/// тоже их возвращает. Снимок сессии при этом не пишется (README, «Что стоит
-/// знать до правки»). Обработчик, а не маска сигналов: маску унаследовали бы
-/// запускаемые демоном приложения.
+/// тоже их возвращает. Затем сигнал повторяется с действием по умолчанию,
+/// и демон завершается так же, как без обработчика; снимок сессии при этом
+/// не пишется (README, «Что стоит знать до правки»). Обработчик, а не маска
+/// сигналов: маску унаследовали бы запускаемые демоном приложения; канал
+/// создаётся с `O_CLOEXEC` (`std::io::pipe`) и им тоже не достаётся.
 pub fn install_guards() -> Result<()> {
     use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, sigaction};
     let prev = std::panic::take_hook();
@@ -378,19 +387,22 @@ pub fn install_guards() -> Result<()> {
         thaw_persisted();
         prev(info);
     }));
-    let (rd, wr) = nix::unistd::pipe().context("канал сигналов")?;
+    let (mut rd, wr) = std::io::pipe().context("канал сигналов")?;
     TERM_PIPE.store(std::os::fd::IntoRawFd::into_raw_fd(wr), Ordering::Relaxed);
     let act = SigAction::new(SigHandler::Handler(on_terminate), SaFlags::SA_RESTART, SigSet::empty());
     for s in [Signal::SIGTERM, Signal::SIGINT] {
         unsafe { sigaction(s, &act) }.with_context(|| format!("обработчик {s}"))?;
     }
     std::thread::spawn(move || {
-        let mut f = std::fs::File::from(rd);
         let mut b = [0u8; 1];
-        let _ = f.read(&mut b);
-        log::info!("демон завершается по сигналу");
+        let _ = rd.read(&mut b);
+        let sig = Signal::try_from(i32::from(b[0])).unwrap_or(Signal::SIGTERM);
+        log::info!("демон завершается по сигналу {sig}");
         thaw_persisted();
-        std::process::exit(0);
+        unsafe {
+            let _ = nix::sys::signal::signal(sig, SigHandler::SigDfl);
+        }
+        let _ = kill(Pid::this(), sig);
     });
     Ok(())
 }
@@ -539,7 +551,7 @@ fn session(path: &Path, send: &dyn Fn(Input) -> bool) -> Result<()> {
 pub fn watch_herdr(send: impl Fn(Input) -> bool) {
     use notify::{RecursiveMode, Watcher};
     let path = herdr_socket();
-    let (Some(dir), Some(name)) = (path.parent().map(Path::to_path_buf), path.file_name().map(|n| n.to_os_string())) else {
+    let Some(dir) = path.parent().map(Path::to_path_buf) else {
         log::error!("внимание: путь сокета herdr {} без каталога", path.display());
         return;
     };
@@ -563,7 +575,11 @@ pub fn watch_herdr(send: impl Fn(Input) -> bool) {
         log::error!("внимание: наблюдатель {}: {e}", dir.display());
         return;
     }
-    let touches = |ev: &notify::Event| ev.paths.iter().any(|p| p.file_name() == Some(name.as_os_str())) && matches!(ev.kind, notify::EventKind::Create(_) | notify::EventKind::Modify(notify::event::ModifyKind::Name(_)));
+    // Попытка — по любому событию каталога, а не только по созданию сокета:
+    // сокет появляется при bind(), а соединения принимаются после listen(),
+    // и попытка между ними получает отказ. Следующий признак жизни сервера —
+    // запись его журнала `herdr-server.log` в том же каталоге.
+    let touches = |ev: &notify::Event| matches!(ev.kind, notify::EventKind::Create(_) | notify::EventKind::Modify(_));
     loop {
         // События до попытки устарели: сокет проверяется самой попыткой.
         while wrx.try_recv().is_ok() {}
@@ -591,7 +607,6 @@ mod tests {
     #[derive(Default)]
     struct Fake {
         active: Option<Win>,
-        playing: Vec<String>,
         exists: bool,
         log: Vec<String>,
         frozen_by: Vec<i32>,
@@ -601,11 +616,8 @@ mod tests {
         fn active(&mut self) -> Option<Win> {
             self.active.clone()
         }
-        fn playing(&mut self) -> Vec<String> {
-            self.playing.clone()
-        }
-        fn pause(&mut self, p: &[String]) {
-            self.log.push(format!("pause {}", p.join(",")));
+        fn pause_playing(&mut self) {
+            self.log.push("pause".into());
         }
         fn play(&mut self, p: &[String]) {
             self.log.push(format!("play {}", p.join(",")));
@@ -657,11 +669,12 @@ mod tests {
 
     #[test]
     fn video_in_browser_pauses_and_focuses_herdr() {
-        let mut fx = Fake { active: Some(browser()), playing: vec!["chromium.instance1".into()], exists: true, ..Fake::default() };
+        let mut fx = Fake { active: Some(browser()), exists: true, ..Fake::default() };
         let mut w = Watch::default();
         w.feed(st("w1:p1", true), &cfg(), &mut fx);
         // Браузер полноэкранный, но в исключениях — не останавливается.
-        assert_eq!(fx.log, vec!["pause chromium.instance1", "focus herdr"]);
+        assert_eq!(fx.log, vec!["pause", "focus herdr"]);
+        w.feed(Input::Paused { players: vec!["chromium.instance1".into()] }, &cfg(), &mut fx);
         fx.log.clear();
         w.feed(st("w1:p1", false), &cfg(), &mut fx);
         assert_eq!(fx.log, vec!["play chromium.instance1", "focus 0xb"]);
@@ -672,7 +685,8 @@ mod tests {
         let mut fx = Fake { active: Some(game()), exists: true, frozen_by: vec![31], ..Fake::default() };
         let mut w = Watch::default();
         w.feed(st("w1:p1", true), &cfg(), &mut fx);
-        assert_eq!(fx.log, vec!["freeze 30", "focus herdr"]);
+        assert_eq!(fx.log, vec!["pause", "freeze 30", "focus herdr"]);
+        w.feed(Input::Paused { players: Vec::new() }, &cfg(), &mut fx);
         fx.log.clear();
         // Второй вопрос во время сигнала — та же очередь, отбой после обоих.
         w.feed(st("w2:p1", true), &cfg(), &mut fx);
@@ -684,7 +698,7 @@ mod tests {
 
     #[test]
     fn herdr_active_does_nothing() {
-        let mut fx = Fake { active: Some(herdr()), playing: vec!["p".into()], ..Fake::default() };
+        let mut fx = Fake { active: Some(herdr()), ..Fake::default() };
         let mut w = Watch::default();
         w.feed(st("w1:p1", true), &cfg(), &mut fx);
         w.feed(st("w1:p1", false), &cfg(), &mut fx);
@@ -693,9 +707,10 @@ mod tests {
 
     #[test]
     fn user_left_herdr_before_release() {
-        let mut fx = Fake { active: Some(game()), playing: vec!["p".into()], exists: true, ..Fake::default() };
+        let mut fx = Fake { active: Some(game()), exists: true, ..Fake::default() };
         let mut w = Watch::default();
         w.feed(st("w1:p1", true), &cfg(), &mut fx);
+        w.feed(Input::Paused { players: vec!["p".into()] }, &cfg(), &mut fx);
         fx.log.clear();
         let mut other = browser();
         other.addr = "0xo".into();
@@ -725,7 +740,7 @@ mod tests {
         w.feed(Input::Snapshot { blocked: BTreeSet::from(["old".to_string()]), fresh: true }, &cfg(), &mut fx);
         assert!(fx.log.is_empty());
         w.feed(Input::Snapshot { blocked: BTreeSet::from(["old".to_string(), "new".to_string()]), fresh: false }, &cfg(), &mut fx);
-        assert_eq!(fx.log, vec!["focus herdr"]);
+        assert_eq!(fx.log, vec!["pause", "focus herdr"]);
         fx.log.clear();
         // Давно забытая панель отбой не задерживает.
         w.feed(Input::Snapshot { blocked: BTreeSet::from(["old".to_string()]), fresh: false }, &cfg(), &mut fx);
@@ -733,13 +748,44 @@ mod tests {
     }
 
     #[test]
-    fn disconnect_releases() {
-        let mut fx = Fake { active: Some(game()), exists: false, ..Fake::default() };
+    fn signal_survives_reconnect() {
+        let mut fx = Fake { active: Some(game()), exists: true, ..Fake::default() };
         let mut w = Watch::default();
         w.feed(st("w1:p1", true), &cfg(), &mut fx);
         fx.log.clear();
+        // Подмена сервера: обрыв не даёт отбоя, первый снимок оставляет
+        // панель, всё ещё ждущую ответа, в сигнале.
         w.feed(Input::Disconnected, &cfg(), &mut fx);
-        assert_eq!(fx.log, vec!["thaw [30]"]);
+        w.feed(Input::Snapshot { blocked: BTreeSet::from(["w1:p1".to_string()]), fresh: true }, &cfg(), &mut fx);
+        assert!(fx.log.is_empty());
+        // На вопрос ответили, пока связи не было: снимок даёт отбой.
+        w.feed(Input::Disconnected, &cfg(), &mut fx);
+        w.feed(Input::Snapshot { blocked: BTreeSet::new(), fresh: true }, &cfg(), &mut fx);
+        assert_eq!(fx.log, vec!["thaw [30]", "focus 0xg"]);
+    }
+
+    #[test]
+    fn moved_pane_keeps_signal() {
+        let mut fx = Fake { active: Some(game()), exists: true, ..Fake::default() };
+        let mut w = Watch::default();
+        w.feed(st("w1:p3", true), &cfg(), &mut fx);
+        fx.log.clear();
+        // Панель перенесена и получила новый идентификатор.
+        w.feed(Input::Snapshot { blocked: BTreeSet::from(["w2:p1".to_string()]), fresh: false }, &cfg(), &mut fx);
+        assert!(fx.log.is_empty());
+        w.feed(st("w2:p1", false), &cfg(), &mut fx);
+        assert_eq!(fx.log, vec!["thaw [30]", "focus 0xg"]);
+    }
+
+    #[test]
+    fn pause_finished_after_release_resumes_players() {
+        let mut fx = Fake { active: Some(browser()), ..Fake::default() };
+        let mut w = Watch::default();
+        w.feed(st("w1:p1", true), &cfg(), &mut fx);
+        w.feed(st("w1:p1", false), &cfg(), &mut fx);
+        fx.log.clear();
+        w.feed(Input::Paused { players: vec!["p".into()] }, &cfg(), &mut fx);
+        assert_eq!(fx.log, vec!["play p"]);
     }
 
     #[test]

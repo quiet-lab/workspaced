@@ -2799,14 +2799,20 @@ impl crate::attention::Effects for AttentionFx<'_> {
         let herdr = c.app().is_some_and(|a| a == app) || self.d.hypr.clients().is_ok_and(|cl| app_windows(&self.d.cfg, &cl, &app).iter().any(|w| w.address == c.address));
         Some(crate::attention::Win { addr: c.address.clone(), class: c.class.clone(), pid: c.pid, fullscreen: c.fullscreen == 2, herdr })
     }
-    fn playing(&mut self) -> Vec<String> {
-        crate::attention::playing_players()
-    }
-    fn pause(&mut self, players: &[String]) {
-        crate::attention::player_cmd(players, "pause");
+    fn pause_playing(&mut self) {
+        // playerctl ждёт ответа плеера по D-Bus; зависший плеер не должен
+        // задерживать демон, поэтому пауза идёт в отдельном потоке, а список
+        // плееров приходит сообщением.
+        let tx = self.d.tx.clone();
+        std::thread::spawn(move || {
+            let players = crate::attention::playing_players();
+            crate::attention::player_cmd(&players, "pause");
+            let _ = tx.send(Msg::Attention(crate::attention::Input::Paused { players }));
+        });
     }
     fn play(&mut self, players: &[String]) {
-        crate::attention::player_cmd(players, "play");
+        let players = players.to_vec();
+        std::thread::spawn(move || crate::attention::player_cmd(&players, "play"));
     }
     fn freeze(&mut self, pid: i32) -> Vec<i32> {
         crate::attention::freeze_tree(pid)
