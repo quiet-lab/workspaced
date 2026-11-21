@@ -222,6 +222,17 @@ pub fn run() -> Result<()> {
         std::thread::spawn(move || crate::attention::watch_herdr(move |i| tx.send(Msg::Attention(i)).is_ok()));
     }
     let mut d = Daemon { cfg: cfg.clone(), cfg_file: cfg, cfg_text, cfg_path, expected: Vec::new(), hypr, st: State::default(), mon, current, pending: Vec::new(), subs: Vec::new(), tx: tx.clone(), remembered_geometry: HashMap::new(), last_plain: None, toggle_back: HashMap::new(), toggle_focused: None, attention: Default::default() };
+    // Демон, запущенный без монитора, сразу считает экран потерянным
+    // (изменение monitor-loss-layout, решение D1): событие появления
+    // запасного выхода ушло раньше, чем демон подписался на события.
+    match d.hypr.monitors() {
+        Ok(mons) => {
+            if let Some(size) = lost_screen(&mons) {
+                d.screen_lost(size, "при старте виден только запасной выход");
+            }
+        }
+        Err(e) => log::warn!("список мониторов при старте: {e:#}"),
+    }
     d.startup()?;
     d.settle_wait();
     // Конфиг при старте прочитан выше, значит привязки в нём могут быть новее
@@ -617,20 +628,35 @@ impl Daemon {
                 }
             }
             Event::MonitorRemoved { name } => {
-                if name != hypr::FALLBACK_OUTPUT {
-                    let mons = self.hypr.monitors()?;
-                    if mons.iter().all(|m| m.name == hypr::FALLBACK_OUTPUT) {
-                        self.screen_lost(fallback_size(&mons), &name);
-                    }
+                if name != hypr::FALLBACK_OUTPUT
+                    && let Some(size) = lost_screen(&self.hypr.monitors()?)
+                {
+                    self.screen_lost(size, &name);
                 }
             }
             Event::MonitorAdded { name } => {
                 if name == hypr::FALLBACK_OUTPUT {
                     let size = self.hypr.monitors().map(|m| fallback_size(&m)).unwrap_or(FALLBACK_SIZE);
                     self.screen_lost(size, &name);
-                } else if let Some(fb) = self.st.screen_lost.take() {
-                    log::info!("монитор {name} подключён: экран возвращён, раскладка снова снимается с экрана");
-                    self.restore_after_screen(fb)?;
+                } else if let Some(fb) = self.st.screen_lost {
+                    // Размер монитора перечитывается до возврата окон: при
+                    // старте демона мог быть виден только запасной выход.
+                    match self.hypr.monitors() {
+                        Ok(mons) => match mons.iter().find(|m| m.name == name) {
+                            Some(m) => self.mon = (m.width, m.height),
+                            None => log::warn!("монитор {name} не найден в списке композитора; размер монитора остаётся {}×{}", self.mon.0, self.mon.1),
+                        },
+                        Err(e) => log::warn!("список мониторов: {e:#}; размер монитора остаётся {}×{}", self.mon.0, self.mon.1),
+                    }
+                    // Признак снимается только после удачного возврата окон:
+                    // иначе сдвинутое положение сняли бы с экрана как место.
+                    match self.restore_after_screen(fb) {
+                        Ok(()) => {
+                            self.st.screen_lost = None;
+                            log::info!("монитор {name} подключён: экран возвращён, раскладка снова снимается с экрана");
+                        }
+                        Err(e) => log::warn!("монитор {name} подключён, но окна не возвращены: {e:#}; экран по-прежнему считается потерянным"),
+                    }
                 }
             }
             Event::Other(_) => {}
@@ -689,7 +715,7 @@ impl Daemon {
             if let Some(r) = f.rect {
                 ex.extend(hypr::d_place(&f.addr, r));
             }
-            self.st.geom.entry(ws.clone()).or_default().insert(f.addr.clone(), f.rect.unwrap_or(f.now));
+            self.st.remember_rect(&ws, &f.addr, f.rect.unwrap_or(f.now), f.now);
         }
         if let Some(a) = self.hypr.active_window()?.filter(|c| c.desktop() == Some(n)) {
             ex.push(hypr::d_raise(&a.address));
@@ -926,7 +952,7 @@ impl Daemon {
         // окно встанет туда же. Изменённое место без владельца (раскладка
         // из снимка) достаётся этому окну (решение D9).
         if let Some(w) = ws.clone().filter(|_| c.desktop().is_some()) {
-            self.st.geom.entry(w.clone()).or_default().insert(c.address.clone(), rect.unwrap_or_else(|| c.rect()));
+            self.st.remember_rect(&w, &c.address, rect.unwrap_or_else(|| c.rect()), c.rect());
             claim_owner(&mut self.st, &cfg, &w, app, &c.address);
         }
         log::info!("новое окно {} ({}, «{}») → приложение {app}, экземпляр {num}, workspace {}", c.address, c.class, c.title, ws.as_deref().unwrap_or("нет"));
@@ -1501,7 +1527,7 @@ impl Daemon {
                 if let Some(r) = target {
                     ex.extend(hypr::d_place(&c.address, r));
                 }
-                self.st.geom.entry(ws.to_string()).or_default().insert(c.address.clone(), target.unwrap_or_else(|| c.rect()));
+                self.st.remember_rect(ws, &c.address, target.unwrap_or_else(|| c.rect()), c.rect());
                 if target.is_some() && target == rect {
                     claim_owner(&mut self.st, &cfg, ws, app, &c.address);
                 }
@@ -1558,7 +1584,7 @@ impl Daemon {
         if let Some(r) = r {
             ex.extend(hypr::d_place(&c.address, r));
         }
-        self.st.geom.entry(v.clone()).or_default().insert(c.address.clone(), r.unwrap_or_else(|| c.rect()));
+        self.st.remember_rect(&v, &c.address, r.unwrap_or_else(|| c.rect()), c.rect());
         log::info!("окно {} ({}) уходит на стол {k} к workspace {v}", c.address, c.class);
     }
 
@@ -2359,7 +2385,7 @@ impl Daemon {
         if let Home::Desktop(k) = home
             && let Some(w) = act.get(&k).filter(|w| members.contains(*w))
         {
-            self.st.geom.entry(w.clone()).or_default().insert(addr.clone(), rect.unwrap_or_else(|| c.rect()));
+            self.st.remember_rect(w, &addr, rect.unwrap_or_else(|| c.rect()), c.rect());
             claim_owner(&mut self.st, &cfg, w, &e.app, &addr);
         }
         self.st.foreign.remove(&addr);
@@ -3307,6 +3333,12 @@ pub const FALLBACK_SIZE: (i32, i32) = (1920, 1080);
 /// без него в списке — [`FALLBACK_SIZE`].
 pub fn fallback_size(mons: &[hypr::Monitor]) -> (i32, i32) {
     mons.iter().find(|m| m.name == hypr::FALLBACK_OUTPUT).map(|m| (m.width, m.height)).unwrap_or(FALLBACK_SIZE)
+}
+
+/// Размер запасного выхода, если кроме него у композитора нет мониторов
+/// (экран потерян, решение D1); иначе `None`.
+pub fn lost_screen(mons: &[hypr::Monitor]) -> Option<(i32, i32)> {
+    mons.iter().all(|m| m.name == hypr::FALLBACK_OUTPUT).then(|| fallback_size(mons))
 }
 
 /// План возврата окон после возвращения монитора (изменение
@@ -7630,5 +7662,177 @@ apps = { chromium = "left", chrome-ai = "right" }
         let mut resized = nv.clone();
         resized.size = (1700, 1065);
         assert!(restore_plan(&st, &[resized], FB).is_empty());
+    }
+
+    #[test]
+    fn remembered_rect_kept_while_screen_lost() {
+        let cfg = Config::parse(LOSS_CFG).unwrap();
+        let mut nv = client("0x1", "neovide", "", "1", &["app:neovide#1", "ws:work"]);
+        put(&mut nv, RIGHT_CELL);
+        let mut st = loss_state(&cfg, std::slice::from_ref(&nv));
+        st.screen_lost = Some(FB);
+        put(&mut nv, PxRect { x: 170, ..RIGHT_CELL });
+
+        // Ctrl+Super+2: work едет на стол 2, окно сохраняет прямоугольник,
+        // прочитанный у композитора, — это сдвиг запасного выхода.
+        st.desktop(1).active = None;
+        st.desktop(2).active = Some("work".into());
+        let kept = st.geom["work"].get("0x1").copied();
+        let target = raise_target(true, true, kept, Some(RIGHT_CELL), nv.rect()).unwrap();
+        st.remember_rect("work", "0x1", target, nv.rect());
+        assert_eq!(st.geom["work"]["0x1"], RIGHT_CELL);
+        // Место из раскладки пишется и при потерянном экране.
+        let other = PxRect { x: 340, y: 10, w: 1740, h: 1065 };
+        st.remember_rect("surf", "0x1", other, nv.rect());
+        st.remember_rect("surf", "0x1", PxRect { x: 500, ..other }, nv.rect());
+        assert_eq!(st.geom["surf"]["0x1"], PxRect { x: 500, ..other });
+        // Записи нет — нынешний прямоугольник пишется, как обычно.
+        st.remember_rect("work", "0x9", nv.rect(), nv.rect());
+        assert_eq!(st.geom["work"]["0x9"], nv.rect());
+
+        // Монитор вернулся: окно на столе 2 возвращается в 2090,10.
+        st.screen_lost = None;
+        nv.workspace.name = "2".into();
+        assert_eq!(restore_plan(&st, std::slice::from_ref(&nv), FB), vec![("0x1".to_string(), RIGHT_CELL)]);
+        // С экраном нынешний прямоугольник заменяет запомненный.
+        st.remember_rect("work", "0x1", nv.rect(), nv.rect());
+        assert_eq!(st.geom["work"]["0x1"], nv.rect());
+    }
+
+    #[test]
+    fn snapshot_rect_from_memory_while_screen_lost() {
+        let cfg = Config::parse(LOSS_CFG).unwrap();
+        let mut nv = client("0x1", "neovide", "", "1", &["app:neovide#1", "ws:work"]);
+        put(&mut nv, RIGHT_CELL);
+        let mut st = loss_state(&cfg, std::slice::from_ref(&nv));
+        put(&mut nv, PxRect { x: 170, ..RIGHT_CELL });
+        let none = |_: i32| (Vec::new(), None);
+        let rec = |st: &State, nv: &Client| crate::session::instance_record(nv, std::slice::from_ref(nv), st, &cfg, &none, "1".into());
+        // С экраном снимок пишет нынешнее положение окна.
+        let r = rec(&st, &nv);
+        assert_eq!((r.rect, r.rects["work"]), (nv.rect(), nv.rect()));
+        // Без экрана — запомненное, без сдвига композитора.
+        st.screen_lost = Some(FB);
+        let r = rec(&st, &nv);
+        assert_eq!((r.rect, r.rects["work"]), (RIGHT_CELL, RIGHT_CELL));
+        // Окна без записи остаются в нынешнем прямоугольнике.
+        assert_eq!(st.window_rect("work", "0x9", nv.rect()), nv.rect());
+    }
+
+    /// Подставной композитор: отвечает на запросы `j/monitors`, `j/clients`
+    /// и `dispatch` заданными строками и запоминает диспетчеры.
+    struct FakeHypr {
+        path: PathBuf,
+        dispatched: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl FakeHypr {
+        fn start(tag: &str, monitors: &str, clients: &str, dispatch_reply: &str) -> FakeHypr {
+            use std::io::Read;
+            let dir = std::env::var("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(|_| std::env::temp_dir());
+            let path = dir.join(format!("workspaced-test-{}-{tag}.sock", std::process::id()));
+            let _ = std::fs::remove_file(&path);
+            let listener = UnixListener::bind(&path).unwrap();
+            let dispatched = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (mons, cls, reply, log) = (monitors.to_string(), clients.to_string(), dispatch_reply.to_string(), dispatched.clone());
+            std::thread::spawn(move || {
+                for s in listener.incoming() {
+                    let Ok(mut s) = s else { break };
+                    let mut buf = [0u8; 65536];
+                    let n = s.read(&mut buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let out = if req == "j/monitors" {
+                        mons.clone()
+                    } else if req == "j/clients" {
+                        cls.clone()
+                    } else if let Some(e) = req.strip_prefix("dispatch ") {
+                        log.lock().unwrap().push(e.to_string());
+                        reply.clone()
+                    } else {
+                        String::new()
+                    };
+                    let _ = s.write_all(out.as_bytes());
+                }
+            });
+            FakeHypr { path, dispatched }
+        }
+
+        fn daemon(&self) -> Daemon {
+            let cfg = Config::parse(LOSS_CFG).unwrap();
+            let (tx, _) = mpsc::channel();
+            Daemon { cfg: cfg.clone(), cfg_file: cfg, cfg_text: LOSS_CFG.to_string(), cfg_path: PathBuf::new(), expected: Vec::new(), hypr: Hypr::with_socket(self.path.clone()), st: State::default(), mon: FB, current: 1, pending: Vec::new(), subs: Vec::new(), tx, remembered_geometry: HashMap::new(), last_plain: None, toggle_back: HashMap::new(), toggle_focused: None, attention: Default::default() }
+        }
+    }
+
+    impl Drop for FakeHypr {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    const NV_SHIFTED: &str = r#"[{"address":"0x1","class":"neovide","title":"","workspace":{"id":1,"name":"1"},"tags":["app:neovide#1","ws:work"],"at":[170,10],"size":[1740,1065],"floating":true,"mapped":true}]"#;
+    const MONS_DP2: &str = r#"[{"name":"DP-2","width":3840,"height":2160,"focused":true},{"name":"FALLBACK","width":1920,"height":1080}]"#;
+
+    /// Демон с потерянным экраном и окном neovide, сдвинутым в 170,10.
+    fn lost_daemon(h: &FakeHypr) -> Daemon {
+        let mut d = h.daemon();
+        d.st.desktop(1).active = Some("work".into());
+        d.st.geom.entry("work".into()).or_default().insert("0x1".into(), RIGHT_CELL);
+        d.st.screen_lost = Some(FB);
+        d
+    }
+
+    #[test]
+    fn screen_flag_cleared_only_after_restore() {
+        // Композитор отклонил диспетчеры: признак остаётся, размер тот же.
+        let h = FakeHypr::start("reject", MONS_DP2, NV_SHIFTED, "error");
+        let mut d = lost_daemon(&h);
+        d.on_event(Event::MonitorAdded { name: "DP-2".into() }).unwrap();
+        assert_eq!(d.st.screen_lost, Some(FB));
+        assert_eq!(h.dispatched.lock().unwrap().len(), 1);
+        // Пока признак стоит, раскладка не снимается.
+        let cfg = d.cfg.clone();
+        let clients: Vec<Client> = serde_json::from_str(NV_SHIFTED).unwrap();
+        absorb_into(&cfg, &mut d.st, "work", 1, &clients, MON);
+        assert!(d.st.moved.is_empty() && d.st.geom["work"]["0x1"] == RIGHT_CELL);
+
+        // Диспетчеры приняты: окно возвращено, признак снят.
+        let h = FakeHypr::start("accept", MONS_DP2, NV_SHIFTED, "ok");
+        let mut d = lost_daemon(&h);
+        d.on_event(Event::MonitorAdded { name: "DP-2".into() }).unwrap();
+        assert_eq!(d.st.screen_lost, None);
+        let sent = h.dispatched.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("x = 2090, y = 10") && sent[0].contains("address:0x1"));
+    }
+
+    #[test]
+    fn monitor_size_reread_when_monitor_returns() {
+        // Демон стартовал без монитора: размер был снят с запасного выхода.
+        let h = FakeHypr::start("size", MONS_DP2, "[]", "ok");
+        let mut d = lost_daemon(&h);
+        assert_eq!(d.mon, FB);
+        d.on_event(Event::MonitorAdded { name: "DP-2".into() }).unwrap();
+        assert_eq!(d.mon, (3840, 2160));
+        // Окон для возврата нет — диспетчеры не отправляются.
+        assert!(h.dispatched.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn screen_lost_by_monitor_list() {
+        // При старте и после пропажи монитора: только запасной выход.
+        let only_fb: Vec<hypr::Monitor> = serde_json::from_str(r#"[{"name":"FALLBACK","width":1920,"height":1080}]"#).unwrap();
+        assert_eq!(lost_screen(&only_fb), Some((1920, 1080)));
+        let both: Vec<hypr::Monitor> = serde_json::from_str(MONS_DP2).unwrap();
+        assert_eq!(lost_screen(&both), None);
+        // Событие пропажи монитора поднимает признак по списку композитора.
+        let h = FakeHypr::start("removed", r#"[{"name":"FALLBACK","width":1920,"height":1080}]"#, "[]", "ok");
+        let mut d = h.daemon();
+        d.on_event(Event::MonitorRemoved { name: "DP-2".into() }).unwrap();
+        assert_eq!(d.st.screen_lost, Some((1920, 1080)));
+        // Пропажа самого запасного выхода признак не трогает.
+        let mut d = h.daemon();
+        d.on_event(Event::MonitorRemoved { name: "FALLBACK".into() }).unwrap();
+        assert_eq!(d.st.screen_lost, None);
     }
 }

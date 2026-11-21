@@ -117,7 +117,7 @@ pub fn instance_record(c: &Client, clients: &[Client], st: &State, cfg: &Config,
     let mut rects = BTreeMap::new();
     for w in workspaces.iter().filter(|w| cfg.workspaces.contains_key(*w)) {
         let here = c.desktop().is_some_and(|n| act.get(&n) == Some(w));
-        let r = if here { Some(c.rect()) } else { st.geom.get(w).and_then(|g| g.get(&c.address)).copied() };
+        let r = if here { Some(st.window_rect(w, &c.address, c.rect())) } else { st.geom.get(w).and_then(|g| g.get(&c.address)).copied() };
         if let Some(r) = r {
             rects.insert(w.clone(), r);
         }
@@ -126,7 +126,10 @@ pub fn instance_record(c: &Client, clients: &[Client], st: &State, cfg: &Config,
     let first = clients.iter().filter_map(|x| x.app_instance()).filter(|(a, _)| *a == app).map(|(_, n)| n).min() == Some(num);
     let (cmd, cwd) = if own_process && !first { proc(c.pid) } else { (Vec::new(), None) };
     let cwd = if cmd.is_empty() { None } else { cwd };
-    SessionWindow { app: Some(app), instance: Some(num), workspaces, desktop, rect: c.rect(), rects, cmd, cwd, ..SessionWindow::default() }
+    // Пока экран потерян, вместо сдвига композитора — запомненный
+    // прямоугольник окна в активном workspace его стола (решение D4).
+    let rect = c.desktop().and_then(|n| act.get(&n)).map_or(c.rect(), |w| st.window_rect(w, &c.address, c.rect()));
+    SessionWindow { app: Some(app), instance: Some(num), workspaces, desktop, rect, rects, cmd, cwd, ..SessionWindow::default() }
 }
 
 /// Записи плана восстановления, которые ещё ждут поднятия своего workspace

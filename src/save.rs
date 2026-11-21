@@ -205,20 +205,22 @@ pub struct Adopted {
 /// нужно, команда не двигает. Окно, которое принимать не следует (диалог,
 /// окно без класса, класс из `ignore_classes`, окно без командной строки),
 /// остаётся свободным со строкой в журнале.
-fn session_plan(cfg: &Config, file: &Config, ws: &str, taken: &mut Vec<String>, windows: &[(&Client, Option<&Foreign>)]) -> Vec<Adopted> {
+fn session_plan(cfg: &Config, file: &Config, st: &State, ws: &str, taken: &mut Vec<String>, windows: &[(&Client, Option<&Foreign>)]) -> Vec<Adopted> {
     let mut out = Vec::new();
     for (c, f) in windows {
+        // Пока экран потерян — запомненный прямоугольник окна (решение D4).
+        let rect = st.window_rect(ws, &c.address, c.rect());
         let cmd: Vec<String> = f.map(|f| f.cmd.clone()).unwrap_or_default();
         match daemon::join_window(cfg, file, Some(ws), c, &cmd, taken) {
             daemon::Join::App(app) => out.push(Adopted { addr: c.address.clone(), app, extra: None }),
             daemon::Join::AppPlace(app) => {
-                out.push(Adopted { addr: c.address.clone(), app, extra: Some(ExtraApp { rect: c.rect(), ..ExtraApp::default() }) });
+                out.push(Adopted { addr: c.address.clone(), app, extra: Some(ExtraApp { rect, ..ExtraApp::default() }) });
             }
             daemon::Join::Extra(name) => {
                 if !taken.contains(&name) {
                     taken.push(name.clone());
                 }
-                let extra = ExtraApp { class: Some(c.class.clone()), cmd, cwd: f.and_then(|f| f.cwd.clone()), rect: c.rect() };
+                let extra = ExtraApp { class: Some(c.class.clone()), cmd, cwd: f.and_then(|f| f.cwd.clone()), rect };
                 out.push(Adopted { addr: c.address.clone(), app: name, extra: Some(extra) });
             }
             daemon::Join::Free(reason) => {
@@ -244,7 +246,7 @@ fn accept_desktop(d: &mut Daemon, n: u8, ws: &str) -> Result<usize> {
     let foreign = d.state().foreign.clone();
     let windows: Vec<(&Client, Option<&Foreign>)> = clients.iter().filter(|c| c.desktop() == Some(n) && c.app().is_none()).map(|c| (c, foreign.get(&c.address))).collect();
     let mut taken = daemon::taken_names(&cfg, &d.state().extra);
-    let plan = session_plan(&cfg, &file, ws, &mut taken, &windows);
+    let plan = session_plan(&cfg, &file, d.state(), ws, &mut taken, &windows);
     if plan.is_empty() {
         return Ok(0);
     }
@@ -463,7 +465,7 @@ pub fn save_workspace(d: &mut Daemon) -> Result<String> {
             ex.push(hypr::d_tag(&c.address, &format!("app:{name}#{}", next_instance(&mut used, &name))));
         }
         ex.push(hypr::d_tag(&c.address, &hypr::ws_tag(&ws)));
-        places.push((name.clone(), Item::Value(rect_item(c.rect()))));
+        places.push((name.clone(), Item::Value(rect_item(d.state().window_rect(&ws, &c.address, c.rect())))));
         adopted.push(c.address.clone());
         log::info!("сохранение: окно {} ({}) → приложение {name} workspace {ws}", c.address, c.class);
     }
@@ -703,7 +705,7 @@ apps = { chromium = "left" }
         let windows: Vec<(&crate::hypr::Client, Option<&Foreign>)> =
             vec![(&alien, Some(&f_alien)), (&known, Some(&f_known)), (&outside, Some(&f_outside)), (&mute, Some(&f_mute))];
         let mut taken: Vec<String> = cfg.apps.keys().cloned().collect();
-        let plan = session_plan(&cfg, &cfg, ws, &mut taken, &windows);
+        let plan = session_plan(&cfg, &cfg, &State::default(), ws, &mut taken, &windows);
 
         // Окно без подходящего приложения конфига даёт новую запись с классом,
         // командой, каталогом и своим прямоугольником.
@@ -724,6 +726,23 @@ apps = { chromium = "left" }
     }
 
     #[test]
+    fn session_plan_rect_from_memory_while_screen_lost() {
+        let cfg = Config::parse(CFG).unwrap();
+        let mut a = test_client("0x1", "Galculator", "Калькулятор", "1", &[]);
+        (a.at, a.size) = ((170, 10), (800, 600));
+        let f = foreign(&["galculator"]);
+        let windows: Vec<(&crate::hypr::Client, Option<&Foreign>)> = vec![(&a, Some(&f))];
+        let kept = PxRect { x: 2090, y: 10, w: 800, h: 600 };
+        let mut st = State::default();
+        st.geom.entry("solo".into()).or_default().insert("0x1".into(), kept);
+        let rect = |st: &State| session_plan(&cfg, &cfg, st, "solo", &mut cfg.apps.keys().cloned().collect(), &windows)[0].extra.clone().unwrap().rect;
+        // С экраном — нынешний прямоугольник, без экрана — запомненный.
+        assert_eq!(rect(&st), a.rect());
+        st.screen_lost = Some((1920, 1080));
+        assert_eq!(rect(&st), kept);
+    }
+
+    #[test]
     fn session_plan_uniquifies_names() {
         let cfg = Config::parse(CFG).unwrap();
         let a = test_client("0x1", "Galculator", "Первый", "1", &[]);
@@ -731,7 +750,7 @@ apps = { chromium = "left" }
         let f = foreign(&["galculator"]);
         let windows: Vec<(&crate::hypr::Client, Option<&Foreign>)> = vec![(&a, Some(&f)), (&b, Some(&f))];
         let mut taken: Vec<String> = cfg.apps.keys().cloned().collect();
-        let plan = session_plan(&cfg, &cfg, "solo", &mut taken, &windows);
+        let plan = session_plan(&cfg, &cfg, &State::default(), "solo", &mut taken, &windows);
         assert_eq!(plan.iter().map(|a| a.app.as_str()).collect::<Vec<_>>(), vec!["galculator", "galculator-2"]);
     }
 
@@ -743,7 +762,7 @@ apps = { chromium = "left" }
         let f = foreign(&["/usr/lib/chromium/chromium", "--ozone-platform=wayland"]);
         let windows: Vec<(&crate::hypr::Client, Option<&Foreign>)> = vec![(&tm, Some(&f))];
         let mut taken: Vec<String> = cfg.apps.keys().cloned().collect();
-        assert!(session_plan(&cfg, &cfg, "solo", &mut taken, &windows).is_empty());
+        assert!(session_plan(&cfg, &cfg, &State::default(), "solo", &mut taken, &windows).is_empty());
     }
 
     #[test]

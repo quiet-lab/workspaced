@@ -144,6 +144,29 @@ pub struct State {
 }
 
 impl State {
+    /// Запомнить прямоугольник окна `addr` в `ws`. Пока экран потерян,
+    /// нынешний прямоугольник окна (`r == now`) задал композитор переносом
+    /// на запасной выход, поэтому уже запомненная запись им не заменяется
+    /// (изменение monitor-loss-layout, решение D2); записи нет — она пишется,
+    /// как обычно. Место из раскладки (`r != now`) пишется всегда.
+    pub fn remember_rect(&mut self, ws: &str, addr: &str, r: PxRect, now: PxRect) {
+        let g = self.geom.entry(ws.to_string()).or_default();
+        if self.screen_lost.is_some() && r == now && g.contains_key(addr) {
+            return;
+        }
+        g.insert(addr.to_string(), r);
+    }
+
+    /// Прямоугольник окна `addr` в `ws` для записи в снимок или конфиг:
+    /// пока экран потерян — запомненный, если он есть (решение D4), иначе
+    /// нынешний `now`.
+    pub fn window_rect(&self, ws: &str, addr: &str, now: PxRect) -> PxRect {
+        if self.screen_lost.is_none() {
+            return now;
+        }
+        self.geom.get(ws).and_then(|g| g.get(addr)).copied().unwrap_or(now)
+    }
+
     pub fn desktop(&mut self, n: u8) -> &mut Desktop {
         self.desktops.entry(n).or_default()
     }

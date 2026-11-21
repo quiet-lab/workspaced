@@ -248,6 +248,12 @@ impl Hypr {
         Ok(Hypr { sock: dir.join(".socket.sock"), sock2: dir.join(".socket2.sock") })
     }
 
+    /// Клиент композитора на заданном сокете запросов (подставной композитор в тестах).
+    #[cfg(test)]
+    pub fn with_socket(sock: PathBuf) -> Self {
+        Hypr { sock2: sock.with_extension("events"), sock }
+    }
+
     pub fn request(&self, req: &str) -> Result<String> {
         let mut s = UnixStream::connect(&self.sock).context("сокет Hyprland недоступен")?;
         s.write_all(req.as_bytes())?;
