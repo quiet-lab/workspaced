@@ -204,7 +204,34 @@ pub enum Event {
     MoveWindow { addr: String, workspace: String },
     Workspace { name: String },
     ActiveWindow { addr: String },
+    /// Композитор подключил монитор (`monitoraddedv2`), имя — второе поле.
+    MonitorAdded { name: String },
+    /// Композитор отключил монитор (`monitorremovedv2`).
+    MonitorRemoved { name: String },
     Other(String),
+}
+
+/// Имя запасного выхода, который Hyprland создаёт, когда пропадает последний
+/// монитор (`FALLBACK_OUTPUT_NAME`, `src/state/FallbackState.hpp`).
+pub const FALLBACK_OUTPUT: &str = "FALLBACK";
+
+/// Разбор строки `.socket2.sock` вида `имя>>данные`; строка без `>>` — `None`.
+/// Данные делятся по запятым не больше чем на четыре поля: последнее поле
+/// (описание монитора, заголовок окна) может само содержать запятые.
+pub fn parse_event(line: &str) -> Option<Event> {
+    let (name, data) = line.split_once(">>")?;
+    let parts: Vec<&str> = data.splitn(4, ',').collect();
+    let field = |i: usize| parts.get(i).unwrap_or(&"").to_string();
+    Some(match name {
+        "openwindow" => Event::OpenWindow { addr: norm_addr(parts[0]), workspace: field(1) },
+        "closewindow" => Event::CloseWindow { addr: norm_addr(parts[0]) },
+        "movewindowv2" => Event::MoveWindow { addr: norm_addr(parts[0]), workspace: field(2) },
+        "workspacev2" => Event::Workspace { name: field(1) },
+        "activewindowv2" => Event::ActiveWindow { addr: norm_addr(parts[0]) },
+        "monitoraddedv2" => Event::MonitorAdded { name: field(1) },
+        "monitorremovedv2" => Event::MonitorRemoved { name: field(1) },
+        other => Event::Other(other.to_string()),
+    })
 }
 
 /// Адрес в виде `0x…` строчными буквами (события приходят без `0x`).
@@ -240,10 +267,15 @@ impl Hypr {
         Ok(ws.name)
     }
 
+    /// Все мониторы композитора.
+    pub fn monitors(&self) -> Result<Vec<Monitor>> {
+        let text = self.request("j/monitors")?;
+        serde_json::from_str(&text).context("разбор j/monitors")
+    }
+
     /// Активный монитор (с фокусом, иначе первый в списке).
     pub fn active_monitor(&self) -> Result<Monitor> {
-        let text = self.request("j/monitors")?;
-        let mons: Vec<Monitor> = serde_json::from_str(&text).context("разбор j/monitors")?;
+        let mons = self.monitors()?;
         mons.iter().find(|m| m.focused).or(mons.first()).cloned().context("нет мониторов")
     }
 
@@ -291,16 +323,7 @@ impl Hypr {
         let reader = BufReader::new(s);
         for line in reader.lines() {
             let line = line?;
-            let Some((name, data)) = line.split_once(">>") else { continue };
-            let parts: Vec<&str> = data.splitn(4, ',').collect();
-            let ev = match name {
-                "openwindow" => Event::OpenWindow { addr: norm_addr(parts[0]), workspace: parts.get(1).unwrap_or(&"").to_string() },
-                "closewindow" => Event::CloseWindow { addr: norm_addr(parts[0]) },
-                "movewindowv2" => Event::MoveWindow { addr: norm_addr(parts[0]), workspace: parts.get(2).unwrap_or(&"").to_string() },
-                "workspacev2" => Event::Workspace { name: parts.get(1).unwrap_or(&"").to_string() },
-                "activewindowv2" => Event::ActiveWindow { addr: norm_addr(parts[0]) },
-                other => Event::Other(other.to_string()),
-            };
+            let Some(ev) = parse_event(&line) else { continue };
             if tx.send(ev).is_err() {
                 break;
             }
@@ -515,6 +538,23 @@ mod tests {
             "specialWorkspace":{"address":"x","type":"special","id":-98,"name":"special:pool"}}]"#;
         let m: Vec<Monitor> = serde_json::from_str(open).unwrap();
         assert_eq!(m[0].special_workspace.as_ref().unwrap().name, "special:pool");
+    }
+
+    #[test]
+    fn monitor_events_parse() {
+        // Описание монитора может содержать запятые: имя — всегда второе поле.
+        let ev = parse_event("monitoraddedv2>>1,DP-2,Dell Inc. DELL U2723QE, 4K,ABC").unwrap();
+        assert!(matches!(ev, Event::MonitorAdded { name } if name == "DP-2"));
+        let ev = parse_event("monitoraddedv2>>2,FALLBACK,").unwrap();
+        assert!(matches!(ev, Event::MonitorAdded { name } if name == FALLBACK_OUTPUT));
+        let ev = parse_event("monitorremovedv2>>1,DP-2,Dell Inc. DELL U2723QE").unwrap();
+        assert!(matches!(ev, Event::MonitorRemoved { name } if name == "DP-2"));
+        // Событие первой версии без номера разбирается как постороннее.
+        assert!(matches!(parse_event("monitoradded>>DP-2").unwrap(), Event::Other(n) if n == "monitoradded"));
+        // Прежние события разбираются как раньше; строка без «>>» пропускается.
+        assert!(matches!(parse_event("workspacev2>>2,2").unwrap(), Event::Workspace { name } if name == "2"));
+        assert!(matches!(parse_event("openwindow>>ABC,1,neovide,a, b").unwrap(), Event::OpenWindow { addr, workspace } if addr == "0xabc" && workspace == "1"));
+        assert!(parse_event("мусор").is_none());
     }
 
     #[test]

@@ -616,8 +616,53 @@ impl Daemon {
                     log::warn!("смена фокуса: {e:#}");
                 }
             }
+            Event::MonitorRemoved { name } => {
+                if name != hypr::FALLBACK_OUTPUT {
+                    let mons = self.hypr.monitors()?;
+                    if mons.iter().all(|m| m.name == hypr::FALLBACK_OUTPUT) {
+                        self.screen_lost(fallback_size(&mons), &name);
+                    }
+                }
+            }
+            Event::MonitorAdded { name } => {
+                if name == hypr::FALLBACK_OUTPUT {
+                    let size = self.hypr.monitors().map(|m| fallback_size(&m)).unwrap_or(FALLBACK_SIZE);
+                    self.screen_lost(size, &name);
+                } else if let Some(fb) = self.st.screen_lost.take() {
+                    log::info!("монитор {name} подключён: экран возвращён, раскладка снова снимается с экрана");
+                    self.restore_after_screen(fb)?;
+                }
+            }
             Event::Other(_) => {}
         }
+        Ok(())
+    }
+
+    /// Поднять признак потерянного экрана с размером запасного выхода
+    /// (решение D1); повторное событие только обновляет размер.
+    fn screen_lost(&mut self, size: (i32, i32), cause: &str) {
+        if self.st.screen_lost.replace(size).is_none() {
+            log::info!("экран потерян ({cause}): запасной выход {}×{}, раскладка с экрана не снимается", size.0, size.1);
+        }
+    }
+
+    /// Вернуть в запомненные прямоугольники окна, которые композитор сдвинул,
+    /// перенося их на запасной выход и обратно (решение D3). Изменённые места,
+    /// главное приложение и фокус не меняются; всё уходит одной
+    /// последовательностью диспетчеров.
+    fn restore_after_screen(&mut self, fb: (i32, i32)) -> Result<()> {
+        let clients = self.hypr.clients()?;
+        let plan = restore_plan(&self.st, &clients, fb);
+        let mut ex = Vec::new();
+        for (addr, r) in &plan {
+            if let Some(c) = clients.iter().find(|c| &c.address == addr) {
+                let now = c.rect();
+                log::info!("окно {addr} ({}) возвращено после пропажи экрана: {},{} → {},{} {}×{}", c.class, now.x, now.y, r.x, r.y, r.w, r.h);
+            }
+            ex.extend(hypr::d_place(addr, *r));
+        }
+        self.hypr.dispatch_all(&ex)?;
+        self.broadcast();
         Ok(())
     }
 
@@ -3220,7 +3265,13 @@ pub fn absorb_plan(cfg: &Config, st: &mut State, ws: &str, n: u8, clients: &[Cli
 /// Снятие идёт только на столе, где `ws` активен: на другом столе окно
 /// стоит в состоянии другого workspace. Изменения мест пишутся в журнал:
 /// по ним видно, откуда взялось место, которое потом займёт окно.
+///
+/// Пока экран потерян, раскладка не снимается (изменение monitor-loss-layout,
+/// решение D2): положение окон задаёт композитор, переносом на запасной выход.
 pub fn absorb_into(cfg: &Config, st: &mut State, ws: &str, n: u8, clients: &[Client], mon: (i32, i32)) {
+    if st.screen_lost.is_some() {
+        return;
+    }
     if st.desktops.get(&n).and_then(|d| d.active.as_deref()) != Some(ws) {
         return;
     }
@@ -3246,6 +3297,45 @@ pub fn absorb_into(cfg: &Config, st: &mut State, ws: &str, n: u8, clients: &[Cli
     for (addr, r) in a.geom {
         g.insert(addr, r);
     }
+}
+
+/// Размер запасного выхода, если в списке мониторов его нет: единственный
+/// режим headless-выхода aquamarine (`Headless.cpp`, `createOutput`).
+pub const FALLBACK_SIZE: (i32, i32) = (1920, 1080);
+
+/// Размер запасного выхода `FALLBACK` по списку мониторов композитора,
+/// без него в списке — [`FALLBACK_SIZE`].
+pub fn fallback_size(mons: &[hypr::Monitor]) -> (i32, i32) {
+    mons.iter().find(|m| m.name == hypr::FALLBACK_OUTPUT).map(|m| (m.width, m.height)).unwrap_or(FALLBACK_SIZE)
+}
+
+/// План возврата окон после возвращения монитора (изменение
+/// monitor-loss-layout, решение D3): окна активного workspace `W` каждого
+/// стола, не скрытые и не полноэкранные, с запомненным для `W`
+/// прямоугольником `R`. Окно возвращается в `R`, если оно стоит не в `R`,
+/// того же размера и в `(R.x mod Wf, R.y mod Hf)`, где `fb = (Wf, Hf)` —
+/// размер запасного выхода: так композитор переносит плавающее окно
+/// на запасной выход, и прежнее положение по модулю не восстанавливает.
+/// Окно, сдвинутое иначе, сдвинул пользователь, и оно остаётся на месте.
+pub fn restore_plan(st: &State, clients: &[Client], fb: (i32, i32)) -> Vec<(String, PxRect)> {
+    let mut out = Vec::new();
+    if fb.0 <= 0 || fb.1 <= 0 {
+        return out;
+    }
+    for (n, ws) in actives(st) {
+        let Some(g) = st.geom.get(&ws) else { continue };
+        for c in ws_windows(clients, &ws) {
+            if c.desktop() != Some(n) || c.on_hidden() || c.fullscreen != 0 {
+                continue;
+            }
+            let Some(r) = g.get(&c.address).copied() else { continue };
+            let now = c.rect();
+            if now != r && now.w == r.w && now.h == r.h && now.x == r.x.rem_euclid(fb.0) && now.y == r.y.rem_euclid(fb.1) {
+                out.push((c.address.clone(), r));
+            }
+        }
+    }
+    out
 }
 
 /// Перенос окна за пользователем на стол при смене стола.
@@ -7385,5 +7475,160 @@ apps = { chrome-ai = "left" }
         assert_eq!(rec(&mut st, "herdr"), (Some(Place::Cell("center".into())), None));
         assert_eq!(rec(&mut st, "chromium"), (Some(Place::Cell("left_top".into())), Some(wide)));
         assert_eq!(st.main_app(&cfg, "home", MON).as_deref(), Some("chrome"));
+    }
+
+    // ---- Пропажа и возвращение монитора (изменение monitor-loss-layout) ----
+
+    /// Ячейки как у живого `work` и `surf`: правая колонка начинается
+    /// с x = 2090, левее 1920 px только ячейка `left`.
+    const LOSS_CFG: &str = r#"
+[templates.duo]
+main = "left"
+[templates.duo.cells]
+left  = { x = 340, y = 10, w = 1740, h = 2140 }
+right = { x = 2090, y = 10, w = 1740, h = 1065 }
+
+[apps.chromium]
+cmd = "chromium"
+class = "^chromium$"
+
+[apps.neovide]
+cmd = "neovide"
+class = "^neovide$"
+
+[apps.chrome-ai]
+cmd = "google-chrome"
+class = "^google-chrome-ai$"
+
+[workspaces.work]
+template = "duo"
+main = "chromium"
+apps = { chromium = "left", neovide = "right" }
+
+[workspaces.surf]
+template = "duo"
+mode = "stack"
+main = "chromium"
+apps = { chromium = "left", chrome-ai = "right" }
+"#;
+
+    const RIGHT_CELL: PxRect = PxRect { x: 2090, y: 10, w: 1740, h: 1065 };
+    const FB: (i32, i32) = (1920, 1080);
+
+    fn put(c: &mut Client, r: PxRect) {
+        (c.at, c.size) = ((r.x, r.y), (r.w, r.h));
+    }
+
+    /// Окна стоят на местах, и их прямоугольники сняты с экрана.
+    fn loss_state(cfg: &Config, clients: &[Client]) -> State {
+        let mut st = State::default();
+        st.desktop(1).active = Some("work".into());
+        st.desktop(2).active = Some("surf".into());
+        absorb_into(cfg, &mut st, "work", 1, clients, MON);
+        absorb_into(cfg, &mut st, "surf", 2, clients, MON);
+        st
+    }
+
+    #[test]
+    fn fallback_size_from_monitor_list() {
+        let mons: Vec<hypr::Monitor> = serde_json::from_str(r#"[{"name":"FALLBACK","width":1920,"height":1080}]"#).unwrap();
+        assert_eq!(fallback_size(&mons), (1920, 1080));
+        let mons: Vec<hypr::Monitor> = serde_json::from_str(r#"[{"name":"FALLBACK","width":1280,"height":720},{"name":"DP-2","width":3840,"height":2160}]"#).unwrap();
+        assert_eq!(fallback_size(&mons), (1280, 720));
+        // Запасного выхода в списке уже нет — единственный режим headless-выхода.
+        let mons: Vec<hypr::Monitor> = serde_json::from_str(r#"[{"name":"DP-2","width":3840,"height":2160}]"#).unwrap();
+        assert_eq!(fallback_size(&mons), FALLBACK_SIZE);
+        assert_eq!(fallback_size(&[]), FALLBACK_SIZE);
+    }
+
+    #[test]
+    fn compositor_shift_is_restored_and_not_absorbed() {
+        let cfg = Config::parse(LOSS_CFG).unwrap();
+        let mut nv = client("0x1", "neovide", "", "1", &["app:neovide#1", "ws:work"]);
+        let mut cr = client("0x2", "chromium", "", "1", &["app:chromium#1", "ws:work"]);
+        put(&mut nv, RIGHT_CELL);
+        put(&mut cr, PxRect { x: 340, y: 10, w: 1740, h: 2140 });
+        let mut st = loss_state(&cfg, &[nv.clone(), cr.clone()]);
+        assert!(st.moved.is_empty());
+        assert_eq!(st.geom["work"]["0x1"], RIGHT_CELL);
+
+        // Экран потерян: композитор перенёс окно на запасной выход в 170,10.
+        st.screen_lost = Some(FB);
+        put(&mut nv, PxRect { x: 170, ..RIGHT_CELL });
+        let shifted = [nv.clone(), cr.clone()];
+        absorb_into(&cfg, &mut st, "work", 1, &shifted, MON);
+        assert!(st.moved.is_empty());
+        assert_eq!(st.geom["work"]["0x1"], RIGHT_CELL);
+
+        // Монитор вернулся: окно ставится в 2090,10, chromium не трогается.
+        st.screen_lost = None;
+        assert_eq!(restore_plan(&st, &shifted, FB), vec![("0x1".to_string(), RIGHT_CELL)]);
+
+        // После постановки снятие раскладки изменённого места не создаёт.
+        put(&mut nv, RIGHT_CELL);
+        absorb_into(&cfg, &mut st, "work", 1, &[nv, cr], MON);
+        assert!(st.moved.is_empty());
+    }
+
+    #[test]
+    fn manual_shift_survives_screen_loss() {
+        let cfg = Config::parse(LOSS_CFG).unwrap();
+        let mut cr = client("0x2", "chromium", "", "1", &["app:chromium#1", "ws:work"]);
+        put(&mut cr, PxRect { x: 340, y: 10, w: 1740, h: 2140 });
+        let mut st = loss_state(&cfg, std::slice::from_ref(&cr));
+        // Пользователь сдвинул окно в 500,200, монитор пропал и вернулся,
+        // окно осталось там же.
+        let moved = PxRect { x: 500, y: 200, w: 1740, h: 2140 };
+        put(&mut cr, moved);
+        assert!(restore_plan(&st, std::slice::from_ref(&cr), FB).is_empty());
+        // Снятие раскладки делает сдвиг изменённым местом, как без пропажи.
+        absorb_into(&cfg, &mut st, "work", 1, std::slice::from_ref(&cr), MON);
+        assert_eq!(st.moved["work"]["chromium"], Moved { rect: moved, owner: Some("0x2".into()) });
+    }
+
+    #[test]
+    fn absorbed_moved_place_survives_screen_loss() {
+        let cfg = Config::parse(LOSS_CFG).unwrap();
+        let place = PxRect { x: 2200, y: 100, w: 1600, h: 1000 };
+        let mut ai = client("0x3", "google-chrome-ai", "", "2", &["app:chrome-ai#1", "ws:surf"]);
+        put(&mut ai, place);
+        let mut st = loss_state(&cfg, std::slice::from_ref(&ai));
+        let before = st.moved["surf"]["chrome-ai"].clone();
+        assert_eq!(before.rect, place);
+
+        // Композитор поставил окно в 280,100; монитор вернулся.
+        put(&mut ai, PxRect { x: 280, ..place });
+        assert_eq!(restore_plan(&st, std::slice::from_ref(&ai), FB), vec![("0x3".to_string(), place)]);
+        put(&mut ai, place);
+        absorb_into(&cfg, &mut st, "surf", 2, std::slice::from_ref(&ai), MON);
+        assert_eq!(st.moved["surf"]["chrome-ai"], before);
+    }
+
+    #[test]
+    fn restore_skips_hidden_fullscreen_and_foreign_desktop_windows() {
+        let cfg = Config::parse(LOSS_CFG).unwrap();
+        let mut nv = client("0x1", "neovide", "", "1", &["app:neovide#1", "ws:work"]);
+        put(&mut nv, RIGHT_CELL);
+        let st = loss_state(&cfg, std::slice::from_ref(&nv));
+        put(&mut nv, PxRect { x: 170, ..RIGHT_CELL });
+        assert_eq!(restore_plan(&st, std::slice::from_ref(&nv), FB).len(), 1);
+
+        // Полноэкранное окно и окно в режиме maximized не возвращаются.
+        for fs in [1, 2] {
+            let mut c = nv.clone();
+            c.fullscreen = fs;
+            assert!(restore_plan(&st, &[c], FB).is_empty());
+        }
+        // Скрытое окно и окно на столе другого workspace тоже.
+        let mut hidden = nv.clone();
+        hidden.workspace.name = "special:hidden".into();
+        assert!(restore_plan(&st, &[hidden], FB).is_empty());
+        let mut other = nv.clone();
+        other.workspace.name = "2".into();
+        assert!(restore_plan(&st, &[other], FB).is_empty());
+        // Другой размер — сдвиг не от запасного выхода.
+        let mut resized = nv.clone();
+        resized.size = (1700, 1065);
+        assert!(restore_plan(&st, &[resized], FB).is_empty());
     }
 }
